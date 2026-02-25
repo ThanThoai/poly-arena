@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8010:8010"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: >
+      gunicorn main:app
+      --worker-class uvicorn.workers.UvicornWorker
+      --workers 4
+      --bind 0.0.0.0:8010
+      --access-logfile -
+      --error-logfile -
+    restart: unless-stopped
