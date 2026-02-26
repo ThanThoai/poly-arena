@@ -7,17 +7,27 @@ from models import BOResult, BOSymbol, BOTimeframe, BOForecast
 
 
 class BOCreate(BaseModel):
-    symbol:    BOSymbol
-    timeframe: BOTimeframe
-    forecast:  BOForecast
-    amount:    float
-    reason:    Optional[str] = None
+    symbol:      BOSymbol
+    timeframe:   BOTimeframe
+    forecast:    BOForecast
+    amount:      float
+    reason:      Optional[str]   = None
+    limit_price: Optional[float] = None   # None = MARKET order; set = LIMIT order
+    tp_price:    Optional[float] = None   # Take Profit — triggers shadow profit on WIN
+    sl_price:    Optional[float] = None   # Stop Loss   — triggers shadow profit on LOSS
 
     @field_validator("amount")
     @classmethod
     def amount_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("amount must be positive")
+        return v
+
+    @field_validator("limit_price", "tp_price", "sl_price")
+    @classmethod
+    def price_in_range(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not (0 < v < 1):
+            raise ValueError("price must be between 0 and 1 (exclusive)")
         return v
 
 
@@ -40,6 +50,15 @@ class BOResponse(BaseModel):
     settlement_at:      Optional[datetime]
     created_at:         Optional[datetime] = None
     updated_at:         Optional[datetime]
+    # Order type
+    limit_price:  Optional[float] = None
+    # Bracket Order fields
+    tp_price:     Optional[float] = None
+    sl_price:     Optional[float] = None
+    exit_price:   Optional[float] = None
+    exit_trigger: Optional[str]   = None
+    exit_filled:  Optional[float] = None
+    me_order_id:  Optional[str]   = None
 
     model_config = {"from_attributes": True}
 

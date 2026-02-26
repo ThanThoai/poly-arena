@@ -81,3 +81,14 @@ class BinaryOption(Base):
     settlement_at      = Column(DateTime(timezone=True), nullable=True)
     created_at         = Column(DateTime(timezone=True), default=_now)
     updated_at         = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    # ── Order type ───────────────────────────────────────────────────────────
+    limit_price  = Column(Float, nullable=True)    # None = MARKET, set = LIMIT order
+
+    # ── Bracket Order (TP/SL) tracking ──────────────────────────────────────
+    tp_price     = Column(Float, nullable=True)    # Take Profit price (optional)
+    sl_price     = Column(Float, nullable=True)    # Stop Loss price (optional)
+    exit_price   = Column(Float, nullable=True)    # avg exit price when TP/SL fires (shadow)
+    exit_trigger = Column(String(20), nullable=True)  # "TP" | "SL" — set when bracket fires
+    exit_filled  = Column(Float, nullable=True)    # qty exited via TP/SL
+    me_order_id  = Column(String(64), nullable=True)  # matching engine SimulatedOrder ID

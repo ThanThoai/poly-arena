@@ -145,16 +145,42 @@ def settle_pending_trades(db: Session) -> None:
         else:
             candle_dir = "GREEN"
 
-        result = BOResult.WIN if candle_dir == bo.forecast else BOResult.LOSS
+        # ── Choose profit formula based on profit matrix ─────────────────────
+        #
+        # exit_trigger is set by the matching engine callback when TP/SL fires:
+        #   "TP"  → WIN  via shadow tracking: (exit_price - avg_price) × exit_filled
+        #   "SL"  → LOSS via shadow tracking: (exit_price - avg_price) × exit_filled (negative)
+        #   None  → binary settlement formula (no bracket exit occurred)
+        #
+        # Matrix:
+        #   No TP, No SL            → binary (both WIN and LOSS)
+        #   TP only, TP fired       → shadow WIN
+        #   TP only, TP not fired   → binary LOSS
+        #   SL only, SL fired       → shadow LOSS
+        #   SL only, SL not fired   → binary WIN
+        #   Both TP+SL, TP fired    → shadow WIN
+        #   Both TP+SL, SL fired    → shadow LOSS
+        # ──────────────────────────────────────────────────────────────────────
 
-        if result == BOResult.WIN:
-            # profit = (1 - avg_price) * num_shares
-            if bo.avg_price is not None and bo.num_shares is not None:
-                profit = round((1 - bo.avg_price) * bo.num_shares, 8)
-            else:
-                profit = round(bo.amount * _PAYOUT_RATE, 8)
+        if bo.exit_trigger in ("TP", "SL") and bo.exit_price is not None and bo.exit_filled is not None:
+            # Shadow tracking formula — bracket exit already occurred
+            result = BOResult.WIN if bo.exit_trigger == "TP" else BOResult.LOSS
+            profit = round((bo.exit_price - bo.avg_price) * bo.exit_filled, 8)
+            logger.info(
+                "Trade #%d settled via shadow tracking: trigger=%s exit_price=%.6f "
+                "avg_price=%.6f exit_filled=%.4f → profit=%.8f",
+                bo.id, bo.exit_trigger, bo.exit_price, bo.avg_price, bo.exit_filled, profit,
+            )
         else:
-            profit = -bo.amount
+            # Binary settlement formula — no bracket fired, use candle direction
+            result = BOResult.WIN if candle_dir == bo.forecast else BOResult.LOSS
+            if result == BOResult.WIN:
+                if bo.avg_price is not None and bo.num_shares is not None:
+                    profit = round((1 - bo.avg_price) * bo.num_shares, 8)
+                else:
+                    profit = round(bo.amount * _PAYOUT_RATE, 8)
+            else:
+                profit = -bo.amount
 
         bo.result      = result
         bo.profit      = profit

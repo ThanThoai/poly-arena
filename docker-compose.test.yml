@@ -1,0 +1,29 @@
+services:
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    command: >
+      redis-server
+      --maxmemory 64mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  test-runner:
+    build: .
+    depends_on:
+      redis-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=sqlite:///./test_orders.db
+      - REDIS_URL=redis://redis-test:6379
+    command: >
+      pytest tests/ -v --tb=short
+    volumes:
+      - .:/app
+    ports:
+      - "8099:8099"
