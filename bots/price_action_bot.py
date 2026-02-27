@@ -46,21 +46,21 @@ _MIN_CONFIDENCE = 0.55
 _FAST_FETCH_DELAY = 2
 
 # Volume analysis
-_VOL_SMA_PERIOD = 20        # period for average volume baseline
-_VOL_HIGH_THRESH = 1.5      # vol_ratio above this = high volume
-_VOL_CLIMAX_THRESH = 2.5    # vol_ratio above this = climax (exhaustion risk)
-_VOL_DRY_THRESH = 0.4       # vol_ratio below this = too thin, skip
-_VOL_CONFIRM_BOOST = 0.07   # high volume confirms pattern
-_VOL_NORMAL_BOOST = 0.03    # normal volume, slight confirmation
-_VOL_DRY_PENALTY = -0.08    # thin volume, unreliable signal
-_VOL_CLIMAX_PENALTY = -0.05 # climax = possible exhaustion
-_VOL_TREND_BOOST = 0.04     # rising volume in pattern direction
+_VOL_SMA_PERIOD = 20  # period for average volume baseline
+_VOL_HIGH_THRESH = 1.5  # vol_ratio above this = high volume
+_VOL_CLIMAX_THRESH = 2.5  # vol_ratio above this = climax (exhaustion risk)
+_VOL_DRY_THRESH = 0.4  # vol_ratio below this = too thin, skip
+_VOL_CONFIRM_BOOST = 0.07  # high volume confirms pattern
+_VOL_NORMAL_BOOST = 0.03  # normal volume, slight confirmation
+_VOL_DRY_PENALTY = -0.08  # thin volume, unreliable signal
+_VOL_CLIMAX_PENALTY = -0.05  # climax = possible exhaustion
+_VOL_TREND_BOOST = 0.04  # rising volume in pattern direction
 _VOL_DIVERGENCE_PENALTY = -0.06  # price trending but volume fading
 
 # Cross-symbol consensus
-_BTC_ALIGN_BOOST = 0.08   # altcoin signal aligned with BTC trend
+_BTC_ALIGN_BOOST = 0.08  # altcoin signal aligned with BTC trend
 _BTC_AGAINST_PENALTY = -0.10  # altcoin signal against BTC trend
-_MAJORITY_BOOST = 0.05    # signal aligned with market majority
+_MAJORITY_BOOST = 0.05  # signal aligned with market majority
 _MAJORITY_THRESHOLD = 0.60  # ≥60% of symbols must agree
 
 # Position sizing tiers: (min_confidence, fraction_of_max_amount)
@@ -112,19 +112,21 @@ class SRZone:
 @dataclass
 class VolumeProfile:
     """Volume analysis for the current candle relative to recent history."""
-    vol_ratio: float        # current volume / SMA(20) volume
-    is_climax: bool         # volume > 2.5x average (exhaustion risk)
-    is_dry: bool            # volume < 0.4x average (unreliable)
-    vol_trend: float        # -1.0 to +1.0: rising (+) or falling (-) volume
+
+    vol_ratio: float  # current volume / SMA(20) volume
+    is_climax: bool  # volume > 2.5x average (exhaustion risk)
+    is_dry: bool  # volume < 0.4x average (unreliable)
+    vol_trend: float  # -1.0 to +1.0: rising (+) or falling (-) volume
     price_vol_divergence: bool  # price trending but volume fading
 
 
 @dataclass
 class SymbolAnalysis:
     """Per-symbol intermediate result before consensus adjustment."""
+
     symbol: str
-    direction: str          # "GREEN" or "RED"
-    confidence: float       # pre-consensus confidence
+    direction: str  # "GREEN" or "RED"
+    confidence: float  # pre-consensus confidence
     trend: TrendState
     patterns: list[PatternSignal]
     volume: Optional[VolumeProfile] = None
@@ -181,7 +183,9 @@ def _pre_filter(symbol: str, candles: list[Candle], log: logging.Logger) -> bool
     if vol_profile is not None and vol_profile.is_dry:
         log.info(
             "SKIP %s — dry volume (ratio=%.2f < %.2f)",
-            symbol, vol_profile.vol_ratio, _VOL_DRY_THRESH,
+            symbol,
+            vol_profile.vol_ratio,
+            _VOL_DRY_THRESH,
         )
         return True
     return False
@@ -575,9 +579,8 @@ def _score_signals(
         if volume.vol_trend > 0.2:
             # Volume is increasing — check if aligned with signal direction
             trend_aligned_vol = (
-                (direction == "GREEN" and trend.direction == Direction.UP)
-                or (direction == "RED" and trend.direction == Direction.DOWN)
-            )
+                direction == "GREEN" and trend.direction == Direction.UP
+            ) or (direction == "RED" and trend.direction == Direction.DOWN)
             if trend_aligned_vol:
                 vol_adj += _VOL_TREND_BOOST
         elif volume.vol_trend < -0.2:
@@ -591,8 +594,11 @@ def _score_signals(
 
         log.info(
             "Volume: ratio=%.2f  trend=%+.2f  climax=%s  divergence=%s  vol_adj=%+.2f",
-            volume.vol_ratio, volume.vol_trend,
-            volume.is_climax, volume.price_vol_divergence, vol_adj,
+            volume.vol_ratio,
+            volume.vol_trend,
+            volume.is_climax,
+            volume.price_vol_divergence,
+            vol_adj,
         )
 
     final_conf = base_conf + trend_adj + sr_adj + vol_adj
@@ -657,7 +663,9 @@ def _apply_consensus(
     if majority_dir:
         log.info(
             "Consensus: market majority=%s (%d/%d symbols)",
-            majority_dir, max(green_count, red_count), total,
+            majority_dir,
+            max(green_count, red_count),
+            total,
         )
 
     # ── 3. Adjust each symbol ──
@@ -666,22 +674,31 @@ def _apply_consensus(
         adj = 0.0
 
         # BTC dominance (only for altcoins, skip BTC itself)
-        if btc_trend is not None and a.symbol != "BTC" and btc_trend != Direction.SIDEWAYS:
-            btc_agrees = (
-                (a.direction == "GREEN" and btc_trend == Direction.UP)
-                or (a.direction == "RED" and btc_trend == Direction.DOWN)
+        if (
+            btc_trend is not None
+            and a.symbol != "BTC"
+            and btc_trend != Direction.SIDEWAYS
+        ):
+            btc_agrees = (a.direction == "GREEN" and btc_trend == Direction.UP) or (
+                a.direction == "RED" and btc_trend == Direction.DOWN
             )
             if btc_agrees:
                 adj += _BTC_ALIGN_BOOST
                 log.info(
                     "Consensus: %s %s aligned with BTC trend %s → %+.2f",
-                    a.symbol, a.direction, btc_trend.value, _BTC_ALIGN_BOOST,
+                    a.symbol,
+                    a.direction,
+                    btc_trend.value,
+                    _BTC_ALIGN_BOOST,
                 )
             else:
                 adj += _BTC_AGAINST_PENALTY
                 log.info(
                     "Consensus: %s %s against BTC trend %s → %+.2f",
-                    a.symbol, a.direction, btc_trend.value, _BTC_AGAINST_PENALTY,
+                    a.symbol,
+                    a.direction,
+                    btc_trend.value,
+                    _BTC_AGAINST_PENALTY,
                 )
 
         # BTC direction consensus (altcoin signal vs BTC signal direction)
@@ -702,7 +719,10 @@ def _apply_consensus(
         if adj != 0.0:
             log.info(
                 "Consensus: %s  pre=%.2f  adj=%+.2f  post=%.2f",
-                a.symbol, a.confidence, adj, final_conf,
+                a.symbol,
+                a.confidence,
+                adj,
+                final_conf,
             )
 
         results[a.symbol] = (a.direction, final_conf)
@@ -749,6 +769,9 @@ class PriceActionBot(BaseBot):
         """Thin wrapper for BaseBot compatibility (no position sizing)."""
         result = self._analyze_symbol(symbol, candles)
         return result.direction if result else None
+        # if not result:
+        #     return None
+        # return "RED" if result.direction == "GREEN" else "GREEN"
 
     def _analyze_symbol(
         self, symbol: str, candles: list[Candle]
@@ -777,7 +800,12 @@ class PriceActionBot(BaseBot):
         volume = _analyze_volume(candles)
 
         result = _score_signals(
-            patterns, trend, sr_zones, current_price, self.log, volume=volume,
+            patterns,
+            trend,
+            sr_zones,
+            current_price,
+            self.log,
+            volume=volume,
         )
         if result is None:
             return None
@@ -840,7 +868,10 @@ class PriceActionBot(BaseBot):
                 skipped_symbols.add(symbol)
 
         if not analyses:
-            self.log.info("── PriceAction cycle done   placed=0  skipped=%d  (no signals) ──", skipped)
+            self.log.info(
+                "── PriceAction cycle done   placed=0  skipped=%d  (no signals) ──",
+                skipped,
+            )
             return
 
         # ── 3. Cross-symbol consensus ──
@@ -851,7 +882,9 @@ class PriceActionBot(BaseBot):
             if confidence < self.min_confidence:
                 self.log.info(
                     "SKIP %s — post-consensus confidence %.2f < threshold %.2f",
-                    symbol, confidence, self.min_confidence,
+                    symbol,
+                    confidence,
+                    self.min_confidence,
                 )
                 skipped += 1
                 continue

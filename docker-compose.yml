@@ -1,17 +1,153 @@
+name: poly-arena-test
+
 services:
-  api:
-    build: .
+  timescaledb-test:
+    image: timescale/timescaledb:latest-pg16
     ports:
-      - "8010:8010"
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: polyarena_test
+      POSTGRES_USER: polyarena
+      POSTGRES_PASSWORD: polyarena_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polyarena"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - pgdata-test:/var/lib/postgresql/data
+    networks:
+      - test-net
+
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    command: >
+      redis-server
+      --maxmemory 64mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis-test-data:/data
+    networks:
+      - test-net
+
+  ws-feed-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.ws_feed
+    image: poly-arena-test/ws-feed
+    depends_on:
+      redis-test:
+        condition: service_healthy
+      timescaledb-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://polyarena:polyarena_test@timescaledb-test:5432/polyarena_test
+      - REDIS_URL=redis://redis-test:6379
+      - DEBUG=${DEBUG:-0}
+    env_file:
+      - .env
     volumes:
       - .:/app
+    restart: unless-stopped
+    networks:
+      - test-net
+
+  scheduler-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    image: poly-arena-test/scheduler
+    depends_on:
+      redis-test:
+        condition: service_healthy
+      timescaledb-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://polyarena:polyarena_test@timescaledb-test:5432/polyarena_test
+      - REDIS_URL=redis://redis-test:6379
+      - DEBUG=${DEBUG:-0}
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    networks:
+      - test-net
+
+  api-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: poly-arena-test/api
+    ports:
+      - "8099:8099"
+    depends_on:
+      redis-test:
+        condition: service_healthy
+      timescaledb-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://polyarena:polyarena_test@timescaledb-test:5432/polyarena_test
+      - REDIS_URL=redis://redis-test:6379
+      - DEBUG=${DEBUG:-0}
     env_file:
       - .env
     command: >
-      gunicorn main:app
-      --worker-class uvicorn.workers.UvicornWorker
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8099
       --workers 4
-      --bind 0.0.0.0:8010
-      --access-logfile -
-      --error-logfile -
+      --reload
+    volumes:
+      - .:/app
     restart: unless-stopped
+    networks:
+      - test-net
+
+  test-bot:
+    build:
+      context: ./test_bot
+      dockerfile: Dockerfile
+    image: poly-arena-test/test-bot
+    environment:
+      - API_URL=http://api-test:8099/poly-arena
+      - BOT_NAME=random-trader
+      - INTERVAL_SEC=300
+      - TRADES_PER_TICK=3
+    depends_on:
+      - api-test
+    restart: unless-stopped
+    networks:
+      - test-net
+
+  ui-test:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    image: poly-arena-test/ui
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8100/poly-arena
+      - HOT_RELOAD=${HOT_RELOAD:-0}
+    depends_on:
+      - api-test
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    volumes:
+      - ./ui/src:/app/src    # mount source for hot-reload (only effective when HOT_RELOAD=1)
+    networks:
+      - test-net
+
+networks:
+  test-net:
+
+volumes:
+  redis-test-data:
+  pgdata-test:

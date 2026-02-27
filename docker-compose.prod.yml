@@ -1,0 +1,95 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: polyarena
+      POSTGRES_USER: polyarena
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-polyarena_prod}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polyarena"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  ws_feed:
+    build:
+      context: .
+      dockerfile: Dockerfile.ws_feed
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://polyarena:${POSTGRES_PASSWORD:-polyarena_prod}@timescaledb:5432/polyarena
+      - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://polyarena:${POSTGRES_PASSWORD:-polyarena_prod}@timescaledb:5432/polyarena
+      - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  api:
+    build: .
+    ports:
+      - "8010:8010"
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://polyarena:${POSTGRES_PASSWORD:-polyarena_prod}@timescaledb:5432/polyarena
+      - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
+    command: >
+      gunicorn main:app
+      --worker-class uvicorn.workers.UvicornWorker
+      --workers 4
+      --bind 0.0.0.0:8010
+      --access-logfile -
+      --error-logfile -
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  pgdata:
