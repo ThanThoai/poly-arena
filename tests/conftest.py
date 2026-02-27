@@ -2,7 +2,7 @@
 Test fixtures for PolyArena.
 
 Test environment uses:
-  - SQLite test database (separate from production orders.db)
+  - PostgreSQL test database (TimescaleDB on port 5433)
   - fakeredis when no real Redis available, real Redis in docker-compose
   - FastAPI TestClient on port 8099
 """
@@ -11,7 +11,7 @@ import os
 import sys
 
 # ── Environment: set DATABASE_URL if not already provided (docker-compose sets it) ──
-os.environ.setdefault("DATABASE_URL", "sqlite:///./test_orders.db")
+os.environ.setdefault("DATABASE_URL", "postgresql://polyarena:polyarena_test@localhost:5433/polyarena_test")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6380")
 
 # Ensure project root is importable
@@ -33,7 +33,9 @@ TEST_DB_URL = os.environ["DATABASE_URL"]
 
 _test_engine = create_engine(
     TEST_DB_URL,
-    connect_args={"check_same_thread": False} if TEST_DB_URL.startswith("sqlite") else {},
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
 )
 TestSessionLocal = sessionmaker(
     autocommit=False, autoflush=False, bind=_test_engine,
@@ -88,10 +90,13 @@ _db_mod.get_db = _get_test_db
 
 @pytest.fixture(autouse=True)
 def setup_test_db():
-    """Create all tables before each test, drop after."""
+    """Create all tables before each test, truncate after (preserves schema)."""
     Base.metadata.create_all(bind=_test_engine)
     yield
-    Base.metadata.drop_all(bind=_test_engine)
+    # Truncate all rows but keep tables intact — safe for shared databases
+    with _test_engine.begin() as conn:
+        for table in reversed(Base.metadata.sorted_tables):
+            conn.execute(table.delete())
     # Flush Redis between tests
     _sync_redis.flushall()
 

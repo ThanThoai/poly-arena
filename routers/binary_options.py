@@ -1,4 +1,5 @@
 from collections import defaultdict
+from decimal import Decimal
 import json
 import time
 from typing import List, Optional, Tuple
@@ -6,6 +7,7 @@ from typing import List, Optional, Tuple
 import logging
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -15,6 +17,7 @@ from services.settlement import calc_settlement_time
 from services.polymarket import PolymarketClient
 from ws_feed_service.config import (
     PRICE_KEY_PREFIX, STALE_THRESHOLD_S, QUEUE_ORDERS_NEW,
+    ORDERBOOK_KEY_PREFIX,
 )
 from schemas import (
     BOBotStats, BOCreate, BOForecastStats, BOResponse,
@@ -98,6 +101,9 @@ def _get_token_id_from_redis(
     boundary. Even when the price is stale (feed gap between sessions), the
     token_id stored in the hash is still the correct current token — so we can
     use it for virtual order placement without needing a REST call.
+
+    Fallback: if Redis has no price key (e.g. after token rotation clears
+    stale keys), fetch token_id from Polymarket REST via PolymarketClient.
     """
     try:
         from services.redis_client import get_sync_redis
@@ -111,10 +117,101 @@ def _get_token_id_from_redis(
                 symbol, timeframe, pm_status, token_id[:16],
             )
             return token_id
-        return None
     except Exception as exc:
         logger.warning("Redis token_id lookup failed: %s", exc)
+
+    # Fallback: fetch token_id from Polymarket REST (without fetching book prices)
+    try:
+        with PolymarketClient() as pm:
+            token_id = pm.get_token_id(symbol, timeframe, pm_status)
+            logger.info(
+                "Token ID from REST fallback: %s %s %s → %s",
+                symbol, timeframe, pm_status, token_id[:16],
+            )
+            return token_id
+    except Exception as exc:
+        logger.warning("REST token_id fallback failed: %s", exc)
         return None
+
+
+_DEFAULT_SLIPPAGE_TOLERANCE = 0.10  # 10%
+
+
+def _fill_market_from_rest(
+    symbol: str, timeframe: str, pm_status: str,
+    amount: float, slippage_tolerance: Optional[float],
+) -> Tuple[float, float, str]:
+    """
+    Fetch full orderbook from Polymarket REST, simulate MARKET BUY fill.
+    Returns (avg_price, num_shares, token_id).
+    Raises HTTPException on failure.
+    """
+    tolerance = slippage_tolerance if slippage_tolerance is not None else _DEFAULT_SLIPPAGE_TOLERANCE
+
+    try:
+        with PolymarketClient() as pm:
+            ob = pm.get_orderbook(symbol, timeframe, pm_status)
+            token_id = ob.token_id
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Polymarket unavailable: {e}")
+
+    # Fetch full book
+    try:
+        resp = httpx.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        book = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Polymarket book fetch failed: {e}")
+
+    asks = sorted(
+        [
+            (Decimal(str(level["price"])), Decimal(str(level["size"])))
+            for level in book.get("asks", [])
+            if float(level["size"]) > 0
+        ],
+        key=lambda x: x[0],
+    )
+
+    if not asks:
+        raise HTTPException(status_code=502, detail="No liquidity available on Polymarket")
+
+    ref_price = asks[0][0]
+    slippage_limit = ref_price * (1 + Decimal(str(tolerance)))
+    remaining_budget = Decimal(str(amount))
+    total_cost = Decimal("0")
+    total_shares = Decimal("0")
+
+    for ask_price, ask_size in asks:
+        if ask_price > slippage_limit:
+            break
+        if remaining_budget <= 0:
+            break
+        # Max shares we can buy at this level within budget
+        max_shares_at_level = remaining_budget / ask_price
+        fill_shares = min(ask_size, max_shares_at_level)
+        fill_cost = fill_shares * ask_price
+        total_cost += fill_cost
+        total_shares += fill_shares
+        remaining_budget -= fill_cost
+
+    if total_shares <= 0:
+        raise HTTPException(status_code=502, detail="No liquidity available within slippage tolerance")
+
+    avg_price = float(total_cost / total_shares)
+    num_shares = float(total_shares)
+
+    logger.info(
+        "REST fill: %s %s %s amount=%.4f → avg_price=%.6f shares=%.4f "
+        "levels=%d slippage_limit=%.4f",
+        symbol, timeframe, pm_status, amount, avg_price, num_shares,
+        len(asks), float(slippage_limit),
+    )
+
+    return avg_price, num_shares, token_id
 
 
 @router.post("/", response_model=BOResponse, status_code=201)
@@ -158,9 +255,13 @@ def create_bo(
     token_id:  Optional[str]   = None
     entry_price: float
 
+    has_bracket = payload.tp_price is not None or payload.sl_price is not None
+    settlement_at = calc_settlement_time(payload.timeframe, datetime.now(timezone.utc))
+
     if is_limit:
         # ── LIMIT order: giá do bot chỉ định ─────────────────────────────────
         entry_price    = payload.limit_price  # type: ignore[assignment]
+        num_shares     = round(payload.amount / entry_price, 8)
         ask_fetched_at = datetime.now(timezone.utc)
         price_source   = "limit"
 
@@ -170,84 +271,49 @@ def create_bo(
             payload.symbol.value, payload.timeframe.value, pm_status,
         )
         if token_id is None:
-            logger.warning(
-                "token_id not in Redis for %s %s %s — ws_feed_service may not be running",
-                payload.symbol.value, payload.timeframe.value, pm_status,
+            # LIMIT orders require matching engine — refund balance and reject
+            bot.balance = round(bot.balance + payload.amount, 8)
+            db.commit()
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Matching engine unavailable for {payload.symbol.value} "
+                    f"{payload.timeframe.value} — ws_feed_service may not be running"
+                ),
             )
-    else:
-        # ── MARKET order: lấy giá từ Redis / REST ─────────────────────────────
-        price_source = "rest"
-        min_ask, token_id = _try_redis_price(
-            payload.symbol.value, payload.timeframe.value, pm_status,
+
+        latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
+        logger.info(
+            "BO LIMIT %s %s %s: price=%.4f src=%s latency=%.0fms tp=%s sl=%s",
+            payload.symbol.value, payload.timeframe.value, payload.forecast.value,
+            entry_price, price_source, latency_ms,
+            payload.tp_price, payload.sl_price,
         )
-        if min_ask is not None:
-            ask_fetched_at = datetime.now(timezone.utc)
-            price_source   = "redis"
-        else:
-            # Redis stale hoặc chưa có — fallback REST, nhưng thử lấy token_id
-            # từ Redis trước (không cần fresh price để lấy token_id).
-            token_id = _get_token_id_from_redis(
-                payload.symbol.value, payload.timeframe.value, pm_status,
-            )
-            try:
-                with PolymarketClient() as pm:
-                    ob = pm.get_orderbook(
-                        payload.symbol.value, payload.timeframe.value, pm_status,
-                    )
-                ask_fetched_at = datetime.now(timezone.utc)
-                min_ask  = ob.min_ask
-                token_id = ob.token_id   # REST luôn cho token_id chính xác nhất
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Polymarket unavailable: {e}")
-        entry_price = min_ask
 
-    num_shares    = round(payload.amount / entry_price, 8)
-    settlement_at = calc_settlement_time(payload.timeframe, datetime.now(timezone.utc))
-    has_bracket   = payload.tp_price is not None or payload.sl_price is not None
+        bo = BinaryOption(
+            bot_name          = bot.bot_name,
+            symbol            = payload.symbol,
+            timeframe         = payload.timeframe,
+            forecast          = payload.forecast,
+            amount            = payload.amount,
+            result            = BOResult.PENDING,
+            avg_price         = None,
+            num_shares        = None,
+            reason            = payload.reason,
+            order_received_at = order_received_at,
+            ask_fetched_at    = ask_fetched_at,
+            settlement_at     = settlement_at,
+            limit_price       = payload.limit_price,
+            tp_price          = payload.tp_price,
+            sl_price          = payload.sl_price,
+            ttl               = payload.ttl,
+            me_order_status   = "PENDING",
+        )
+        db.add(bo)
+        db.commit()
+        db.refresh(bo)
 
-    latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
-    logger.info(
-        "BO %s %s %s: price=%.4f src=%s latency=%.0fms "
-        "limit=%s tp=%s sl=%s",
-        payload.symbol.value, payload.timeframe.value, payload.forecast.value,
-        entry_price, price_source, latency_ms,
-        payload.limit_price, payload.tp_price, payload.sl_price,
-    )
-
-    # All orders go through ME when token_id is available.
-    # avg_price and num_shares are set by ME fill, not from snapshot.
-    # Fallback to snapshot only when WS Feed Service is not running (no token_id).
-    uses_me = token_id is not None
-
-    bo = BinaryOption(
-        bot_name          = bot.bot_name,
-        symbol            = payload.symbol,
-        timeframe         = payload.timeframe,
-        forecast          = payload.forecast,
-        amount            = payload.amount,
-        result            = BOResult.PENDING,
-        avg_price         = None if uses_me else entry_price,
-        num_shares        = None if uses_me else num_shares,
-        reason            = payload.reason,
-        order_received_at = order_received_at,
-        ask_fetched_at    = ask_fetched_at,
-        settlement_at     = settlement_at,
-        limit_price       = payload.limit_price,
-        tp_price          = payload.tp_price,
-        sl_price          = payload.sl_price,
-        ttl               = payload.ttl,
-        # me_order_status tracks matching engine lifecycle for all ME orders
-        me_order_status   = "PENDING" if uses_me else None,
-    )
-    db.add(bo)
-    db.commit()
-    db.refresh(bo)
-
-    # ── Push virtual order to Redis queue (consumed by WS Feed Service) ─────
-    # Push all orders to ME when token_id is available.
-    # MARKET orders fill immediately (price=1 taker), LIMIT orders wait for match.
-    should_place_virtual = token_id is not None
-    if should_place_virtual:
+        # Push LIMIT order to ME via Redis queue
         try:
             from services.redis_client import get_sync_redis
             sr = get_sync_redis()
@@ -256,6 +322,7 @@ def create_bo(
                 "token_id": token_id,
                 "side": "BUY",
                 "price": entry_price,
+                "expected_price": entry_price,
                 "quantity": num_shares,
                 "amount": payload.amount,
                 "limit_price": payload.limit_price,
@@ -267,13 +334,83 @@ def create_bo(
             })
             sr.lpush(QUEUE_ORDERS_NEW, order_payload)
             logger.info(
-                "Virtual order queued for BO #%d: type=%s tp=%s sl=%s",
-                bo.id,
-                "LIMIT" if is_limit else "MARKET",
-                payload.tp_price, payload.sl_price,
+                "Virtual order queued for BO #%d: type=LIMIT tp=%s sl=%s",
+                bo.id, payload.tp_price, payload.sl_price,
             )
         except Exception as exc:
             logger.error("Failed to queue virtual order for BO #%d: %s", bo.id, exc)
+
+    else:
+        # ── MARKET order: fill immediately via Polymarket REST API ─────────
+        avg_price, num_shares, token_id = _fill_market_from_rest(
+            payload.symbol.value, payload.timeframe.value, pm_status,
+            payload.amount, payload.slippage_tolerance,
+        )
+        ask_fetched_at = datetime.now(timezone.utc)
+        price_source = "rest"
+
+        latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
+        logger.info(
+            "BO MARKET %s %s %s: avg_price=%.6f shares=%.4f src=%s "
+            "latency=%.0fms tp=%s sl=%s",
+            payload.symbol.value, payload.timeframe.value, payload.forecast.value,
+            avg_price, num_shares, price_source, latency_ms,
+            payload.tp_price, payload.sl_price,
+        )
+
+        bo = BinaryOption(
+            bot_name          = bot.bot_name,
+            symbol            = payload.symbol,
+            timeframe         = payload.timeframe,
+            forecast          = payload.forecast,
+            amount            = payload.amount,
+            result            = BOResult.PENDING,
+            avg_price         = avg_price,
+            num_shares        = num_shares,
+            reason            = payload.reason,
+            order_received_at = order_received_at,
+            ask_fetched_at    = ask_fetched_at,
+            settlement_at     = settlement_at,
+            limit_price       = None,
+            tp_price          = payload.tp_price,
+            sl_price          = payload.sl_price,
+            ttl               = payload.ttl,
+            # MARKET+bracket → "PREFILLED" (ME monitors TP/SL only)
+            # MARKET without bracket → None (scheduler settles)
+            me_order_status   = "PREFILLED" if has_bracket else None,
+        )
+        db.add(bo)
+        db.commit()
+        db.refresh(bo)
+
+        # Only queue to ME when MARKET order has TP/SL bracket
+        if has_bracket:
+            try:
+                from services.redis_client import get_sync_redis
+                sr = get_sync_redis()
+                order_payload = json.dumps({
+                    "bo_id": bo.id,
+                    "token_id": token_id,
+                    "side": "BUY",
+                    "prefilled": True,
+                    "prefilled_avg_price": avg_price,
+                    "prefilled_filled": num_shares,
+                    "tp_price": payload.tp_price,
+                    "sl_price": payload.sl_price,
+                    "timeframe": payload.timeframe.value,
+                })
+                sr.lpush(QUEUE_ORDERS_NEW, order_payload)
+                logger.info(
+                    "Prefilled bracket order queued for BO #%d: "
+                    "avg_price=%.6f shares=%.4f tp=%s sl=%s",
+                    bo.id, avg_price, num_shares,
+                    payload.tp_price, payload.sl_price,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to queue prefilled bracket order for BO #%d: %s",
+                    bo.id, exc,
+                )
 
     db.refresh(bo)
     return bo
@@ -428,6 +565,145 @@ def engine_status():
             "redis": "error",
             "error": str(exc),
         }
+
+
+# ─── Orderbook depth ──────────────────────────────────────────────────────
+
+_OB_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+_OB_DIRECTIONS = ["UP", "DOWN"]
+_OB_CACHE_TTL = 5  # seconds
+_ob_cache: dict = {}  # key: "SYM:TF:DIR" → {"bids": [...], "asks": [...], "fetched_at": float}
+
+
+def _fetch_orderbooks_rest(combos: set[tuple[str, str, str]]) -> dict[tuple[str, str, str], dict]:
+    """Fetch orderbooks from Polymarket REST API for multiple combos, with caching."""
+    import httpx
+
+    now = time.time()
+    results: dict[tuple[str, str, str], dict] = {}
+    to_fetch: list[tuple[str, str, str]] = []
+
+    for combo in combos:
+        cache_key = f"{combo[0]}:{combo[1]}:{combo[2]}"
+        cached = _ob_cache.get(cache_key)
+        if cached and now - cached["fetched_at"] < _OB_CACHE_TTL:
+            results[combo] = cached
+        else:
+            to_fetch.append(combo)
+
+    if not to_fetch:
+        return results
+
+    try:
+        with PolymarketClient(timeout=8.0) as pm:
+            for sym, tf, dir_ in to_fetch:
+                try:
+                    ob = pm.get_orderbook(sym, tf, dir_)
+                    resp = httpx.get(
+                        "https://clob.polymarket.com/book",
+                        params={"token_id": ob.token_id},
+                        timeout=8.0,
+                    )
+                    resp.raise_for_status()
+                    book = resp.json()
+                    bids = sorted(
+                        [[float(l["price"]), float(l["size"])] for l in book.get("bids", [])],
+                        key=lambda x: x[0], reverse=True,
+                    )[:20]
+                    asks = sorted(
+                        [[float(l["price"]), float(l["size"])] for l in book.get("asks", [])],
+                        key=lambda x: x[0],
+                    )[:20]
+                    entry = {
+                        "bids": bids,
+                        "asks": asks,
+                        "fetched_at": now,
+                        "updated_at": str(now),
+                    }
+                    cache_key = f"{sym}:{tf}:{dir_}"
+                    _ob_cache[cache_key] = entry
+                    results[(sym, tf, dir_)] = entry
+                except Exception as exc:
+                    logger.debug("REST orderbook fetch failed for %s/%s/%s: %s", sym, tf, dir_, exc)
+    except Exception as exc:
+        logger.warning("PolymarketClient error in orderbook fallback: %s", exc)
+
+    return results
+
+
+@router.get("/engine/orderbook")
+def engine_orderbook(
+    symbol:    Optional[str] = Query(None),
+    timeframe: Optional[str] = Query(None),
+    direction: Optional[str] = Query(None),
+):
+    """
+    Return orderbook depth (bid/ask levels).
+
+    Primary source: Redis (written by ws_feed_service on every book update).
+    Fallback: Polymarket REST API for combos missing from Redis.
+    Optional filters: symbol, timeframe, direction.
+    """
+    from services.redis_client import get_sync_redis
+
+    target_syms = [symbol.upper()] if symbol else _OB_SYMBOLS
+    target_tfs = [timeframe.upper()] if timeframe else ["M5", "M15", "H1"]
+    target_dirs = [direction.upper()] if direction else _OB_DIRECTIONS
+
+    # Track which combos we need
+    needed: set[tuple[str, str, str]] = {
+        (s, t, d) for s in target_syms for t in target_tfs for d in target_dirs
+    }
+
+    orderbooks = []
+
+    # 1. Try Redis first
+    try:
+        sr = get_sync_redis()
+        keys = sr.keys(f"{ORDERBOOK_KEY_PREFIX}:*")
+        for key in keys:
+            parts = key.split(":")
+            if len(parts) != 4:
+                continue
+            _, sym, tf, dir_ = parts
+            combo = (sym, tf, dir_)
+            if combo not in needed:
+                continue
+
+            data = sr.hgetall(key)
+            if not data:
+                continue
+
+            bids = json.loads(data.get("bids", "[]"))
+            asks = json.loads(data.get("asks", "[]"))
+            if bids or asks:
+                orderbooks.append({
+                    "symbol": sym,
+                    "timeframe": tf,
+                    "direction": dir_,
+                    "bids": bids,
+                    "asks": asks,
+                    "updated_at": data.get("updated_at"),
+                })
+                needed.discard(combo)
+    except Exception as exc:
+        logger.warning("engine_orderbook Redis read failed: %s", exc)
+
+    # 2. Fallback to REST for missing combos
+    if needed:
+        rest_results = _fetch_orderbooks_rest(needed)
+        for (sym, tf, dir_), entry in rest_results.items():
+            if entry["bids"] or entry["asks"]:
+                orderbooks.append({
+                    "symbol": sym,
+                    "timeframe": tf,
+                    "direction": dir_,
+                    "bids": entry["bids"],
+                    "asks": entry["asks"],
+                    "updated_at": entry["updated_at"],
+                })
+
+    return {"orderbooks": orderbooks}
 
 
 # ─── Live prices (direct REST) ─────────────────────────────────────────────

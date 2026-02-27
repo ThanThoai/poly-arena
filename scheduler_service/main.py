@@ -21,8 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from database import Base, engine, SessionLocal
-from main import run_migrations
+from database import SessionLocal
 from services.redis_client import get_sync_redis, close_sync_redis
 from services.settlement import settle_pending_trades, sweep_stuck_orders
 from scheduler_service.config import (
@@ -33,8 +32,10 @@ from scheduler_service.config import (
     HEARTBEAT_TTL_S,
 )
 
+_log_level = logging.DEBUG if os.getenv("DEBUG", "").strip() in ("1", "true", "yes") else logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s  %(levelname)-8s  %(name)s: %(message)s",
 )
 log = logging.getLogger("scheduler_service")
@@ -93,11 +94,7 @@ async def main():
         log.error("Cannot connect to Redis: %s", exc)
         sys.exit(1)
 
-    # 2. DB setup
-    Base.metadata.create_all(bind=engine)
-    run_migrations()
-
-    # 3. Create scheduler
+    # 2. Create scheduler
     scheduler = BackgroundScheduler()
 
     scheduler.add_job(

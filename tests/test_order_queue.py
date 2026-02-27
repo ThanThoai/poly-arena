@@ -8,10 +8,16 @@ Verifies:
 """
 
 import json
+from unittest.mock import patch, MagicMock
 
 import pytest
 
 from ws_feed_service.config import QUEUE_ORDERS_NEW
+
+
+def _mock_fill_market_from_rest(symbol, timeframe, pm_status, amount, slippage_tolerance):
+    """Mock REST fill returning predictable values."""
+    return (0.52, round(amount / 0.52, 8), "fake-token-btc-m5-up")
 
 
 # ── create_bo → LPUSH ────────────────────────────────────────────────────────
@@ -57,16 +63,10 @@ def test_create_bo_limit_order_pushes_to_queue(client, test_bot, fake_sync_redis
     assert order["timeframe"] == "M5"
 
 
-def test_create_bo_market_with_bracket_pushes_to_queue(client, test_bot, fake_sync_redis):
-    """MARKET order with TP/SL should also push to queue."""
+@patch("routers.binary_options._fill_market_from_rest", side_effect=_mock_fill_market_from_rest)
+def test_create_bo_market_with_bracket_pushes_to_queue(mock_fill, client, test_bot, fake_sync_redis):
+    """MARKET order with TP/SL should fill via REST then push prefilled order to queue."""
     bot_name, api_key = test_bot
-
-    # Seed Redis with token_id so the order goes through ME
-    fake_sync_redis.hset("price:BTC:M5:UP", mapping={
-        "token_id": "fake-token-btc-m5-up",
-        "best_ask": "0.52",
-        "updated_at": "9999999999",
-    })
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -82,26 +82,27 @@ def test_create_bo_market_with_bracket_pushes_to_queue(client, test_bot, fake_sy
     )
 
     assert resp.status_code == 201
+    data = resp.json()
+    # MARKET orders are now filled immediately via REST
+    assert data["avg_price"] == 0.52
+    assert data["num_shares"] is not None
+    assert data["me_order_status"] == "PREFILLED"
 
     queue_len = fake_sync_redis.llen(QUEUE_ORDERS_NEW)
     assert queue_len == 1
 
     raw = fake_sync_redis.rpop(QUEUE_ORDERS_NEW)
     order = json.loads(raw)
+    assert order["prefilled"] is True
+    assert order["prefilled_avg_price"] == 0.52
     assert order["tp_price"] == 0.70
     assert order["sl_price"] == 0.30
 
 
-def test_create_bo_market_no_bracket_skips_queue(client, test_bot, fake_sync_redis):
-    """Plain MARKET order (no TP/SL) is also pushed to queue for ME tracking."""
+@patch("routers.binary_options._fill_market_from_rest", side_effect=_mock_fill_market_from_rest)
+def test_create_bo_market_no_bracket_skips_queue(mock_fill, client, test_bot, fake_sync_redis):
+    """Plain MARKET order (no TP/SL) fills via REST and does NOT push to queue."""
     bot_name, api_key = test_bot
-
-    # Seed Redis with token_id so the order goes through ME
-    fake_sync_redis.hset("price:BTC:M5:UP", mapping={
-        "token_id": "fake-token-btc-m5-up",
-        "best_ask": "0.52",
-        "updated_at": "9999999999",
-    })
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -115,7 +116,12 @@ def test_create_bo_market_no_bracket_skips_queue(client, test_bot, fake_sync_red
     )
 
     assert resp.status_code == 201
+    data = resp.json()
+    # MARKET orders are now filled immediately via REST
+    assert data["avg_price"] == 0.52
+    assert data["num_shares"] is not None
+    assert data["me_order_status"] is None
 
-    # All orders go through ME when token_id is available
+    # No queue push — scheduler settles, no ME involvement
     queue_len = fake_sync_redis.llen(QUEUE_ORDERS_NEW)
-    assert queue_len == 1
+    assert queue_len == 0

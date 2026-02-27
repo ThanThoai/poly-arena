@@ -4,8 +4,10 @@ RedisWriter — writes price data and bracket exit events to Redis.
 Used by the WS Feed Service to publish data that FastAPI consumes.
 """
 
+import json
 import logging
 import time
+from decimal import Decimal
 from typing import Optional
 
 import redis.asyncio as aioredis
@@ -13,6 +15,7 @@ import redis.asyncio as aioredis
 from ws_feed_service.config import (
     PRICE_KEY_PREFIX,
     PRICE_CACHE_TTL_S,
+    ORDERBOOK_KEY_PREFIX,
     STREAM_BRACKET_EXITS,
     STREAM_ORDER_CANCELS,
     STREAM_ORDER_FILLS,
@@ -134,6 +137,43 @@ class RedisWriter:
             )
         except Exception as exc:
             logger.error("RedisWriter.clear_price_keys failed: %s", exc)
+
+    async def update_orderbook(
+        self,
+        token_id: str,
+        bids: list[tuple[Decimal, Decimal]],
+        asks: list[tuple[Decimal, Decimal]],
+    ) -> None:
+        """
+        Write top-N orderbook depth for all (sym, tf, dir) combos mapped to this token_id.
+
+        Key format: orderbook:{SYM}:{TF}:{DIR}
+        Hash fields: bids, asks, updated_at
+
+        bids/asks are JSON arrays of [price, size] pairs (already sorted by caller).
+        """
+        combos = self._token_map.get(token_id)
+        if not combos:
+            return
+
+        now_ts = str(time.time())
+        bids_json = json.dumps([[float(p), float(s)] for p, s in bids])
+        asks_json = json.dumps([[float(p), float(s)] for p, s in asks])
+
+        pipe = self._r.pipeline(transaction=False)
+        for sym, tf, direction in combos:
+            key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
+            pipe.hset(key, mapping={
+                "bids": bids_json,
+                "asks": asks_json,
+                "updated_at": now_ts,
+            })
+            pipe.expire(key, PRICE_CACHE_TTL_S)
+
+        try:
+            await pipe.execute()
+        except Exception as exc:
+            logger.error("RedisWriter.update_orderbook failed: %s", exc)
 
     async def publish_bracket_exit(
         self,

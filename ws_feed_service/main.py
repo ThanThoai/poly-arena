@@ -21,15 +21,17 @@ from services.redis_client import get_async_redis, get_sync_redis, close_async_r
 from services.matching_engine import MatchingEngine, get_engine
 from services.token_registry import TokenRegistry
 from services.ws_feed import PolymarketFeed
-from ws_feed_service.config import QUEUE_ORDERS_NEW
+from ws_feed_service.config import QUEUE_ORDERS_NEW, ORDERBOOK_DEPTH_LEVELS
 from ws_feed_service.redis_writer import RedisWriter
 from ws_feed_service.order_consumer import OrderConsumer
 
 from database import SessionLocal
 from models import BinaryOption, BOResult
 
+_log_level = logging.DEBUG if os.getenv("DEBUG", "").strip() in ("1", "true", "yes") else logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s  %(levelname)-8s  %(name)s: %(message)s",
 )
 log = logging.getLogger("ws_feed_service")
@@ -77,11 +79,15 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
                 )
                 continue
 
-            # Skip orders with NULL avg_price or num_shares (corrupt data)
-            if bo.avg_price is None or bo.num_shares is None:
+            # Unfilled LIMIT orders: avg_price/num_shares are NULL by design.
+            # Re-push them with limit_price as price and amount/limit_price as quantity
+            # so the matching engine can attempt to fill them.
+            is_unfilled = bo.avg_price is None or bo.num_shares is None
+            if is_unfilled and not is_limit:
+                # Non-LIMIT order with NULL fill data — truly corrupt, skip
                 skipped += 1
                 log.warning(
-                    "Recovery: skipping BO #%d — avg_price/num_shares is NULL",
+                    "Recovery: skipping BO #%d — avg_price/num_shares is NULL (non-LIMIT)",
                     bo.id,
                 )
                 continue
@@ -114,18 +120,43 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
                 )
                 continue
 
-            order_data = json.dumps({
+            # Determine if this is an already-filled order (MARKET+bracket)
+            # that should be registered as prefilled (monitoring only)
+            is_already_filled = (
+                not is_unfilled
+                and not is_limit
+                and has_bracket
+            )
+
+            if is_unfilled:
+                # Unfilled LIMIT: use limit_price as price, amount/limit_price as quantity
+                rec_price = bo.limit_price
+                rec_quantity = round(bo.amount / bo.limit_price, 8)
+            else:
+                rec_price = bo.avg_price
+                rec_quantity = bo.num_shares
+
+            payload = {
                 "bo_id": bo.id,
                 "token_id": token_id,
                 "side": "BUY",
-                "price": bo.avg_price,
-                "quantity": bo.num_shares,
+                "price": rec_price,
+                "quantity": rec_quantity,
                 "limit_price": bo.limit_price,
                 "tp_price": bo.tp_price,
                 "sl_price": bo.sl_price,
                 "timeframe": tf_val,
                 "ttl": ttl_remaining,
-            })
+            }
+
+            # Already-filled MARKET+bracket: set prefilled so OrderConsumer
+            # registers for bracket monitoring instead of re-matching
+            if is_already_filled:
+                payload["prefilled"] = True
+                payload["prefilled_avg_price"] = bo.avg_price
+                payload["prefilled_filled"] = bo.num_shares
+
+            order_data = json.dumps(payload)
             sync_redis.lpush(QUEUE_ORDERS_NEW, order_data)
             count += 1
     except Exception as exc:
@@ -164,14 +195,20 @@ def _patch_dispatch_event(engine: MatchingEngine, writer: RedisWriter, loop: asy
                         float(best_bid) if best_bid is not None else None,
                     )
                     try:
-                        # _handle_message is called synchronously from within
-                        # the asyncio event loop (in the WS listener coroutine).
-                        # Use ensure_future which works from the same thread;
-                        # run_coroutine_threadsafe also works but is designed
-                        # for cross-thread scheduling.
                         asyncio.ensure_future(coro, loop=loop)
                     except Exception:
                         pass
+
+                # Publish orderbook depth
+                try:
+                    bid_depth = book.depth("bid", ORDERBOOK_DEPTH_LEVELS)
+                    ask_depth = book.depth("ask", ORDERBOOK_DEPTH_LEVELS)
+                    depth_coro = writer.update_orderbook(
+                        asset_id, bid_depth, ask_depth,
+                    )
+                    asyncio.ensure_future(depth_coro, loop=loop)
+                except Exception:
+                    pass
 
     engine.dispatch_event = patched_dispatch
     log.info("Patched engine.dispatch_event to write prices to Redis")

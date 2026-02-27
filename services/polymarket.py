@@ -72,10 +72,10 @@ def get_current_time_et():
     et_tz = ZoneInfo("America/New_York")
     now_et = datetime.now(et_tz)
 
-    month = now_et.strftime("%B").lower()                      # "february"
-    day   = str(now_et.day)                                    # "26" (no pad)
-    hour  = str(now_et.hour % 12 or 12)                        # "2"  (no pad)
-    ampm  = "am" if now_et.hour < 12 else "pm"
+    month = now_et.strftime("%B").lower()  # "february"
+    day = str(now_et.day)  # "26" (no pad)
+    hour = str(now_et.hour % 12 or 12)  # "2"  (no pad)
+    ampm = "am" if now_et.hour < 12 else "pm"
 
     return f"{month}-{day}-{hour}{ampm}-et"
 
@@ -181,8 +181,36 @@ class PolymarketClient:
             token_id=token_id,
         )
 
+    def get_token_id(
+        self, symbol: str, timeframe: str, status: str,
+    ) -> str:
+        """
+        Resolve the current token_id for a symbol/timeframe/status combo
+        without fetching book prices.
+        """
+        tf_norm = _TF_NORMALIZE.get(timeframe.upper(), timeframe.lower())
+        if tf_norm not in _TF_SECONDS:
+            raise ValueError(f"Unsupported timeframe: {timeframe!r}")
+
+        status = status.upper()
+        if status not in _STATUS_INDEX:
+            raise ValueError(f"status must be 'UP' or 'DOWN', got {status!r}")
+
+        if tf_norm == "1h":
+            slug = self._slug_v2(symbol)
+        else:
+            ts = self._next_settlement(tf_norm)
+            slug = self._slug(symbol, tf_norm, ts)
+
+        ids = self._token_ids(slug)
+        return ids[_STATUS_INDEX[status]]
+
     def get_token_id_at(
-        self, symbol: str, timeframe: str, status: str, settlement_ts: int,
+        self,
+        symbol: str,
+        timeframe: str,
+        status: str,
+        settlement_ts: int,
     ) -> Optional[str]:
         """
         Fetch token_id for a specific settlement timestamp.

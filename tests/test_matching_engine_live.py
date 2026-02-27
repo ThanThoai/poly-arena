@@ -99,7 +99,7 @@ def test_section4_matching_buy():
         ],
     )
     # BUY 100 @ 0.52 — should consume 0.50(30) + 0.51(40) + 0.52(30)
-    order = book.place_virtual_order(OrderSide.BUY, Decimal("0.52"), Decimal("100"))
+    order, _ = book.place_virtual_order(OrderSide.BUY, Decimal("0.52"), Decimal("100"))
     ok(order.status == OrderStatus.FILLED, "BUY fully filled across 3 levels")
     ok(order.filled == Decimal("100"), f"filled=100 (got {order.filled})")
     ok(Decimal("0.50") not in book.asks, "0.50 level fully consumed")
@@ -119,7 +119,7 @@ def test_section4_matching_sell():
         ],
         asks=[],
     )
-    order = book.place_virtual_order(OrderSide.SELL, Decimal("0.93"), Decimal("100"))
+    order, _ = book.place_virtual_order(OrderSide.SELL, Decimal("0.93"), Decimal("100"))
     ok(order.status == OrderStatus.FILLED, "SELL fully filled")
     ok(order.filled == Decimal("100"), f"filled=100 (got {order.filled})")
     ok(Decimal("0.95") not in book.bids, "0.95 consumed")
@@ -134,7 +134,7 @@ def test_section4_partial_fill():
         bids=[],
         asks=[{"price": "0.50", "size": "30"}],
     )
-    order = book.place_virtual_order(OrderSide.BUY, Decimal("0.50"), Decimal("100"))
+    order, _ = book.place_virtual_order(OrderSide.BUY, Decimal("0.50"), Decimal("100"))
     ok(order.status == OrderStatus.PARTIAL, "status=PARTIAL when book exhausted")
     ok(order.filled == Decimal("30"), f"filled=30 (got {order.filled})")
     ok(order.remaining_qty == Decimal("70"), "remaining=70")
@@ -185,7 +185,7 @@ def test_section3_event_routing():
 
     # market_resolved cancels open virtual orders
     engine.place_virtual_order("tok1", OrderSide.BUY,
-                                Decimal("0.50"), Decimal("999"))
+                                Decimal("0.50"), Decimal("999"))  # ignore return
     engine.dispatch_event({"event_type": "market_resolved", "asset_id": "tok1"})
     with book._lock:
         canceled = [o for o in book._virtual_orders
@@ -209,7 +209,7 @@ def test_section5_take_profit():
 
     # Place a BUY order — fills immediately AND TP fires during placement
     # because best_bid (0.80) >= tp_price (0.75)
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.55"),
         quantity=Decimal("100"),
@@ -240,7 +240,7 @@ def test_section5_stop_loss():
     )
 
     # SL fires during placement: best_bid (0.25) <= sl (0.35)
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.40"),
         quantity=Decimal("100"),
@@ -266,7 +266,7 @@ def test_section5_partial_fill_bracket():
         asks=[{"price": "0.50", "size": "30"}],  # only 30 in asks
     )
     # BUY 100 but only 30 fills; TP fires during placement (0.80 >= 0.70)
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.50"),
         quantity=Decimal("100"),
@@ -287,7 +287,7 @@ def test_section5_oco_sl_after_tp():
         asks=[{"price": "0.50", "size": "100"}],
     )
     # Both TP and SL conditions met at placement, but TP wins OCO
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.50"),
         quantity=Decimal("50"),
@@ -313,7 +313,7 @@ def test_section3_best_bid_ask_triggers_bracket():
         "asks": [{"price": "0.70", "size": "100"}],
     })
     # Place filled BUY with TP at 0.55 (already triggerable)
-    order = engine.place_virtual_order(
+    order, _ = engine.place_virtual_order(
         "bba_tok", OrderSide.BUY, Decimal("0.70"), Decimal("50"),
         tp_price=Decimal("0.55"),  # best_bid=0.60 >= 0.55 → fires
     )
@@ -340,7 +340,7 @@ def test_section3_last_trade_triggers_bracket():
         "bids": [{"price": "0.50", "size": "300"}],
         "asks": [{"price": "0.60", "size": "100"}],
     })
-    order = engine.place_virtual_order(
+    order, _ = engine.place_virtual_order(
         "ltp_tok", OrderSide.BUY, Decimal("0.60"), Decimal("50"),
         sl_price=Decimal("0.55"),  # best_bid=0.50 <= 0.55 → SL fires
     )
@@ -368,7 +368,7 @@ def test_avg_entry_price_tracking():
         ],
     )
     # BUY 70 @ 0.52 — fills 30@0.50 + 40@0.51
-    order = book.place_virtual_order(OrderSide.BUY, Decimal("0.52"), Decimal("70"))
+    order, _ = book.place_virtual_order(OrderSide.BUY, Decimal("0.52"), Decimal("70"))
     ok(order.status == OrderStatus.FILLED, "BUY fully filled")
     # avg = (30*0.50 + 40*0.51) / 70 = (15+20.4) / 70 = 35.4/70 ≈ 0.505714...
     expected = (Decimal("30") * Decimal("0.50") + Decimal("40") * Decimal("0.51")) / Decimal("70")
@@ -387,7 +387,7 @@ def test_calculate_profit_tp():
         ],
     )
     # TP fires during placement: best_bid(0.80) >= tp(0.70)
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         OrderSide.BUY, Decimal("0.55"), Decimal("50"),
         tp_price=Decimal("0.70"),
     )
@@ -414,7 +414,7 @@ def test_calculate_profit_sl():
         asks=[{"price": "0.50", "size": "100"}],
     )
     # SL fires during placement: best_bid(0.30) <= sl(0.40)
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         OrderSide.BUY, Decimal("0.50"), Decimal("40"),
         sl_price=Decimal("0.40"),
     )
@@ -434,7 +434,7 @@ def test_cancel_individual_order():
         asks=[{"price": "0.50", "size": "30"}],
     )
     # BUY 100 but only 30 available → PARTIAL
-    order = book.place_virtual_order(OrderSide.BUY, Decimal("0.50"), Decimal("100"))
+    order, _ = book.place_virtual_order(OrderSide.BUY, Decimal("0.50"), Decimal("100"))
     ok(order.status == OrderStatus.PARTIAL, "partial fill")
     ok(order.filled == Decimal("30"), "30 filled")
     ok(order.avg_entry_price == Decimal("0.50"), "avg_entry=0.50")
@@ -464,7 +464,7 @@ def test_partial_exit_not_fully_closed():
         asks=[{"price": "0.50", "size": "100"}],
     )
     # TP fires during placement but only 20 shares can exit (bids exhausted)
-    order = book.place_virtual_order(
+    order, _ = book.place_virtual_order(
         OrderSide.BUY, Decimal("0.50"), Decimal("100"),
         tp_price=Decimal("0.70"),
     )
@@ -599,7 +599,7 @@ async def run_live_tests():
         tp  = (ask * Decimal("1.15")).quantize(Decimal("0.001"))
         sl  = (ask * Decimal("0.80")).quantize(Decimal("0.001"))
 
-        order = engine.place_virtual_order(
+        order, _ = engine.place_virtual_order(
             tid, OrderSide.BUY, ask, qty,
             tp_price=tp, sl_price=sl,
         )
@@ -652,7 +652,7 @@ async def run_live_tests():
             bk = ws_engine.get_book(tid)
             if bk and bk.best_ask():
                 ask_ = bk.best_ask()
-                order_ = ws_engine.place_virtual_order(
+                order_, _ = ws_engine.place_virtual_order(
                     tid, OrderSide.BUY, ask_, Decimal("10"),
                     tp_price=(ask_ * Decimal("1.05")).quantize(Decimal("0.001")),
                     sl_price=(ask_ * Decimal("0.95")).quantize(Decimal("0.001")),

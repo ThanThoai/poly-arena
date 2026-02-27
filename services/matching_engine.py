@@ -438,7 +438,7 @@ class ShadowOrderbook:
         order_type:        str                = "LIMIT",
         max_slippage:      Optional[Decimal]  = None,
         max_cost:          Optional[Decimal]  = None,
-    ) -> SimulatedOrder:
+    ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
         """
         Create a virtual order, immediately try to match it,
         and attach optional TP/SL bracket parameters (spec 2.1).
@@ -446,6 +446,13 @@ class ShadowOrderbook:
         MARKET orders use IOC (Immediate-Or-Cancel) semantics: any remaining
         quantity after sweeping the available book is immediately canceled.
         LIMIT orders remain active until filled or expired.
+
+        Returns:
+            Tuple of (order, bracket_results).  ``bracket_results`` contains any
+            TP/SL exits that fired immediately after fill.  The bracket exit
+            **callbacks are NOT fired** — the caller is responsible for invoking
+            them AFTER publishing the fill event so that the DB consumer always
+            sees the fill before the bracket exit.
 
         Expiry (one of, in priority order):
           - ``ttl_seconds`` — raw offset from now (user-specified TTL).
@@ -485,7 +492,7 @@ class ShadowOrderbook:
             expire_at=expire_at,
             _on_bracket_exit=on_bracket_exit,
         )
-        pending_callbacks: list[tuple[Callable, BracketFillResult]] = []
+        immediate_bracket_results: list[BracketFillResult] = []
         with self._lock:
             self._virtual_orders.append(order)
             # Snapshot book state BEFORE matching so we know if
@@ -518,30 +525,86 @@ class ShadowOrderbook:
                     )
             # If order filled immediately and has bracket, check TP/SL right away
             # instead of waiting for next WS event (#2).
+            # Bracket results are returned to the caller — callbacks are NOT
+            # fired here so the caller can publish fill events FIRST.
             if order.is_eligible_for_bracket and self.bids:
                 current_best_bid = max(self.bids.keys())
                 triggered = False
                 if order.tp_price is not None and current_best_bid >= order.tp_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "TP")
                     self._bracket_log.append(result)
-                    if order._on_bracket_exit is not None:
-                        pending_callbacks.append((order._on_bracket_exit, result))
+                    immediate_bracket_results.append(result)
                     triggered = True
                 if not triggered and order.sl_price is not None and current_best_bid <= order.sl_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "SL")
                     self._bracket_log.append(result)
-                    if order._on_bracket_exit is not None:
-                        pending_callbacks.append((order._on_bracket_exit, result))
+                    immediate_bracket_results.append(result)
             # Collect state changes before releasing the lock
             state_events = self.collect_state_changes()
-        # Fire callbacks outside lock
-        for cb, res in pending_callbacks:
-            try:
-                cb(res)
-            except Exception as exc:
-                logger.error("bracket exit callback error (initial): %s", exc, exc_info=True)
+        # Fire state-change callbacks outside lock (for other orders on same book)
         self._fire_state_change_callbacks(state_events)
-        return order
+        return order, immediate_bracket_results
+
+    # ── Pre-filled bracket order (for MARKET orders filled via REST) ────────
+
+    def place_prefilled_bracket_order(
+        self,
+        side:              OrderSide,
+        avg_entry_price:   Decimal,
+        filled:            Decimal,
+        tp_price:          Optional[Decimal] = None,
+        sl_price:          Optional[Decimal] = None,
+        on_bracket_exit:   Optional[Callable] = None,
+    ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
+        """
+        Register an already-filled order for bracket (TP/SL) monitoring only.
+        No matching is attempted — the order is injected as FILLED.
+
+        Used for MARKET orders that were filled via Polymarket REST API.
+        The ME only monitors TP/SL conditions and fires bracket exit callbacks.
+
+        Returns:
+            Tuple of (order, bracket_results).  Bracket exit callbacks are NOT
+            fired — the caller must invoke them after ensuring DB state is ready.
+        """
+        order = SimulatedOrder(
+            order_id=str(uuid.uuid4()),
+            side=side,
+            price=avg_entry_price,
+            quantity=filled,
+            order_type="MARKET",
+            filled=filled,
+            status=OrderStatus.FILLED,
+            _entry_cost=avg_entry_price * filled,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            _on_bracket_exit=on_bracket_exit,
+        )
+
+        immediate_bracket_results: list[BracketFillResult] = []
+        with self._lock:
+            self._virtual_orders.append(order)
+
+            # Check TP/SL immediately against current best_bid
+            if order.is_eligible_for_bracket and self.bids:
+                current_best_bid = max(self.bids.keys())
+                triggered = False
+                if order.tp_price is not None and current_best_bid >= order.tp_price:
+                    result = self._execute_bracket_exit(order, current_best_bid, "TP")
+                    self._bracket_log.append(result)
+                    immediate_bracket_results.append(result)
+                    triggered = True
+                if not triggered and order.sl_price is not None and current_best_bid <= order.sl_price:
+                    result = self._execute_bracket_exit(order, current_best_bid, "SL")
+                    self._bracket_log.append(result)
+                    immediate_bracket_results.append(result)
+
+        logger.info(
+            "Prefilled bracket order registered: id=%s filled=%s avg=%s tp=%s sl=%s",
+            order.order_id[:12], order.filled, order.avg_entry_price,
+            tp_price, sl_price,
+        )
+        return order, immediate_bracket_results
 
     # ── State-change callback registration ───────────────────────────────────
 
@@ -687,7 +750,10 @@ class ShadowOrderbook:
 
         def _is_prunable(o: SimulatedOrder) -> bool:
             if o.status == OrderStatus.CANCELED:
-                # Use expire_at as the reference time for canceled orders
+                # Don't prune CANCELED orders that still have active brackets
+                # (e.g. MARKET IOC partial fill → CANCELED but filled > 0 with TP/SL)
+                if o.is_eligible_for_bracket:
+                    return False
                 ref = o.expire_at or o.created_at
                 return (now - ref) > grace
             if o.status == OrderStatus.FILLED and o.position_closed:
@@ -1346,7 +1412,7 @@ class MatchingEngine:
         order_type:        str                = "LIMIT",
         max_slippage:      Optional[Decimal]  = None,
         max_cost:          Optional[Decimal]  = None,
-    ) -> SimulatedOrder:
+    ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
         """
         Convenience wrapper: get/create book and place a virtual order.
 
@@ -1366,6 +1432,25 @@ class MatchingEngine:
         return book.place_virtual_order(
             side, price, quantity, tp_price, sl_price, timeframe, ttl_seconds,
             on_bracket_exit, order_type, max_slippage, max_cost,
+        )
+
+    def place_prefilled_bracket_order(
+        self,
+        token_id:          str,
+        side:              OrderSide,
+        avg_entry_price:   Decimal,
+        filled:            Decimal,
+        tp_price:          Optional[Decimal] = None,
+        sl_price:          Optional[Decimal] = None,
+        on_bracket_exit:   Optional[Callable] = None,
+    ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
+        """
+        Convenience wrapper: get/create book and register a pre-filled bracket order.
+        Used for MARKET orders filled via REST that need TP/SL monitoring.
+        """
+        book = self.get_or_create_book(token_id)
+        return book.place_prefilled_bracket_order(
+            side, avg_entry_price, filled, tp_price, sl_price, on_bracket_exit,
         )
 
     def cancel_order(self, token_id: str, order_id: str) -> Optional[SimulatedOrder]:

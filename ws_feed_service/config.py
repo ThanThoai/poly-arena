@@ -15,6 +15,11 @@ PRICE_KEY_PREFIX = "price"          # price:{SYM}:{TF}:{DIR}
 PRICE_CACHE_TTL_S = 120             # EXPIRE on each HSET (2 min to survive session gaps)
 STALE_THRESHOLD_S = 45              # FastAPI treats older prices as stale
 
+# ── Orderbook depth ─────────────────────────────────────────────────────────
+
+ORDERBOOK_KEY_PREFIX = "orderbook"  # orderbook:{SYM}:{TF}:{DIR}
+ORDERBOOK_DEPTH_LEVELS = 20         # Top N levels to publish per side
+
 # ── Queue / stream tuning ────────────────────────────────────────────────────
 
 BRPOP_TIMEOUT_S = 1                 # OrderConsumer BRPOP blocking timeout

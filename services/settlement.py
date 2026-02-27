@@ -24,7 +24,7 @@ _PAYOUT_RATE = 1.00  # fallback khi thiếu price_open / num_shares
 
 
 def _utc(dt: datetime | None) -> datetime | None:
-    """Ensure a datetime is UTC-aware. SQLite returns naive datetimes."""
+    """Ensure a datetime is UTC-aware (guards against naive datetimes from legacy data)."""
     if dt is None:
         return None
     if dt.tzinfo is None:

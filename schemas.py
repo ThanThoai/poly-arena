@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from models import BOResult, BOSymbol, BOTimeframe, BOForecast
 
@@ -45,6 +45,25 @@ class BOCreate(BaseModel):
         if v is not None and not (0 < v <= 1):
             raise ValueError("slippage_tolerance must be between 0 (exclusive) and 1 (inclusive)")
         return v
+
+    @model_validator(mode="after")
+    def validate_bracket_prices(self) -> "BOCreate":
+        tp = self.tp_price
+        sl = self.sl_price
+        limit = self.limit_price
+
+        # TP must be greater than SL
+        if tp is not None and sl is not None and tp <= sl:
+            raise ValueError("tp_price must be greater than sl_price")
+
+        # For LIMIT orders, validate TP/SL relative to limit_price
+        if limit is not None:
+            if tp is not None and tp <= limit:
+                raise ValueError("tp_price must be greater than limit_price for LIMIT BUY orders")
+            if sl is not None and sl >= limit:
+                raise ValueError("sl_price must be less than limit_price for LIMIT BUY orders")
+
+        return self
 
 
 class BOResponse(BaseModel):

@@ -288,13 +288,16 @@ def test_on_bracket_exit_callback_called_on_tp():
     book.asks = {Decimal("0.50"): Decimal("200")}
 
     received = []
-    order = book.place_virtual_order(
+    order, bracket_results = book.place_virtual_order(
         side            = OrderSide.BUY,
         price           = Decimal("0.50"),
         quantity        = Decimal("200"),
         tp_price        = Decimal("0.65"),
         on_bracket_exit = lambda r: received.append(r),
     )
+    # Fire any immediate bracket results
+    for br in bracket_results:
+        received.append(br)
     assert order.status == OrderStatus.FILLED
 
     book.monitor_bracket_orders()
@@ -311,13 +314,15 @@ def test_on_bracket_exit_callback_called_on_sl():
     book.asks = {Decimal("0.50"): Decimal("200")}
 
     received = []
-    order = book.place_virtual_order(
+    order, bracket_results = book.place_virtual_order(
         side            = OrderSide.BUY,
         price           = Decimal("0.50"),
         quantity        = Decimal("200"),
         sl_price        = Decimal("0.40"),
         on_bracket_exit = lambda r: received.append(r),
     )
+    for br in bracket_results:
+        received.append(br)
     assert order.status == OrderStatus.FILLED
 
     book.monitor_bracket_orders()
@@ -333,12 +338,14 @@ def test_no_callback_without_bracket():
     book.asks = {Decimal("0.50"): Decimal("200")}
 
     received = []
-    order = book.place_virtual_order(
+    order, bracket_results = book.place_virtual_order(
         side            = OrderSide.BUY,
         price           = Decimal("0.50"),
         quantity        = Decimal("200"),
         on_bracket_exit = lambda r: received.append(r),
     )
+    for br in bracket_results:
+        received.append(br)
     book.monitor_bracket_orders()
     assert len(received) == 0  # no TP/SL → no callback
 
@@ -350,13 +357,15 @@ def test_callback_not_called_twice_after_position_closed():
     book.asks = {Decimal("0.50"): Decimal("200")}
 
     received = []
-    book.place_virtual_order(
+    _, bracket_results = book.place_virtual_order(
         side            = OrderSide.BUY,
         price           = Decimal("0.50"),
         quantity        = Decimal("200"),
         tp_price        = Decimal("0.65"),
         on_bracket_exit = lambda r: received.append(r),
     )
+    for br in bracket_results:
+        received.append(br)
 
     book.monitor_bracket_orders()  # fires TP, position_closed=True
     book.monitor_bracket_orders()  # second tick — should NOT fire again

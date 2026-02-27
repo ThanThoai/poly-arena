@@ -97,23 +97,94 @@ class OrderConsumer:
 
         bo_id = data.get("bo_id")
         token_id = data.get("token_id")
-        side = OrderSide(data.get("side", "BUY"))
-        price = Decimal(str(data["price"]))
-        quantity = Decimal(str(data["quantity"]))
-        amount = data.get("amount")  # original dollar amount from API
-        limit_price = data.get("limit_price")
+        is_prefilled = data.get("prefilled", False)
+
         tp_price = data.get("tp_price")
         sl_price = data.get("sl_price")
-        timeframe = data.get("timeframe")
-        ttl = data.get("ttl")  # TTL in seconds (None = use candle expiry)
-        slippage_tolerance = data.get("slippage_tolerance")  # 0.0-1.0 or None
-
         has_bracket = tp_price is not None or sl_price is not None
-        is_market = limit_price is None
 
         on_bracket_exit = None
         if has_bracket and bo_id is not None:
             on_bracket_exit = self._make_bracket_callback(bo_id)
+
+        if is_prefilled:
+            # ── Pre-filled MARKET order: register for bracket monitoring only ──
+            self._process_prefilled_order(data, bo_id, token_id, on_bracket_exit)
+        else:
+            # ── Standard order flow (LIMIT or legacy MARKET) ──────────────────
+            self._process_standard_order(data, bo_id, token_id, on_bracket_exit)
+
+    def _process_prefilled_order(
+        self, data: dict, bo_id: Optional[int],
+        token_id: Optional[str], on_bracket_exit,
+    ) -> None:
+        """Handle a pre-filled MARKET order — register for bracket monitoring only."""
+        tp_price = data.get("tp_price")
+        sl_price = data.get("sl_price")
+
+        try:
+            order, bracket_results = self._engine.place_prefilled_bracket_order(
+                token_id=token_id,
+                side=OrderSide.BUY,
+                avg_entry_price=Decimal(str(data["prefilled_avg_price"])),
+                filled=Decimal(str(data["prefilled_filled"])),
+                tp_price=Decimal(str(tp_price)) if tp_price else None,
+                sl_price=Decimal(str(sl_price)) if sl_price else None,
+                on_bracket_exit=on_bracket_exit,
+            )
+
+            logger.info(
+                "Prefilled bracket order registered from queue: bo_id=%s "
+                "me_order=%s filled=%s avg=%s tp=%s sl=%s",
+                bo_id, order.order_id[:12],
+                order.filled, order.avg_entry_price,
+                tp_price, sl_price,
+            )
+
+            # Register for centralized monitoring (bracket exits)
+            if bo_id is not None:
+                self._order_to_bo[order.order_id] = bo_id
+                book = self._engine.get_book(token_id)
+                if book is not None:
+                    # Seed as FILLED so no duplicate fill events are emitted
+                    book.seed_last_reported(order.order_id, order.filled, order.status)
+                    if token_id not in self._registered_books:
+                        book.register_state_change_callback(self._on_state_changes)
+                        self._registered_books.add(token_id)
+                        logger.info(
+                            "Registered state-change callback on book %s",
+                            token_id[:16],
+                        )
+
+            # Fire bracket exit callbacks AFTER registration is complete.
+            # For prefilled orders, DB already has avg_price/num_shares from
+            # order creation, so bracket exit consumer can safely read them.
+            for br in bracket_results:
+                if on_bracket_exit is not None:
+                    on_bracket_exit(br)
+        except Exception as exc:
+            logger.error(
+                "Failed to place prefilled bracket order for bo_id=%s: %s",
+                bo_id, exc,
+            )
+
+    def _process_standard_order(
+        self, data: dict, bo_id: Optional[int],
+        token_id: Optional[str], on_bracket_exit,
+    ) -> None:
+        """Handle standard LIMIT/MARKET order flow via matching engine."""
+        side = OrderSide(data.get("side", "BUY"))
+        price = Decimal(str(data["price"]))
+        quantity = Decimal(str(data["quantity"]))
+        amount = data.get("amount")
+        limit_price = data.get("limit_price")
+        tp_price = data.get("tp_price")
+        sl_price = data.get("sl_price")
+        timeframe = data.get("timeframe")
+        ttl = data.get("ttl")
+        slippage_tolerance = data.get("slippage_tolerance")
+
+        is_market = limit_price is None
 
         # TTL: pass as ttl_seconds so matching engine uses raw offset
         ttl_seconds = float(ttl) if ttl is not None else None
@@ -148,7 +219,7 @@ class OrderConsumer:
             if is_market and side == OrderSide.BUY and amount is not None:
                 cost_cap = Decimal(str(amount))
 
-            order = self._engine.place_virtual_order(
+            order, bracket_results = self._engine.place_virtual_order(
                 token_id=token_id,
                 side=side,
                 price=Decimal(str(limit_price)) if limit_price is not None else price,
@@ -171,7 +242,8 @@ class OrderConsumer:
                 tp_price, sl_price, ttl,
             )
 
-            # If order filled immediately, publish fill event right away
+            # Step 1: Publish fill event FIRST so DB has avg_price/num_shares
+            # before any bracket exit arrives.
             if bo_id is not None and order.filled > 0:
                 self._publish_async(
                     self._writer.publish_order_fill(
@@ -187,7 +259,7 @@ class OrderConsumer:
                     bo_id, order.filled, order.avg_entry_price, order.status.value,
                 )
 
-            # ── Register for centralized monitoring (replaces per-order threads) ──
+            # Step 2: Register for centralized monitoring
             if bo_id is not None:
                 self._order_to_bo[order.order_id] = bo_id
                 # Seed last_reported so callback won't duplicate the immediate fill
@@ -202,6 +274,13 @@ class OrderConsumer:
                             "Registered state-change callback on book %s",
                             token_id[:16],
                         )
+
+            # Step 3: Fire bracket exit callbacks AFTER fill is published.
+            # This ensures _handle_bracket_exit in API always finds
+            # avg_price/num_shares already written by _handle_order_fill.
+            for br in bracket_results:
+                if on_bracket_exit is not None:
+                    on_bracket_exit(br)
         except Exception as exc:
             logger.error(
                 "Failed to place virtual order for bo_id=%s: %s", bo_id, exc,
