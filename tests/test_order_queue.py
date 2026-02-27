@@ -21,6 +21,14 @@ def test_create_bo_limit_order_pushes_to_queue(client, test_bot, fake_sync_redis
     """LIMIT order should LPUSH to queue:orders:new."""
     bot_name, api_key = test_bot
 
+    # Seed Redis with token_id so _get_token_id_from_redis() returns a value.
+    # In production this is written by the WS Feed Service (TokenRegistry).
+    fake_sync_redis.hset("price:BTC:M5:UP", mapping={
+        "token_id": "fake-token-btc-m5-up",
+        "best_ask": "0.52",
+        "updated_at": "9999999999",
+    })
+
     resp = client.post(
         "/poly-arena/binary-options/",
         json={

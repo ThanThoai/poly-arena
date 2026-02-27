@@ -44,10 +44,11 @@ class BOForecast(str, enum.Enum):
 
 
 class BOResult(str, enum.Enum):
-    PENDING = "PENDING"
-    WIN     = "WIN"
-    LOSS    = "LOSS"
-    TIE     = "TIE"
+    PENDING   = "PENDING"
+    WIN       = "WIN"
+    LOSS      = "LOSS"
+    TIE       = "TIE"
+    CANCELLED = "CANCELLED"
 
 
 class BalanceHistory(Base):
@@ -91,4 +92,7 @@ class BinaryOption(Base):
     exit_price   = Column(Float, nullable=True)    # avg exit price when TP/SL fires (shadow)
     exit_trigger = Column(String(20), nullable=True)  # "TP" | "SL" — set when bracket fires
     exit_filled  = Column(Float, nullable=True)    # qty exited via TP/SL
-    me_order_id  = Column(String(64), nullable=True)  # matching engine SimulatedOrder ID
+    exit_at      = Column(DateTime, nullable=True)   # timestamp when TP/SL triggered
+    me_order_id     = Column(String(64), nullable=True)  # matching engine SimulatedOrder ID
+    me_order_status = Column(String(20), nullable=True)  # PENDING | PARTIAL | FILLED | CANCELED
+    ttl             = Column(Integer, nullable=True)     # TTL in seconds; None = use candle expiry

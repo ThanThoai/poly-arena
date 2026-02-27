@@ -3,21 +3,22 @@ Test fixtures for PolyArena.
 
 Test environment uses:
   - SQLite test database (separate from production orders.db)
-  - fakeredis (no real Redis needed)
-  - FastAPI TestClient on ephemeral port
+  - fakeredis when no real Redis available, real Redis in docker-compose
+  - FastAPI TestClient on port 8099
 """
 
 import os
 import sys
 
-# ── Environment MUST be set before any app imports ───────────────────────────
-os.environ["DATABASE_URL"] = "sqlite:///./test_orders.db"
-os.environ["REDIS_URL"] = "redis://localhost:6380"
+# ── Environment: set DATABASE_URL if not already provided (docker-compose sets it) ──
+os.environ.setdefault("DATABASE_URL", "sqlite:///./test_orders.db")
+os.environ.setdefault("REDIS_URL", "redis://localhost:6380")
 
 # Ensure project root is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+import redis as _real_redis
 import fakeredis
 import fakeredis.aioredis
 
@@ -28,35 +29,50 @@ from database import Base
 
 # ── Test database ────────────────────────────────────────────────────────────
 
-TEST_DB_URL = "sqlite:///./test_orders.db"
+TEST_DB_URL = os.environ["DATABASE_URL"]
 
 _test_engine = create_engine(
-    TEST_DB_URL, connect_args={"check_same_thread": False},
+    TEST_DB_URL,
+    connect_args={"check_same_thread": False} if TEST_DB_URL.startswith("sqlite") else {},
 )
 TestSessionLocal = sessionmaker(
     autocommit=False, autoflush=False, bind=_test_engine,
 )
 
-# ── Shared fake Redis server (survives across fixtures in same test) ─────────
+# ── Redis: try real connection, fall back to fakeredis ───────────────────────
 
-_fake_server = fakeredis.FakeServer()
+_USE_REAL_REDIS = False
 
-# Pre-create module-level clients so they can be patched BEFORE app import
-_fake_sync = fakeredis.FakeRedis(server=_fake_server, decode_responses=True)
-_fake_async = fakeredis.aioredis.FakeRedis(server=_fake_server, decode_responses=True)
+try:
+    _probe = _real_redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+    _probe.ping()
+    _probe.close()
+    _USE_REAL_REDIS = True
+except Exception:
+    pass
 
-# ── Eagerly patch redis_client BEFORE main.py is ever imported ───────────────
-import services.redis_client as _rc
-_rc._sync_client = _fake_sync
-_rc._async_client = _fake_async
-_rc.get_sync_redis = lambda: _fake_sync
-_rc.get_async_redis = lambda: _fake_async
+if _USE_REAL_REDIS:
+    # Real Redis — use actual clients from redis_client module
+    import services.redis_client as _rc
+    _sync_redis = _rc.get_sync_redis()
+    _async_redis = _rc.get_async_redis()
+else:
+    # Fake Redis — patch singletons before any app import
+    _fake_server = fakeredis.FakeServer()
+    _sync_redis = fakeredis.FakeRedis(server=_fake_server, decode_responses=True)
+    _async_redis = fakeredis.aioredis.FakeRedis(server=_fake_server, decode_responses=True)
+
+    import services.redis_client as _rc
+    _rc._sync_client = _sync_redis
+    _rc._async_client = _async_redis
+    _rc.get_sync_redis = lambda: _sync_redis
+    _rc.get_async_redis = lambda: _async_redis
+
 
 # ── Eagerly patch database BEFORE main.py is ever imported ───────────────────
 import database as _db_mod
 _db_mod.engine = _test_engine
 _db_mod.SessionLocal = TestSessionLocal
-_original_get_db = _db_mod.get_db
 
 def _get_test_db():
     session = TestSessionLocal()
@@ -77,7 +93,7 @@ def setup_test_db():
     yield
     Base.metadata.drop_all(bind=_test_engine)
     # Flush Redis between tests
-    _fake_sync.flushall()
+    _sync_redis.flushall()
 
 
 @pytest.fixture()
@@ -93,20 +109,25 @@ def db():
 
 @pytest.fixture()
 def fake_sync_redis():
-    """Sync fakeredis client."""
-    return _fake_sync
+    """Sync Redis client (real or fake depending on environment)."""
+    return _sync_redis
 
 
 @pytest.fixture()
 def fake_async_redis():
-    """Async fakeredis client."""
-    return _fake_async
+    """Async Redis client (real or fake depending on environment)."""
+    return _async_redis
 
 
 # ── FastAPI test client ──────────────────────────────────────────────────────
 
 async def _noop_consumer():
-    """Replacement for _consume_bracket_exits in tests — sleeps forever."""
+    """Replacement for _consume_bracket_exits in tests.
+
+    fakeredis xreadgroup(block=N) returns immediately instead of blocking,
+    which causes an infinite tight loop. With real Redis the consumer works
+    but is unnecessary during unit tests. Replace with a no-op in both cases.
+    """
     import asyncio
     try:
         await asyncio.Event().wait()
@@ -117,17 +138,16 @@ async def _noop_consumer():
 @pytest.fixture()
 def client():
     """
-    FastAPI TestClient with test DB and fake Redis.
-    Patches are already applied at module level.
-
-    The bracket exit consumer is replaced with a no-op to avoid
-    tight-looping (fakeredis xreadgroup doesn't truly block).
+    FastAPI TestClient with test DB and Redis.
+    Uses port 8099 to avoid conflict with production.
     """
     from unittest.mock import patch as _patch
 
     with _patch("services.scheduler.start_scheduler"), \
          _patch("services.scheduler.stop_scheduler"), \
-         _patch("main._consume_bracket_exits", _noop_consumer):
+         _patch("main._consume_bracket_exits", _noop_consumer), \
+         _patch("main._consume_order_cancels", _noop_consumer), \
+         _patch("main._consume_order_fills", _noop_consumer):
         from fastapi.testclient import TestClient
         from main import app
         with TestClient(app, base_url="http://testserver:8099") as c:

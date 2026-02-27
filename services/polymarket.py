@@ -60,21 +60,23 @@ class OrderbookResult:
 
 
 def get_current_time_et():
-    # 1. Xác định múi giờ ET (America/New_York)
-    et_tz = ZoneInfo("America/New_York")
+    """
+    Return the current ET time formatted as Polymarket H1 slug suffix.
 
-    # 2. Lấy thời gian hiện tại tại múi giờ đó
+    Polymarket slugs use non-zero-padded day and hour:
+        bitcoin-up-or-down-february-26-2pm-et   ← correct
+        bitcoin-up-or-down-february-26-02pm-et  ← WRONG (leading zero)
+        bitcoin-up-or-down-february-06-2pm-et   ← WRONG (leading zero on day)
+    """
+    et_tz = ZoneInfo("America/New_York")
     now_et = datetime.now(et_tz)
 
-    # 3. Format theo yêu cầu:
-    # %B: Tên tháng đầy đủ (ví dụ: February)
-    # %d: Ngày (ví dụ: 24)
-    # %I: Giờ hệ 12h (ví dụ: 12)
-    # %p: AM hoặc PM
-    # Cuối cùng dùng .lower() để viết thường toàn bộ và thêm hậu tố -et
-    formatted_time = now_et.strftime("%B-%d-%I%p-et").lower()
+    month = now_et.strftime("%B").lower()                      # "february"
+    day   = str(now_et.day)                                    # "26" (no pad)
+    hour  = str(now_et.hour % 12 or 12)                        # "2"  (no pad)
+    ampm  = "am" if now_et.hour < 12 else "pm"
 
-    return formatted_time
+    return f"{month}-{day}-{hour}{ampm}-et"
 
 
 class PolymarketClient:

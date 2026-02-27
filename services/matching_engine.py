@@ -293,6 +293,7 @@ class ShadowOrderbook:
         self.last_update: Optional[datetime]         = None
         self._virtual_orders: list[SimulatedOrder]   = []
         self._bracket_log:    list[BracketFillResult] = []
+        self._cleanup_counter: int = 0
 
     # ── Snapshot / delta handlers ────────────────────────────────────────────
 
@@ -400,23 +401,23 @@ class ShadowOrderbook:
         and attach optional TP/SL bracket parameters (spec 2.1).
 
         Expiry (one of, in priority order):
+          - ``ttl_seconds`` — raw offset from now (user-specified TTL).
           - ``timeframe``   — align to next candle close on the grid.
                               e.g. timeframe='M5', now=12:12 → expire_at=12:15
-          - ``ttl_seconds`` — raw offset from now (legacy / testing).
           - both None       — Good-Till-Canceled, never expires automatically.
 
         Args:
             timeframe:        Candle timeframe string (M5/M15/H1).
                               expire_at is aligned to the candle grid.
-            ttl_seconds:      Raw seconds from now. Used only when timeframe is None.
+            ttl_seconds:      Raw seconds from now. Takes priority over timeframe.
             on_bracket_exit:  Optional callback fired (outside lock) after every
                               TP/SL/FORCE_CLOSE exit.
                               Signature: callback(result: BracketFillResult) -> None
         """
-        if timeframe is not None:
-            expire_at = candle_expire_at(timeframe)
-        elif ttl_seconds is not None:
+        if ttl_seconds is not None:
             expire_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        elif timeframe is not None:
+            expire_at = candle_expire_at(timeframe)
         else:
             expire_at = None
 
@@ -430,12 +431,38 @@ class ShadowOrderbook:
             expire_at=expire_at,
             _on_bracket_exit=on_bracket_exit,
         )
+        pending_callbacks: list[tuple[Callable, BracketFillResult]] = []
         with self._lock:
             self._virtual_orders.append(order)
             self._match_order(order)
+            # If order filled immediately and has bracket, check TP/SL right away
+            # instead of waiting for next WS event (#2).
+            if order.is_eligible_for_bracket and self.bids:
+                current_best_bid = max(self.bids.keys())
+                triggered = False
+                if order.tp_price is not None and current_best_bid >= order.tp_price:
+                    result = self._execute_bracket_exit(order, current_best_bid, "TP")
+                    self._bracket_log.append(result)
+                    if order._on_bracket_exit is not None:
+                        pending_callbacks.append((order._on_bracket_exit, result))
+                    triggered = True
+                if not triggered and order.sl_price is not None and current_best_bid <= order.sl_price:
+                    result = self._execute_bracket_exit(order, current_best_bid, "SL")
+                    self._bracket_log.append(result)
+                    if order._on_bracket_exit is not None:
+                        pending_callbacks.append((order._on_bracket_exit, result))
+        # Fire callbacks outside lock
+        for cb, res in pending_callbacks:
+            try:
+                cb(res)
+            except Exception as exc:
+                logger.error("bracket exit callback error (initial): %s", exc, exc_info=True)
         return order
 
     # ── Matching algorithm (Section 4) ───────────────────────────────────────
+
+    _BRACKET_LOG_MAX = 500
+    _CLEANUP_INTERVAL = 50   # run cleanup every N calls to run_matching
 
     def run_matching(self) -> None:
         """Re-run matching for all active virtual orders (after book updates).
@@ -446,6 +473,50 @@ class ShadowOrderbook:
                 if order.status in (OrderStatus.FILLED, OrderStatus.CANCELED):
                     continue
                 self._match_order(order)
+            # Periodic cleanup of terminal orders to prevent memory leak
+            self._cleanup_counter += 1
+            if self._cleanup_counter >= self._CLEANUP_INTERVAL:
+                self._cleanup_counter = 0
+                self._prune_terminal_orders()
+
+    _PRUNE_GRACE_S = 30  # keep terminal orders for 30s so monitor threads can read them
+
+    def _prune_terminal_orders(self) -> None:
+        """Remove fully terminal orders from _virtual_orders.
+        Must be called while holding self._lock.
+
+        An order is terminal when:
+          - CANCELED (TTL expired, no further matching or bracket possible)
+          - FILLED + position_closed (bracket exit completed)
+        Orders that are FILLED but still have an active bracket are kept.
+
+        Terminal orders are kept for _PRUNE_GRACE_S seconds after their
+        expire_at (or last update) so monitor threads have time to read
+        the terminal status and publish events before the order disappears.
+        """
+        now = datetime.now(timezone.utc)
+        grace = timedelta(seconds=self._PRUNE_GRACE_S)
+        before = len(self._virtual_orders)
+
+        def _is_prunable(o: SimulatedOrder) -> bool:
+            if o.status == OrderStatus.CANCELED:
+                # Use expire_at as the reference time for canceled orders
+                ref = o.expire_at or o.created_at
+                return (now - ref) > grace
+            if o.status == OrderStatus.FILLED and o.position_closed:
+                return True  # bracket exit done, safe to remove immediately
+            return False
+
+        self._virtual_orders = [
+            o for o in self._virtual_orders if not _is_prunable(o)
+        ]
+        pruned = before - len(self._virtual_orders)
+        if pruned:
+            logger.info("Pruned %d terminal orders (was %d, now %d)",
+                        pruned, before, len(self._virtual_orders))
+        # Cap bracket log
+        if len(self._bracket_log) > self._BRACKET_LOG_MAX:
+            self._bracket_log = self._bracket_log[-self._BRACKET_LOG_MAX:]
 
     def expire_pending_orders(self) -> list[SimulatedOrder]:
         """
@@ -484,12 +555,14 @@ class ShadowOrderbook:
             elif order.status == OrderStatus.PARTIAL:
                 # Has partial fill — clamp quantity to filled so remaining
                 # unfilled qty is closed out and no further matching occurs.
-                # Status stays PARTIAL so settlement can use order.filled.
+                # Set status to CANCELED so the order monitor can detect it
+                # and publish the cancel event with partial fill data.
                 unfilled = order.remaining_qty
                 order.quantity = order.filled  # remaining_qty now == 0
+                order.status = OrderStatus.CANCELED
                 expired.append(order)
                 logger.info(
-                    "Order expired (PARTIAL clamped): id=%s filled=%s unfilled=%s",
+                    "Order expired (PARTIAL→CANCELED): id=%s filled=%s unfilled=%s",
                     order.order_id[:12], order.filled, unfilled,
                 )
         return expired
@@ -865,7 +938,10 @@ class MatchingEngine:
         book = self.get_or_create_book(asset_id)
 
         # Sync best bid/ask into shadow book if it's fresher than last delta
-        # (lightweight upsert — does not replace the full book)
+        # (lightweight upsert — does not replace the full book).
+        # Always refresh last_update so the book is not marked stale between
+        # full price_change snapshots — best_bid_ask events confirm the feed
+        # is alive even when top-of-book prices haven't moved.
         raw_bid = event.get("bid")
         raw_ask = event.get("ask")
         if raw_bid or raw_ask:
@@ -876,6 +952,11 @@ class MatchingEngine:
                 changes.append({"side": "ask", "price": raw_ask, "size": event.get("ask_size", "0")})
             if any(c["size"] != "0" for c in changes):
                 book.apply_changes(changes)
+            else:
+                # Prices unchanged but feed is alive — touch last_update to
+                # prevent the book from becoming stale
+                with book._lock:
+                    book.last_update = datetime.now(timezone.utc)
 
         # Trigger Workflow E
         exits = book.monitor_bracket_orders()
@@ -952,7 +1033,7 @@ class MatchingEngine:
         timeframe:        Candle timeframe (M5/M15/H1).
                           expire_at aligned to next candle close on the grid.
                           e.g. timeframe='M5', now=12:12 → expire_at=12:15
-        ttl_seconds:      Raw offset fallback (used only when timeframe is None).
+        ttl_seconds:      Raw seconds from now. Takes priority over timeframe.
         on_bracket_exit:  Callback fired after every TP/SL/FORCE_CLOSE exit.
                           Signature: callback(result: BracketFillResult) -> None
         """

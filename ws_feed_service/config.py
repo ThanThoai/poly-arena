@@ -6,12 +6,14 @@ Constants and configuration for the WS Feed Service.
 
 QUEUE_ORDERS_NEW = "queue:orders:new"
 STREAM_BRACKET_EXITS = "stream:bracket:exits"
+STREAM_ORDER_CANCELS = "stream:order:cancels"
+STREAM_ORDER_FILLS   = "stream:order:fills"
 
 # ── Price cache ──────────────────────────────────────────────────────────────
 
 PRICE_KEY_PREFIX = "price"          # price:{SYM}:{TF}:{DIR}
-PRICE_CACHE_TTL_S = 60              # EXPIRE on each HSET
-STALE_THRESHOLD_S = 30              # FastAPI treats older prices as miss
+PRICE_CACHE_TTL_S = 120             # EXPIRE on each HSET (2 min to survive session gaps)
+STALE_THRESHOLD_S = 45              # FastAPI treats older prices as stale
 
 # ── Queue / stream tuning ────────────────────────────────────────────────────
 

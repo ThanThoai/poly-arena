@@ -205,6 +205,11 @@ class TokenRegistry:
 
         Polymarket may take a few seconds after candle close to publish
         the new market.  Each retry waits _REFRESH_RETRY_DELAY seconds.
+
+        IMPORTANT: At a candle boundary we EXPECT token_ids to change.
+        If the first fetch returns the same token_ids as before, Polymarket
+        hasn't published the new market yet — we must keep retrying, NOT
+        treat "same tokens" as success.
         """
         logger.info("Candle boundary — refreshing tokens for %s", tf)
 
@@ -213,21 +218,32 @@ class TokenRegistry:
 
             if new_ids is not None:
                 if new_ids:
+                    # Token IDs actually changed → new session discovered
                     logger.info(
                         "TokenRegistry [%s] attempt %d/%d: %d new token(s)",
                         tf, attempt, _REFRESH_MAX_RETRIES, len(new_ids),
                     )
                     if self._on_new_tokens:
                         self._on_new_tokens(new_ids)
+                    return  # success — new tokens found
                 else:
-                    logger.debug("TokenRegistry [%s] attempt %d: no change", tf, attempt)
-                return  # success
+                    # Fetch succeeded but token_ids are unchanged.
+                    # At candle boundary this means Polymarket hasn't
+                    # published the new market yet — keep retrying.
+                    logger.warning(
+                        "TokenRegistry [%s] attempt %d/%d: same tokens (market not rotated yet), "
+                        "retrying in %ds",
+                        tf, attempt, _REFRESH_MAX_RETRIES, _REFRESH_RETRY_DELAY,
+                    )
+                    # Fall through to retry below
 
-            # fetch returned None → Polymarket not ready yet
-            logger.warning(
-                "TokenRegistry [%s] attempt %d/%d: market not ready, retrying in %ds",
-                tf, attempt, _REFRESH_MAX_RETRIES, _REFRESH_RETRY_DELAY,
-            )
+            else:
+                # fetch returned None → all requests failed
+                logger.warning(
+                    "TokenRegistry [%s] attempt %d/%d: market not ready, retrying in %ds",
+                    tf, attempt, _REFRESH_MAX_RETRIES, _REFRESH_RETRY_DELAY,
+                )
+
             try:
                 await asyncio.sleep(_REFRESH_RETRY_DELAY)
             except asyncio.CancelledError:

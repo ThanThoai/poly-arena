@@ -207,6 +207,43 @@ def test_refresh_calls_on_new_tokens_for_changed_ids():
     assert received == ["new-up"]
 
 
+def test_refresh_retries_when_same_tokens_at_boundary():
+    """If Polymarket returns the same token_ids at boundary, keep retrying (not a success)."""
+    received = []
+    registry = TokenRegistry(
+        on_new_tokens=lambda ids: received.extend(ids),
+        symbols=["BTC"], timeframes=["M5"],
+    )
+    registry._mapping = {
+        ("BTC", "M5", "UP"):   "old-up",
+        ("BTC", "M5", "DOWN"): "old-down",
+    }
+
+    call_count = [0]
+
+    def fake_get_orderbook(sym, tf, direction):
+        call_count[0] += 1
+        # First 2 calls return old tokens (market not rotated yet)
+        # Next 2 calls return new tokens (market rotated)
+        if call_count[0] <= 4:  # 2 directions × 2 attempts = 4 calls with old tokens
+            return _make_ob(f"old-{direction.lower()}")
+        else:
+            return _make_ob(f"new-{direction.lower()}")
+
+    with patch("services.token_registry.PolymarketClient") as MockClient:
+        instance = MockClient.return_value.__enter__.return_value
+        instance.get_orderbook.side_effect = fake_get_orderbook
+
+        with patch("services.token_registry._REFRESH_RETRY_DELAY", 0):
+            asyncio.run(registry._refresh_timeframe_with_retry("M5"))
+
+    # Should have retried and found the new tokens
+    assert "new-up" in received
+    assert "new-down" in received
+    # Should have called get_orderbook at least 6 times (2 directions × 3 attempts)
+    assert call_count[0] >= 6
+
+
 # ── ws_feed.add_tokens with re-subscribe ─────────────────────────────────────
 
 

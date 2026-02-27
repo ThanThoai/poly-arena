@@ -15,6 +15,7 @@ class BOCreate(BaseModel):
     limit_price: Optional[float] = None   # None = MARKET order; set = LIMIT order
     tp_price:    Optional[float] = None   # Take Profit — triggers shadow profit on WIN
     sl_price:    Optional[float] = None   # Stop Loss   — triggers shadow profit on LOSS
+    ttl:         Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
 
     @field_validator("amount")
     @classmethod
@@ -28,6 +29,13 @@ class BOCreate(BaseModel):
     def price_in_range(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and not (0 < v < 1):
             raise ValueError("price must be between 0 and 1 (exclusive)")
+        return v
+
+    @field_validator("ttl")
+    @classmethod
+    def ttl_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("ttl must be positive (seconds)")
         return v
 
 
@@ -58,7 +66,10 @@ class BOResponse(BaseModel):
     exit_price:   Optional[float] = None
     exit_trigger: Optional[str]   = None
     exit_filled:  Optional[float] = None
-    me_order_id:  Optional[str]   = None
+    exit_at:      Optional[datetime] = None
+    me_order_id:     Optional[str]   = None
+    me_order_status: Optional[str]   = None
+    ttl:             Optional[int]   = None
 
     model_config = {"from_attributes": True}
 
