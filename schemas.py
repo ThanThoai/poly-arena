@@ -15,7 +15,8 @@ class BOCreate(BaseModel):
     limit_price: Optional[float] = None   # None = MARKET order; set = LIMIT order
     tp_price:    Optional[float] = None   # Take Profit — triggers shadow profit on WIN
     sl_price:    Optional[float] = None   # Stop Loss   — triggers shadow profit on LOSS
-    ttl:         Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
+    ttl:                Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
+    slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
 
     @field_validator("amount")
     @classmethod
@@ -36,6 +37,13 @@ class BOCreate(BaseModel):
     def ttl_positive(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
             raise ValueError("ttl must be positive (seconds)")
+        return v
+
+    @field_validator("slippage_tolerance")
+    @classmethod
+    def slippage_in_range(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not (0 < v <= 1):
+            raise ValueError("slippage_tolerance must be between 0 (exclusive) and 1 (inclusive)")
         return v
 
 

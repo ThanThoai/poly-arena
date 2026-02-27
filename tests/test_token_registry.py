@@ -78,6 +78,7 @@ def test_discover_all_builds_mapping():
     with patch("services.token_registry.PolymarketClient") as MockClient:
         instance = MockClient.return_value.__enter__.return_value
         instance.get_orderbook.side_effect = fake_get_orderbook
+        instance._future_settlements.return_value = []
 
         ids = registry.discover_all()
 
@@ -100,6 +101,7 @@ def test_discover_all_partial_failure():
     with patch("services.token_registry.PolymarketClient") as MockClient:
         instance = MockClient.return_value.__enter__.return_value
         instance.get_orderbook.side_effect = fake_get_orderbook
+        instance._future_settlements.return_value = []
 
         ids = registry.discover_all()
 
@@ -117,6 +119,53 @@ def test_all_token_ids_deduplicates():
     }
     ids = registry.all_token_ids()
     assert sorted(ids) == ["tok-a", "tok-b"]
+
+
+def test_all_token_ids_includes_future():
+    """all_token_ids() returns both current and future tokens."""
+    registry = TokenRegistry(symbols=["BTC"], timeframes=["M5"])
+    registry._mapping = {
+        ("BTC", "M5", "UP"):   "tok-current",
+    }
+    registry._future_mapping = {
+        ("BTC", "M5", "UP"): ["tok-f1", "tok-f2"],
+    }
+    ids = registry.all_token_ids()
+    assert sorted(ids) == ["tok-current", "tok-f1", "tok-f2"]
+
+
+def test_discover_all_prefetches_future_candles():
+    """discover_all() also fetches token_ids for future candles."""
+    registry = TokenRegistry(symbols=["BTC"], timeframes=["M5"])
+
+    def fake_get_orderbook(sym, tf, direction):
+        return _make_ob(f"token-{sym}-{tf}-{direction}")
+
+    def fake_get_token_id_at(sym, tf, direction, settlement_ts):
+        return f"future-{sym}-{tf}-{direction}-{settlement_ts}"
+
+    with patch("services.token_registry.PolymarketClient") as MockClient:
+        instance = MockClient.return_value.__enter__.return_value
+        instance.get_orderbook.side_effect = fake_get_orderbook
+        instance._future_settlements.return_value = [1000, 1300, 1600]
+        instance.get_token_id_at.side_effect = fake_get_token_id_at
+
+        ids = registry.discover_all()
+
+    # Current: 2 directions = 2 tokens
+    assert len(registry._mapping) == 2
+    # Future: 2 directions × 3 timestamps = 6 tokens
+    future_up = registry.get_future_token_ids("BTC", "M5", "UP")
+    future_down = registry.get_future_token_ids("BTC", "M5", "DOWN")
+    assert len(future_up) == 3
+    assert len(future_down) == 3
+    assert "future-BTC-M5-UP-1000" in future_up
+
+
+def test_get_future_token_ids_returns_empty_when_not_available():
+    """get_future_token_ids() returns [] for unknown combos."""
+    registry = TokenRegistry(symbols=["BTC"], timeframes=["M5"])
+    assert registry.get_future_token_ids("BTC", "M5", "UP") == []
 
 
 # ── _fetch_timeframe ──────────────────────────────────────────────────────────
@@ -139,6 +188,7 @@ def test_fetch_timeframe_detects_rotated_tokens():
     with patch("services.token_registry.PolymarketClient") as MockClient:
         instance = MockClient.return_value.__enter__.return_value
         instance.get_orderbook.side_effect = fake_get_orderbook
+        instance._future_settlements.return_value = []
 
         new_ids = asyncio.run(registry._fetch_timeframe("M5"))
 
@@ -177,6 +227,7 @@ def test_discover_all_no_callback():
     with patch("services.token_registry.PolymarketClient") as MockClient:
         instance = MockClient.return_value.__enter__.return_value
         instance.get_orderbook.side_effect = lambda s, t, d: _make_ob(f"tok-{s}-{d}")
+        instance._future_settlements.return_value = []
         registry.discover_all()
 
     # discover_all does NOT call on_new_tokens
@@ -201,6 +252,7 @@ def test_refresh_calls_on_new_tokens_for_changed_ids():
     with patch("services.token_registry.PolymarketClient") as MockClient:
         instance = MockClient.return_value.__enter__.return_value
         instance.get_orderbook.side_effect = fake_get_orderbook
+        instance._future_settlements.return_value = []
 
         asyncio.run(registry._refresh_timeframe_with_retry("M5"))
 
@@ -233,6 +285,7 @@ def test_refresh_retries_when_same_tokens_at_boundary():
     with patch("services.token_registry.PolymarketClient") as MockClient:
         instance = MockClient.return_value.__enter__.return_value
         instance.get_orderbook.side_effect = fake_get_orderbook
+        instance._future_settlements.return_value = []
 
         with patch("services.token_registry._REFRESH_RETRY_DELAY", 0):
             asyncio.run(registry._refresh_timeframe_with_retry("M5"))

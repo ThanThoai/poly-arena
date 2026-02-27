@@ -48,6 +48,9 @@ _TIMEFRAMES: list[str] = ["M5", "M15", "H1"]
 
 _TF_SECONDS: dict[str, int] = {"M5": 300, "M15": 900, "H1": 3600}
 
+# Number of future candles to prefetch token_ids for.
+_PREFETCH_CANDLES: int = 5
+
 # Seconds to wait AFTER candle boundary before fetching the new slug.
 # Polymarket needs a few seconds to publish the new market.
 # Retry logic handles the case where it's not ready yet.
@@ -78,8 +81,11 @@ class TokenRegistry:
         self._on_new_tokens = on_new_tokens
         self._symbols    = [s.upper() for s in (symbols    or _SYMBOLS)]
         self._timeframes = [t.upper() for t in (timeframes or _TIMEFRAMES)]
-        # (symbol, timeframe, direction) → token_id
+        # (symbol, timeframe, direction) → token_id  (current candle)
         self._mapping: dict[tuple[str, str, str], str] = {}
+        # (symbol, timeframe, direction) → [token_id_1, ..., token_id_N]
+        # future candles (index 0 = next candle, index 4 = 5th candle ahead)
+        self._future_mapping: dict[tuple[str, str, str], list[str]] = {}
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
@@ -90,19 +96,31 @@ class TokenRegistry:
         key = (symbol.upper(), timeframe.upper(), direction.upper())
         return self._mapping.get(key)
 
+    def get_future_token_ids(
+        self, symbol: str, timeframe: str, direction: str,
+    ) -> list[str]:
+        """Return prefetched token_ids for the next N candles (may be fewer if some failed)."""
+        key = (symbol.upper(), timeframe.upper(), direction.upper())
+        return list(self._future_mapping.get(key, []))
+
     def all_token_ids(self) -> list[str]:
-        """Return all currently-known token_ids (deduplicated)."""
-        return list(dict.fromkeys(self._mapping.values()))
+        """Return all currently-known token_ids (current + future, deduplicated)."""
+        ids: list[str] = list(self._mapping.values())
+        for future_ids in self._future_mapping.values():
+            ids.extend(future_ids)
+        return list(dict.fromkeys(ids))
 
     # ── Initial discovery ─────────────────────────────────────────────────────
 
     def discover_all(self) -> list[str]:
         """
         Fetch token_ids for all (symbol × timeframe × direction) combos
-        for the CURRENT candle.  Blocking — call before starting the event loop.
+        for the CURRENT candle + next N future candles.
+        Blocking — call before starting the event loop.
 
-        Returns a list of discovered token_ids.  Missing combos are skipped
-        with a warning so a single REST error does not abort startup.
+        Returns a list of all discovered token_ids (current + future).
+        Missing combos are skipped with a warning so a single REST error
+        does not abort startup.
         """
         discovered: list[str] = []
 
@@ -111,6 +129,7 @@ class TokenRegistry:
                 for sym in self._symbols:
                     for tf in self._timeframes:
                         for direction in _DIRECTIONS:
+                            # ── Current candle ──
                             try:
                                 ob = pm.get_orderbook(sym, tf, direction)
                                 key = (sym, tf, direction)
@@ -125,15 +144,57 @@ class TokenRegistry:
                                     "Token discovery skipped: %s %s %s — %s",
                                     sym, tf, direction, exc,
                                 )
+                                continue
+
+                            # ── Future candles ──
+                            self._prefetch_future(pm, sym, tf, direction, discovered)
         except Exception as exc:
             logger.error("PolymarketClient error during discovery: %s", exc)
 
+        total_expected = len(self._symbols) * len(self._timeframes) * len(_DIRECTIONS)
         logger.info(
-            "TokenRegistry: discovered %d / %d token IDs",
-            len(discovered),
-            len(self._symbols) * len(self._timeframes) * len(_DIRECTIONS),
+            "TokenRegistry: discovered %d current + %d future token IDs (expected %d combos)",
+            len(self._mapping), sum(len(v) for v in self._future_mapping.values()),
+            total_expected,
         )
         return discovered
+
+    def _prefetch_future(
+        self,
+        pm: PolymarketClient,
+        sym: str,
+        tf: str,
+        direction: str,
+        discovered: list[str],
+    ) -> None:
+        """Prefetch token_ids for the next N future candles."""
+        tf_norm = {"M5": "5m", "M15": "15m", "H1": "1h"}.get(tf, tf.lower())
+        future_timestamps = pm._future_settlements(tf_norm, _PREFETCH_CANDLES)
+        key = (sym, tf, direction)
+        future_ids: list[str] = []
+
+        for i, ts in enumerate(future_timestamps):
+            try:
+                token_id = pm.get_token_id_at(sym, tf, direction, ts)
+                if token_id:
+                    future_ids.append(token_id)
+                    discovered.append(token_id)
+                    logger.info(
+                        "Future token [+%d]: %s %s %s ts=%d → %s",
+                        i + 1, sym, tf, direction, ts, token_id[:24],
+                    )
+                else:
+                    logger.debug(
+                        "Future token [+%d]: %s %s %s ts=%d — not available yet",
+                        i + 1, sym, tf, direction, ts,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Future token [+%d]: %s %s %s ts=%d — %s",
+                    i + 1, sym, tf, direction, ts, exc,
+                )
+
+        self._future_mapping[key] = future_ids
 
     # ── Background refresh loop ───────────────────────────────────────────────
 
@@ -258,13 +319,15 @@ class TokenRegistry:
     async def _fetch_timeframe(self, tf: str) -> Optional[list[str]]:
         """
         Fetch token_ids for all symbols/directions for the given timeframe.
+        Also refreshes future candle token_ids in the background.
 
         Returns:
-          list[str]  — list of *changed* (new) token_ids (may be empty if no change)
+          list[str]  — list of *changed* current candle token_ids
+                       (may be empty if no rotation detected)
           None       — all requests failed (market not published yet)
+
+        Side effect: updates self._future_mapping with the next N candle token_ids.
         """
-        new_token_ids: list[str] = []
-        any_success = False
 
         def _blocking_fetch() -> tuple[list[str], bool]:
             """Run in executor — blocking HTTP calls."""
@@ -274,6 +337,7 @@ class TokenRegistry:
             with PolymarketClient(timeout=10.0) as pm:
                 for sym in self._symbols:
                     for direction in _DIRECTIONS:
+                        # ── Current candle ──
                         try:
                             ob = pm.get_orderbook(sym, tf, direction)
                             key = (sym, tf, direction)
@@ -293,6 +357,11 @@ class TokenRegistry:
                                 "Token refresh failed: %s %s %s — %s",
                                 sym, tf, direction, exc,
                             )
+                            continue
+
+                        # ── Future candles (prefetch silently) ──
+                        _scratch: list[str] = []
+                        self._prefetch_future(pm, sym, tf, direction, _scratch)
 
             return local_new, local_ok
 

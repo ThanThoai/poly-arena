@@ -214,9 +214,10 @@ def create_bo(
         payload.limit_price, payload.tp_price, payload.sl_price,
     )
 
-    # Bracket/LIMIT orders: avg_price and num_shares are set by ME fill,
-    # not from Polymarket snapshot. Only pure MARKET orders use snapshot price.
-    uses_me = is_limit or has_bracket
+    # All orders go through ME when token_id is available.
+    # avg_price and num_shares are set by ME fill, not from snapshot.
+    # Fallback to snapshot only when WS Feed Service is not running (no token_id).
+    uses_me = token_id is not None
 
     bo = BinaryOption(
         bot_name          = bot.bot_name,
@@ -235,7 +236,7 @@ def create_bo(
         tp_price          = payload.tp_price,
         sl_price          = payload.sl_price,
         ttl               = payload.ttl,
-        # me_order_status tracks matching engine lifecycle for limit/bracket orders
+        # me_order_status tracks matching engine lifecycle for all ME orders
         me_order_status   = "PENDING" if uses_me else None,
     )
     db.add(bo)
@@ -243,10 +244,9 @@ def create_bo(
     db.refresh(bo)
 
     # ── Push virtual order to Redis queue (consumed by WS Feed Service) ─────
-    # Push when:
-    #   - LIMIT order (tracking fill + TTL expiry)
-    #   - MARKET order with bracket (tracking TP/SL shadow)
-    should_place_virtual = (is_limit or has_bracket) and token_id is not None
+    # Push all orders to ME when token_id is available.
+    # MARKET orders fill immediately (price=1 taker), LIMIT orders wait for match.
+    should_place_virtual = token_id is not None
     if should_place_virtual:
         try:
             from services.redis_client import get_sync_redis
@@ -263,6 +263,7 @@ def create_bo(
                 "sl_price": payload.sl_price,
                 "timeframe": payload.timeframe.value,
                 "ttl": payload.ttl,
+                "slippage_tolerance": payload.slippage_tolerance,
             })
             sr.lpush(QUEUE_ORDERS_NEW, order_payload)
             logger.info(

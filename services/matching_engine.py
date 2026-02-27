@@ -45,6 +45,11 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_DUST_THRESHOLD = Decimal("0.000001")  # residual size below this is treated as zero
+_DEFAULT_SLIPPAGE = Decimal("0.10")    # 10% max slippage for MARKET orders
+
 
 # ── Timeframe helpers ─────────────────────────────────────────────────────────
 
@@ -117,8 +122,11 @@ class SimulatedOrder:
     """
     order_id:  str
     side:      OrderSide
-    price:     Decimal          # limit price
+    price:     Decimal          # limit price (ignored for MARKET)
     quantity:  Decimal          # total requested size
+    order_type: str             = "LIMIT"   # "MARKET" or "LIMIT"
+    max_slippage: Optional[Decimal] = None  # None = _DEFAULT_SLIPPAGE for MARKET
+    max_cost:  Optional[Decimal] = None   # cost cap for MARKET BUY (amount from user)
     filled:    Decimal          = field(default_factory=lambda: Decimal("0"))
     status:    OrderStatus      = OrderStatus.PENDING
     created_at: datetime        = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -126,6 +134,8 @@ class SimulatedOrder:
 
     # ── Entry tracking (weighted avg across multiple fill levels) ────────────
     _entry_cost: Decimal        = field(default_factory=lambda: Decimal("0"))
+    # Slippage reference price — locked in at first match when book has data
+    _slippage_ref_price: Optional[Decimal] = field(default=None, compare=False, repr=False)
     # cumulative cost = Σ(fill_qty × fill_price) — avg_entry_price = _entry_cost / filled
 
     # ── Bracket Order fields (Section 2.1) ───────────────────────────────────
@@ -163,13 +173,18 @@ class SimulatedOrder:
     @property
     def is_eligible_for_bracket(self) -> bool:
         """True when this order has TP/SL set, has been at least partially
-        filled, and the position has not yet been closed."""
+        filled, and the position has not yet been closed.
+
+        Includes CANCELED orders (MARKET IOC remainder or LIMIT TTL expiry)
+        that still have a filled portion — spec Workflow E monitors any
+        order with filled > 0, regardless of status.
+        """
         return (
             self.side == OrderSide.BUY
             and self.has_bracket
             and self.filled > 0
             and not self.position_closed
-            and self.status in (OrderStatus.FILLED, OrderStatus.PARTIAL)
+            and self.status in (OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.CANCELED)
         )
 
     @property
@@ -259,6 +274,17 @@ class LastTrade:
 
 
 @dataclass
+class OrderStateChangeEvent:
+    """Emitted when a virtual order's fill or status changes."""
+    order_id: str
+    event_type: str                    # "FILL" | "CANCEL"
+    filled: Decimal
+    avg_entry_price: Optional[Decimal]
+    status: OrderStatus
+    cancel_reason: Optional[str] = None
+
+
+@dataclass
 class BracketFillResult:
     """Records the outcome of a TP or SL execution."""
     order_id:     str
@@ -282,6 +308,17 @@ class ShadowOrderbook:
     Maintains the full bids/asks dict updated by WebSocket events,
     runs the matching algorithm for virtual orders, and monitors
     bracket (TP/SL) conditions on every price tick.
+
+    Thread-safety model
+    ───────────────────
+    A single per-book ``threading.Lock`` (``self._lock``) serializes **all**
+    mutations to bids, asks, and virtual orders.  Per-order locks are not
+    needed because every order mutation (matching, expiry, bracket exit)
+    occurs within the same book-level critical section.
+
+    Callbacks (``_on_bracket_exit``, state-change callbacks) are fired
+    **outside** the lock to avoid blocking I/O operations (Redis publish,
+    DB writes) while holding the lock.
     """
 
     def __init__(self, token_id: str) -> None:
@@ -294,6 +331,9 @@ class ShadowOrderbook:
         self._virtual_orders: list[SimulatedOrder]   = []
         self._bracket_log:    list[BracketFillResult] = []
         self._cleanup_counter: int = 0
+        # ── Centralized state-change tracking ─────────────────────────────
+        self._last_reported: dict[str, tuple[Decimal, OrderStatus]] = {}
+        self._state_change_callbacks: list[Callable] = []
 
     # ── Snapshot / delta handlers ────────────────────────────────────────────
 
@@ -395,10 +435,17 @@ class ShadowOrderbook:
         timeframe:         Optional[str]      = None,
         ttl_seconds:       Optional[float]    = None,
         on_bracket_exit:   Optional[Callable] = None,
+        order_type:        str                = "LIMIT",
+        max_slippage:      Optional[Decimal]  = None,
+        max_cost:          Optional[Decimal]  = None,
     ) -> SimulatedOrder:
         """
-        Create a virtual limit order, immediately try to match it,
+        Create a virtual order, immediately try to match it,
         and attach optional TP/SL bracket parameters (spec 2.1).
+
+        MARKET orders use IOC (Immediate-Or-Cancel) semantics: any remaining
+        quantity after sweeping the available book is immediately canceled.
+        LIMIT orders remain active until filled or expired.
 
         Expiry (one of, in priority order):
           - ``ttl_seconds`` — raw offset from now (user-specified TTL).
@@ -407,12 +454,16 @@ class ShadowOrderbook:
           - both None       — Good-Till-Canceled, never expires automatically.
 
         Args:
+            order_type:       "MARKET" or "LIMIT" (default).
             timeframe:        Candle timeframe string (M5/M15/H1).
                               expire_at is aligned to the candle grid.
             ttl_seconds:      Raw seconds from now. Takes priority over timeframe.
             on_bracket_exit:  Optional callback fired (outside lock) after every
                               TP/SL/FORCE_CLOSE exit.
                               Signature: callback(result: BracketFillResult) -> None
+            max_slippage:     Maximum slippage for MARKET orders as a fraction
+                              (e.g. 0.05 = 5%). None = _DEFAULT_SLIPPAGE (10%).
+                              Ignored for LIMIT orders.
         """
         if ttl_seconds is not None:
             expire_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
@@ -426,6 +477,9 @@ class ShadowOrderbook:
             side=side,
             price=price,
             quantity=quantity,
+            order_type=order_type,
+            max_slippage=max_slippage,
+            max_cost=max_cost,
             tp_price=tp_price,
             sl_price=sl_price,
             expire_at=expire_at,
@@ -434,7 +488,34 @@ class ShadowOrderbook:
         pending_callbacks: list[tuple[Callable, BracketFillResult]] = []
         with self._lock:
             self._virtual_orders.append(order)
+            # Snapshot book state BEFORE matching so we know if
+            # liquidity existed on the relevant side.
+            had_liquidity = (
+                bool(self.asks) if order.side == OrderSide.BUY else bool(self.bids)
+            )
             self._match_order(order)
+
+            # MARKET = IOC: cancel remainder if not fully filled (spec 3.1).
+            # Only apply IOC when the book had liquidity (or the order
+            # actually got fills).  If the book was empty (WS feed hasn't
+            # arrived yet), leave the order PENDING so run_matching() can
+            # retry once the book is populated.
+            if order_type == "MARKET" and order.status != OrderStatus.FILLED:
+                if had_liquidity or order.filled > 0:
+                    order.status = OrderStatus.CANCELED
+                    logger.info(
+                        "MARKET IOC cancel: id=%s filled=%s/%s avg=%s "
+                        "had_liquidity=%s",
+                        order.order_id[:12], order.filled, order.quantity,
+                        order.avg_entry_price, had_liquidity,
+                    )
+                else:
+                    logger.info(
+                        "MARKET order PENDING (empty book): id=%s qty=%s "
+                        "ask_levels=%d bid_levels=%d",
+                        order.order_id[:12], order.quantity,
+                        len(self.asks), len(self.bids),
+                    )
             # If order filled immediately and has bracket, check TP/SL right away
             # instead of waiting for next WS event (#2).
             if order.is_eligible_for_bracket and self.bids:
@@ -451,13 +532,99 @@ class ShadowOrderbook:
                     self._bracket_log.append(result)
                     if order._on_bracket_exit is not None:
                         pending_callbacks.append((order._on_bracket_exit, result))
+            # Collect state changes before releasing the lock
+            state_events = self.collect_state_changes()
         # Fire callbacks outside lock
         for cb, res in pending_callbacks:
             try:
                 cb(res)
             except Exception as exc:
                 logger.error("bracket exit callback error (initial): %s", exc, exc_info=True)
+        self._fire_state_change_callbacks(state_events)
         return order
+
+    # ── State-change callback registration ───────────────────────────────────
+
+    def register_state_change_callback(self, callback: Callable) -> None:
+        """Register a callback for order state changes (FILL/CANCEL).
+
+        Callbacks are invoked **outside** the book lock with a list of
+        ``OrderStateChangeEvent`` objects.
+
+        Signature: ``callback(events: list[OrderStateChangeEvent]) -> None``
+        """
+        with self._lock:
+            self._state_change_callbacks.append(callback)
+
+    def seed_last_reported(self, order_id: str, filled: Decimal, status: OrderStatus) -> None:
+        """Seed the last-reported state for an order to suppress duplicate events.
+
+        Called right after ``place_virtual_order()`` when the caller has already
+        published the immediate fill, so ``collect_state_changes()`` won't
+        re-emit that same fill.
+        """
+        with self._lock:
+            self._last_reported[order_id] = (filled, status)
+
+    def collect_state_changes(self) -> list[OrderStateChangeEvent]:
+        """Compare every order vs ``_last_reported`` and emit change events.
+
+        Must be called while holding ``self._lock``.
+
+        Emits:
+          - FILL when ``filled`` increased since last report.
+          - CANCEL when status changed to CANCELED.
+        Also cleans up tracking for pruned orders.
+        """
+        events: list[OrderStateChangeEvent] = []
+        live_ids: set[str] = set()
+
+        for order in self._virtual_orders:
+            live_ids.add(order.order_id)
+            prev = self._last_reported.get(order.order_id)
+            prev_filled = prev[0] if prev else Decimal("0")
+            prev_status = prev[1] if prev else OrderStatus.PENDING
+
+            # FILL event: filled increased
+            if order.filled > prev_filled:
+                events.append(OrderStateChangeEvent(
+                    order_id=order.order_id,
+                    event_type="FILL",
+                    filled=order.filled,
+                    avg_entry_price=order.avg_entry_price,
+                    status=order.status,
+                ))
+
+            # CANCEL event: status transitioned to CANCELED
+            if order.status == OrderStatus.CANCELED and prev_status != OrderStatus.CANCELED:
+                events.append(OrderStateChangeEvent(
+                    order_id=order.order_id,
+                    event_type="CANCEL",
+                    filled=order.filled,
+                    avg_entry_price=order.avg_entry_price,
+                    status=order.status,
+                    cancel_reason="TTL_EXPIRED",
+                ))
+
+            # Update tracking
+            self._last_reported[order.order_id] = (order.filled, order.status)
+
+        # Cleanup tracking for pruned orders
+        stale_ids = set(self._last_reported.keys()) - live_ids
+        for oid in stale_ids:
+            del self._last_reported[oid]
+
+        return events
+
+    def _fire_state_change_callbacks(self, events: list[OrderStateChangeEvent]) -> None:
+        """Fire registered callbacks outside the lock."""
+        if not events:
+            return
+        for cb in self._state_change_callbacks:
+            try:
+                cb(events)
+            except Exception as exc:
+                logger.error("state-change callback error: %s", exc, exc_info=True)
 
     # ── Matching algorithm (Section 4) ───────────────────────────────────────
 
@@ -467,19 +634,39 @@ class ShadowOrderbook:
     def run_matching(self) -> None:
         """Re-run matching for all active virtual orders (after book updates).
         Also expires stale PENDING orders whose TTL has elapsed."""
+        state_events: list[OrderStateChangeEvent] = []
         with self._lock:
             self._expire_pending_orders()
             for order in self._virtual_orders:
                 if order.status in (OrderStatus.FILLED, OrderStatus.CANCELED):
                     continue
+                had_liquidity = (
+                    bool(self.asks) if order.side == OrderSide.BUY else bool(self.bids)
+                )
                 self._match_order(order)
+
+                # MARKET IOC: after matching against a populated book,
+                # cancel any unfilled remainder.  This handles the case
+                # where the order was placed before the book had data.
+                if order.order_type == "MARKET" and order.status != OrderStatus.FILLED:
+                    if had_liquidity or order.filled > 0:
+                        order.status = OrderStatus.CANCELED
+                        logger.info(
+                            "MARKET IOC cancel (rematch): id=%s filled=%s/%s avg=%s",
+                            order.order_id[:12], order.filled, order.quantity,
+                            order.avg_entry_price,
+                        )
+            # Collect state changes before releasing the lock
+            state_events = self.collect_state_changes()
             # Periodic cleanup of terminal orders to prevent memory leak
             self._cleanup_counter += 1
             if self._cleanup_counter >= self._CLEANUP_INTERVAL:
                 self._cleanup_counter = 0
                 self._prune_terminal_orders()
+        # Fire callbacks outside lock
+        self._fire_state_change_callbacks(state_events)
 
-    _PRUNE_GRACE_S = 30  # keep terminal orders for 30s so monitor threads can read them
+    _PRUNE_GRACE_S = 5  # keep terminal orders for 5s (event-driven callbacks don't need long grace)
 
     def _prune_terminal_orders(self) -> None:
         """Remove fully terminal orders from _virtual_orders.
@@ -571,53 +758,169 @@ class ShadowOrderbook:
         """
         Core matching algorithm — spec Section 4.
         Must be called while holding self._lock.
+
+        MARKET orders: sweep all available levels (no price check).
+        LIMIT orders: match only at limit price or better.
         """
+        is_market = order.order_type == "MARKET"
+        filled_before = order.filled
+
+        # ── Slippage bounds for MARKET orders ─────────────────────────────
+        # Lock in the reference price on first match with book data so
+        # subsequent re-matches (after book repopulates) don't lose the
+        # original slippage protection.
+        slippage_limit_buy: Optional[Decimal] = None
+        slippage_limit_sell: Optional[Decimal] = None
+        if is_market:
+            slippage = order.max_slippage if order.max_slippage is not None else _DEFAULT_SLIPPAGE
+            if order.side == OrderSide.BUY and self.asks:
+                if order._slippage_ref_price is None:
+                    order._slippage_ref_price = min(self.asks.keys())
+                slippage_limit_buy = order._slippage_ref_price * (1 + slippage)
+            elif order.side == OrderSide.SELL and self.bids:
+                if order._slippage_ref_price is None:
+                    order._slippage_ref_price = max(self.bids.keys())
+                slippage_limit_sell = order._slippage_ref_price * (1 - slippage)
+
+        # ── Pre-match book snapshot for debug ─────────────────────────────
+        if order.side == OrderSide.BUY:
+            top_asks = sorted(self.asks.items())[:5]
+            logger.info(
+                "MATCH_START %s BUY %s: id=%s price=%s qty=%s "
+                "remaining=%s slippage_limit=%s "
+                "ask_levels=%d top_asks=%s",
+                order.order_type, self.token_id[:16],
+                order.order_id[:12], order.price, order.quantity,
+                order.remaining_qty, slippage_limit_buy,
+                len(self.asks),
+                [(str(p), str(s)) for p, s in top_asks],
+            )
+        else:
+            top_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:5]
+            logger.info(
+                "MATCH_START %s SELL %s: id=%s price=%s qty=%s "
+                "remaining=%s slippage_limit=%s "
+                "bid_levels=%d top_bids=%s",
+                order.order_type, self.token_id[:16],
+                order.order_id[:12], order.price, order.quantity,
+                order.remaining_qty, slippage_limit_sell,
+                len(self.bids),
+                [(str(p), str(s)) for p, s in top_bids],
+            )
+
         if order.side == OrderSide.BUY:
             # Iterate sorted asks ascending — stop when no more price matches
             for ask_price in sorted(self.asks.keys()):
                 ask_size = self.asks.get(ask_price, Decimal("0"))
                 if ask_size <= 0:
                     continue
-                if order.price >= ask_price:
-                    match_qty = min(order.remaining_qty, ask_size)
-                    order.filled          += match_qty
-                    order._entry_cost     += match_qty * ask_price  # track weighted entry cost
-                    self.asks[ask_price]  -= match_qty
-                    if self.asks[ask_price] <= 0:
-                        del self.asks[ask_price]
-                    order._update_status()
-                    logger.debug(
-                        "MATCH BUY  %s @ %s qty=%s filled=%s/%s avg_entry=%s",
-                        order.order_id[:8], ask_price, match_qty,
-                        order.filled, order.quantity, order.avg_entry_price,
-                    )
-                    if order.status == OrderStatus.FILLED:
+                # MARKET: sweep asks within slippage bound
+                # LIMIT: only match if order.price >= ask_price
+                if is_market:
+                    if slippage_limit_buy is not None and ask_price > slippage_limit_buy:
+                        logger.info(
+                            "MATCH_SLIPPAGE_STOP BUY %s: ask=%s > limit=%s, stopping",
+                            order.order_id[:12], ask_price, slippage_limit_buy,
+                        )
                         break
-                else:
-                    break  # ascending — no further matches possible
+                elif order.price < ask_price:
+                    break  # LIMIT ascending — no further matches possible
+
+                match_qty = min(order.remaining_qty, ask_size)
+
+                # ── Cost cap for MARKET BUY: don't exceed max_cost ─────
+                if order.max_cost is not None:
+                    budget_remaining = order.max_cost - order._entry_cost
+                    if budget_remaining <= 0:
+                        logger.info(
+                            "MATCH_COST_CAP BUY %s: budget exhausted "
+                            "(cost=%s >= max_cost=%s), stopping",
+                            order.order_id[:12], order._entry_cost,
+                            order.max_cost,
+                        )
+                        break
+                    affordable_qty = budget_remaining / ask_price
+                    if affordable_qty < match_qty:
+                        match_qty = affordable_qty
+                        logger.info(
+                            "MATCH_COST_CAP BUY %s: capping qty to %s "
+                            "(budget=%s / price=%s)",
+                            order.order_id[:12], match_qty,
+                            budget_remaining, ask_price,
+                        )
+
+                if match_qty < _DUST_THRESHOLD:
+                    break
+
+                order.filled          += match_qty
+                order._entry_cost     += match_qty * ask_price  # track weighted entry cost
+                self.asks[ask_price]  -= match_qty
+                if self.asks[ask_price] < _DUST_THRESHOLD:
+                    del self.asks[ask_price]
+                order._update_status()
+                logger.info(
+                    "MATCH_FILL BUY %s: %s @ %s (level_remain=%s) "
+                    "filled=%s/%s avg_entry=%s cost=%s",
+                    order.order_id[:12], match_qty, ask_price,
+                    self.asks.get(ask_price, "consumed"),
+                    order.filled, order.quantity, order.avg_entry_price,
+                    order._entry_cost,
+                )
+                if order.status == OrderStatus.FILLED:
+                    break
+                # Check cost cap again after fill
+                if order.max_cost is not None and order._entry_cost >= order.max_cost:
+                    logger.info(
+                        "MATCH_COST_CAP BUY %s: cost=%s reached max_cost=%s, stopping",
+                        order.order_id[:12], order._entry_cost, order.max_cost,
+                    )
+                    break
         else:
             # Iterate sorted bids descending
             for bid_price in sorted(self.bids.keys(), reverse=True):
                 bid_size = self.bids.get(bid_price, Decimal("0"))
                 if bid_size <= 0:
                     continue
-                if order.price <= bid_price:
-                    match_qty = min(order.remaining_qty, bid_size)
-                    order.filled          += match_qty
-                    order._entry_cost     += match_qty * bid_price  # track weighted entry cost
-                    self.bids[bid_price]  -= match_qty
-                    if self.bids[bid_price] <= 0:
-                        del self.bids[bid_price]
-                    order._update_status()
-                    logger.debug(
-                        "MATCH SELL %s @ %s qty=%s filled=%s/%s avg_entry=%s",
-                        order.order_id[:8], bid_price, match_qty,
-                        order.filled, order.quantity, order.avg_entry_price,
-                    )
-                    if order.status == OrderStatus.FILLED:
+                # MARKET: sweep bids within slippage bound
+                # LIMIT: only match if order.price <= bid_price
+                if is_market:
+                    if slippage_limit_sell is not None and bid_price < slippage_limit_sell:
+                        logger.info(
+                            "MATCH_SLIPPAGE_STOP SELL %s: bid=%s < limit=%s, stopping",
+                            order.order_id[:12], bid_price, slippage_limit_sell,
+                        )
                         break
-                else:
-                    break  # descending — no further matches possible
+                elif order.price > bid_price:
+                    break  # LIMIT descending — no further matches possible
+
+                match_qty = min(order.remaining_qty, bid_size)
+                order.filled          += match_qty
+                order._entry_cost     += match_qty * bid_price  # track weighted entry cost
+                self.bids[bid_price]  -= match_qty
+                if self.bids[bid_price] < _DUST_THRESHOLD:
+                    del self.bids[bid_price]
+                order._update_status()
+                logger.info(
+                    "MATCH_FILL SELL %s: %s @ %s (level_remain=%s) "
+                    "filled=%s/%s avg_entry=%s",
+                    order.order_id[:12], match_qty, bid_price,
+                    self.bids.get(bid_price, "consumed"),
+                    order.filled, order.quantity, order.avg_entry_price,
+                )
+                if order.status == OrderStatus.FILLED:
+                    break
+
+        # ── Post-match summary ────────────────────────────────────────────
+        new_fills = order.filled - filled_before
+        if new_fills > 0 or is_market:
+            logger.info(
+                "MATCH_DONE %s %s %s: id=%s new_fills=%s total_filled=%s/%s "
+                "avg_entry=%s status=%s remaining_asks=%d remaining_bids=%d",
+                order.order_type, order.side.value, self.token_id[:16],
+                order.order_id[:12], new_fills,
+                order.filled, order.quantity, order.avg_entry_price,
+                order.status.value, len(self.asks), len(self.bids),
+            )
 
     # ── Workflow E: Bracket Order TP/SL monitoring (Section 5) ───────────────
 
@@ -724,7 +1027,7 @@ class ShadowOrderbook:
             qty_exited          += fill_qty
             total_value         += fill_qty * bid_price
             self.bids[bid_price] -= fill_qty
-            if self.bids[bid_price] <= 0:
+            if self.bids[bid_price] < _DUST_THRESHOLD:
                 del self.bids[bid_price]
             levels_hit += 1
 
@@ -920,12 +1223,26 @@ class MatchingEngine:
             asset_id[:16], len(bids), len(asks),
             book.best_bid(), book.best_ask(),
         )
+        # Trigger bracket monitoring after book update (TP/SL may fire)
+        exits = book.monitor_bracket_orders()
+        if exits:
+            logger.info(
+                "book snapshot on %s triggered %d bracket exit(s)",
+                asset_id[:16], len(exits),
+            )
 
     def _handle_price_change(self, asset_id: str, event: dict) -> None:
         """Delta update — apply changes and run matching (spec 3.2)."""
         book = self.get_or_create_book(asset_id)
         book.apply_changes(event.get("changes", []))
         book.run_matching()
+        # Trigger bracket monitoring after price change (TP/SL may fire)
+        exits = book.monitor_bracket_orders()
+        if exits:
+            logger.info(
+                "price_change on %s triggered %d bracket exit(s)",
+                asset_id[:16], len(exits),
+            )
 
     def _handle_best_bid_ask(self, asset_id: str, event: dict) -> None:
         """
@@ -1026,21 +1343,29 @@ class MatchingEngine:
         timeframe:         Optional[str]      = None,
         ttl_seconds:       Optional[float]    = None,
         on_bracket_exit:   Optional[Callable] = None,
+        order_type:        str                = "LIMIT",
+        max_slippage:      Optional[Decimal]  = None,
+        max_cost:          Optional[Decimal]  = None,
     ) -> SimulatedOrder:
         """
         Convenience wrapper: get/create book and place a virtual order.
 
+        order_type:       "MARKET" or "LIMIT" (default).
         timeframe:        Candle timeframe (M5/M15/H1).
                           expire_at aligned to next candle close on the grid.
                           e.g. timeframe='M5', now=12:12 → expire_at=12:15
         ttl_seconds:      Raw seconds from now. Takes priority over timeframe.
         on_bracket_exit:  Callback fired after every TP/SL/FORCE_CLOSE exit.
                           Signature: callback(result: BracketFillResult) -> None
+        max_slippage:     Maximum slippage for MARKET orders (fraction).
+                          None = 10% default. Ignored for LIMIT.
+        max_cost:         Cost cap for MARKET BUY orders (user's dollar amount).
+                          Matching stops when cumulative cost reaches this limit.
         """
         book = self.get_or_create_book(token_id)
         return book.place_virtual_order(
             side, price, quantity, tp_price, sl_price, timeframe, ttl_seconds,
-            on_bracket_exit,
+            on_bracket_exit, order_type, max_slippage, max_cost,
         )
 
     def cancel_order(self, token_id: str, order_id: str) -> Optional[SimulatedOrder]:

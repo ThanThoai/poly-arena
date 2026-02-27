@@ -11,7 +11,6 @@ from sqlalchemy import inspect, text
 from database import Base, engine, SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
 from routers import binary_options, bots, dashboard
-from services.scheduler import start_scheduler, stop_scheduler
 from services.redis_client import get_async_redis, close_async_redis
 from ws_feed_service.config import (
     STREAM_BRACKET_EXITS, STREAM_ORDER_CANCELS, STREAM_ORDER_FILLS,
@@ -675,7 +674,6 @@ async def _consume_order_fills() -> None:
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     run_migrations()
-    start_scheduler()
 
     # Start bracket exit consumer (reads from Redis Stream)
     consumer_task = asyncio.create_task(
@@ -702,7 +700,6 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     await close_async_redis()
-    stop_scheduler()
 
 
 app = FastAPI(

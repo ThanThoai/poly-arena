@@ -61,6 +61,13 @@ def test_create_bo_market_with_bracket_pushes_to_queue(client, test_bot, fake_sy
     """MARKET order with TP/SL should also push to queue."""
     bot_name, api_key = test_bot
 
+    # Seed Redis with token_id so the order goes through ME
+    fake_sync_redis.hset("price:BTC:M5:UP", mapping={
+        "token_id": "fake-token-btc-m5-up",
+        "best_ask": "0.52",
+        "updated_at": "9999999999",
+    })
+
     resp = client.post(
         "/poly-arena/binary-options/",
         json={
@@ -86,8 +93,15 @@ def test_create_bo_market_with_bracket_pushes_to_queue(client, test_bot, fake_sy
 
 
 def test_create_bo_market_no_bracket_skips_queue(client, test_bot, fake_sync_redis):
-    """Plain MARKET order (no TP/SL) should NOT push to queue."""
+    """Plain MARKET order (no TP/SL) is also pushed to queue for ME tracking."""
     bot_name, api_key = test_bot
+
+    # Seed Redis with token_id so the order goes through ME
+    fake_sync_redis.hset("price:BTC:M5:UP", mapping={
+        "token_id": "fake-token-btc-m5-up",
+        "best_ask": "0.52",
+        "updated_at": "9999999999",
+    })
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -102,5 +116,6 @@ def test_create_bo_market_no_bracket_skips_queue(client, test_bot, fake_sync_red
 
     assert resp.status_code == 201
 
+    # All orders go through ME when token_id is available
     queue_len = fake_sync_redis.llen(QUEUE_ORDERS_NEW)
-    assert queue_len == 0
+    assert queue_len == 1

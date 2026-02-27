@@ -207,7 +207,8 @@ def test_section5_take_profit():
         asks=[{"price": "0.55", "size": "200"}],
     )
 
-    # Place a BUY order — fills immediately
+    # Place a BUY order — fills immediately AND TP fires during placement
+    # because best_bid (0.80) >= tp_price (0.75)
     order = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.55"),
@@ -215,24 +216,15 @@ def test_section5_take_profit():
         tp_price=Decimal("0.75"),  # trigger when bid >= 0.75
         sl_price=Decimal("0.30"),  # well below market — should NOT fire
     )
-    ok(order.status == OrderStatus.FILLED, "BUY filled before TP check")
-    ok(order.is_eligible_for_bracket, "eligible for bracket monitoring")
+    ok(order.status == OrderStatus.FILLED, "BUY filled")
+    ok(order.position_closed, "TP fired during placement (bid 0.80 >= tp 0.75)")
+    ok(order.exit_trigger == "TP", "exit_trigger=TP, not SL")
+    ok(order.exit_filled == Decimal("100"), f"fully exited 100 (got {order.exit_filled})")
+    ok(order.exit_price >= Decimal("0.79"), f"avg price ≥ 0.79 (got {order.exit_price})")
 
-    # Best bid (0.80) >= tp_price (0.75) → TP fires
-    exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, f"exactly 1 TP exit (got {len(exits)})")
-    ex = exits[0]
-    ok(ex.trigger == "TP", "trigger=TP")
-    ok(ex.qty_exited == Decimal("100"), f"fully exited 100 (got {ex.qty_exited})")
-    ok(ex.avg_exit_price >= Decimal("0.79"), f"avg price ≥ 0.79 (got {ex.avg_exit_price})")
-    ok(ex.levels_consumed >= 1, f"consumed ≥1 bid level (got {ex.levels_consumed})")
-
-    # position_closed — second call must NOT re-fire (OCO)
+    # position_closed — monitor must NOT re-fire (OCO)
     exits2 = book.monitor_bracket_orders()
     ok(len(exits2) == 0, "OCO: TP already fired, no second exit")
-
-    # SL must NOT have fired
-    ok(order.exit_trigger == "TP", "exit_trigger=TP, not SL")
 
 
 def test_section5_stop_loss():
@@ -247,6 +239,7 @@ def test_section5_stop_loss():
         asks=[{"price": "0.40", "size": "200"}],
     )
 
+    # SL fires during placement: best_bid (0.25) <= sl (0.35)
     order = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.40"),
@@ -255,14 +248,14 @@ def test_section5_stop_loss():
         sl_price=Decimal("0.35"),  # best_bid (0.25) <= sl (0.35) → fires
     )
     ok(order.status == OrderStatus.FILLED, "BUY filled")
+    ok(order.position_closed, "SL fired during placement")
+    ok(order.exit_trigger == "SL", "exit_trigger=SL")
+    ok(order.exit_filled == Decimal("100"), f"fully exited (got {order.exit_filled})")
+    ok(order.exit_price < Decimal("0.35"), f"avg exit price < sl_price due to slippage (got {order.exit_price})")
 
+    # Already closed — monitor should not fire again
     exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, "1 SL exit")
-    ex = exits[0]
-    ok(ex.trigger == "SL", "trigger=SL")
-    ok(ex.qty_exited == Decimal("100"), f"fully exited (got {ex.qty_exited})")
-    ok(ex.levels_consumed > 1, f"slippage across >1 levels (got {ex.levels_consumed})")
-    ok(ex.avg_exit_price < Decimal("0.35"), f"avg exit price < sl_price due to slippage")
+    ok(len(exits) == 0, "no re-fire after SL already closed")
 
 
 def test_section5_partial_fill_bracket():
@@ -272,7 +265,7 @@ def test_section5_partial_fill_bracket():
         bids=[{"price": "0.80", "size": "500"}],
         asks=[{"price": "0.50", "size": "30"}],  # only 30 in asks
     )
-    # BUY 100 but only 30 fills
+    # BUY 100 but only 30 fills; TP fires during placement (0.80 >= 0.70)
     order = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.50"),
@@ -281,12 +274,9 @@ def test_section5_partial_fill_bracket():
     )
     ok(order.status == OrderStatus.PARTIAL, "partial fill")
     ok(order.filled == Decimal("30"), f"filled=30 (got {order.filled})")
-
-    exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, "TP fires on partial fill")
-    ex = exits[0]
-    ok(ex.qty_to_close == Decimal("30"), f"only closes filled qty=30 (got {ex.qty_to_close})")
-    ok(ex.qty_exited == Decimal("30"), f"exited=30 (got {ex.qty_exited})")
+    ok(order.position_closed, "TP fired during placement on partial fill")
+    ok(order.exit_filled == Decimal("30"), f"only closes filled qty=30 (got {order.exit_filled})")
+    ok(order.exit_trigger == "TP", "exit_trigger=TP")
 
 
 def test_section5_oco_sl_after_tp():
@@ -296,6 +286,7 @@ def test_section5_oco_sl_after_tp():
         bids=[{"price": "0.80", "size": "200"}],
         asks=[{"price": "0.50", "size": "100"}],
     )
+    # Both TP and SL conditions met at placement, but TP wins OCO
     order = book.place_virtual_order(
         side=OrderSide.BUY,
         price=Decimal("0.50"),
@@ -303,9 +294,12 @@ def test_section5_oco_sl_after_tp():
         tp_price=Decimal("0.70"),  # fires (0.80 >= 0.70)
         sl_price=Decimal("0.90"),  # also would fire (0.80 <= 0.90)
     )
+    ok(order.position_closed, "bracket fired during placement")
+    ok(order.exit_trigger == "TP", "TP fired, not SL (OCO: TP wins)")
+
+    # Monitor should not re-fire
     exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, "only 1 exit (TP wins OCO race)")
-    ok(exits[0].trigger == "TP", "TP fired, not SL")
+    ok(len(exits) == 0, "no re-fire after TP already closed")
 
 
 def test_section3_best_bid_ask_triggers_bracket():
@@ -392,6 +386,7 @@ def test_calculate_profit_tp():
             {"price": "0.52", "size": "70"},
         ],
     )
+    # TP fires during placement: best_bid(0.80) >= tp(0.70)
     order = book.place_virtual_order(
         OrderSide.BUY, Decimal("0.55"), Decimal("50"),
         tp_price=Decimal("0.70"),
@@ -401,10 +396,7 @@ def test_calculate_profit_tp():
     # entry: 30@0.50 + 20@0.52 = 15+10.4 = 25.4 → avg = 0.508
     avg_entry = order.avg_entry_price
     ok(avg_entry is not None, "avg_entry_price tracked")
-
-    # TP fires: best_bid(0.80) >= tp(0.70), exits at 0.80
-    exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, "TP exit")
+    ok(order.position_closed, "TP fired during placement")
 
     profit = order.calculate_profit()
     ok(profit is not None, "profit calculated")
@@ -421,14 +413,13 @@ def test_calculate_profit_sl():
         bids=[{"price": "0.30", "size": "200"}],
         asks=[{"price": "0.50", "size": "100"}],
     )
+    # SL fires during placement: best_bid(0.30) <= sl(0.40)
     order = book.place_virtual_order(
         OrderSide.BUY, Decimal("0.50"), Decimal("40"),
         sl_price=Decimal("0.40"),
     )
     ok(order.status == OrderStatus.FILLED, "filled")
-    # SL fires: best_bid(0.30) <= sl(0.40)
-    exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, "SL exit")
+    ok(order.position_closed, "SL fired during placement")
 
     profit = order.calculate_profit()
     ok(profit is not None, "profit calculated")
@@ -472,21 +463,17 @@ def test_partial_exit_not_fully_closed():
         bids=[{"price": "0.80", "size": "20"}],  # only 20 available to sell into
         asks=[{"price": "0.50", "size": "100"}],
     )
+    # TP fires during placement but only 20 shares can exit (bids exhausted)
     order = book.place_virtual_order(
         OrderSide.BUY, Decimal("0.50"), Decimal("100"),
         tp_price=Decimal("0.70"),
     )
     ok(order.status == OrderStatus.FILLED, "BUY filled")
     ok(order.filled == Decimal("100"), "filled=100")
-
-    # TP fires but only 20 shares can exit (bids exhausted)
-    exits = book.monitor_bracket_orders()
-    ok(len(exits) == 1, "1 exit attempt")
-    ok(exits[0].qty_to_close == Decimal("100"), "wanted to close 100")
-    ok(exits[0].qty_exited == Decimal("20"), "only exited 20")
+    ok(order.exit_filled == Decimal("20"), "only exited 20 during placement")
     ok(not order.position_closed, "position NOT fully closed (partial exit)")
 
-    # Add more bids — TP should fire again on next tick
+    # Add more bids — TP should fire again on next monitor tick
     book.apply_changes([{"side": "bid", "price": "0.78", "size": "80"}])
     exits2 = book.monitor_bracket_orders()
     ok(len(exits2) == 1, "TP fires again for remaining shares")

@@ -259,9 +259,11 @@ def settle_order(db, bo, dry_run: bool) -> str:
     bo.price_close = close_price
 
     # Update bot balance
+    # Amount was deducted upfront at order creation → return cost + profit
     bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
     if bot:
-        bot.balance = round(bot.balance + profit, 8)
+        payout = round(bo.amount + profit, 8)
+        bot.balance = round(bot.balance + payout, 8)
         db.add(
             BalanceHistory(
                 bot_name=bo.bot_name,

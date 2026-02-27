@@ -13,6 +13,7 @@ Fetches best bid/ask for UP/DOWN prediction markets given symbol + timeframe.
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 import httpx
 
@@ -97,12 +98,29 @@ class PolymarketClient:
         now = int(time.time())
         return now - (now % period)
 
+    def _future_settlements(self, tf_norm: str, count: int = 5) -> list[int]:
+        """Return settlement timestamps for the next `count` candles after the current one."""
+        period = _TF_SECONDS[tf_norm]
+        current = self._next_settlement(tf_norm)
+        return [current + period * (i + 1) for i in range(count)]
+
     def _slug(self, symbol: str, tf_norm: str, settlement_ts: int) -> str:
         return f"{symbol.lower()}-updown-{tf_norm}-{settlement_ts}"
 
     def _slug_v2(self, symbol: str):
         symbol = _SYMBOL_INDEX[symbol.lower()]
         return f"{symbol}-up-or-down-{get_current_time_et()}"
+
+    def _slug_v2_at(self, symbol: str, settlement_ts: int) -> str:
+        """Build H1 slug for a specific settlement timestamp."""
+        et_tz = ZoneInfo("America/New_York")
+        dt = datetime.fromtimestamp(settlement_ts, tz=et_tz)
+        month = dt.strftime("%B").lower()
+        day = str(dt.day)
+        hour = str(dt.hour % 12 or 12)
+        ampm = "am" if dt.hour < 12 else "pm"
+        sym = _SYMBOL_INDEX[symbol.lower()]
+        return f"{sym}-up-or-down-{month}-{day}-{hour}{ampm}-et"
 
     def _token_ids(self, slug: str) -> list[str]:
         resp = self._http.get(_GAMMA_URL, params={"slug": slug})
@@ -162,6 +180,33 @@ class PolymarketClient:
             max_bid=max_bid,
             token_id=token_id,
         )
+
+    def get_token_id_at(
+        self, symbol: str, timeframe: str, status: str, settlement_ts: int,
+    ) -> Optional[str]:
+        """
+        Fetch token_id for a specific settlement timestamp.
+
+        Returns token_id string, or None if the market doesn't exist yet.
+        """
+        tf_norm = _TF_NORMALIZE.get(timeframe.upper(), timeframe.lower())
+        if tf_norm not in _TF_SECONDS:
+            raise ValueError(f"Unsupported timeframe: {timeframe!r}")
+
+        status = status.upper()
+        if status not in _STATUS_INDEX:
+            raise ValueError(f"status must be 'UP' or 'DOWN', got {status!r}")
+
+        if tf_norm == "1h":
+            slug = self._slug_v2_at(symbol, settlement_ts)
+        else:
+            slug = self._slug(symbol, tf_norm, settlement_ts)
+
+        try:
+            ids = self._token_ids(slug)
+            return ids[_STATUS_INDEX[status]]
+        except Exception:
+            return None
 
     def close(self):
         self._http.close()

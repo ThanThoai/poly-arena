@@ -33,7 +33,28 @@ services:
     env_file:
       - .env
     volumes:
+      - .:/app              # source code — không cần rebuild khi đổi code
       - api-db-data:/data   # cùng volume với api-test, dùng chung DB
+    restart: unless-stopped
+    networks:
+      - test-net
+
+  scheduler-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    image: poly-arena-test/scheduler
+    depends_on:
+      redis-test:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=sqlite:////data/test_orders.db
+      - REDIS_URL=redis://redis-test:6379
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - api-db-data:/data
     restart: unless-stopped
     networks:
       - test-net
@@ -42,7 +63,7 @@ services:
     build: .
     image: poly-arena-test/api
     ports:
-      - "8099:8099"
+      - "8007:8099"
     depends_on:
       redis-test:
         condition: service_healthy
@@ -56,6 +77,7 @@ services:
       --host 0.0.0.0
       --port 8099
       --workers 4
+      --reload
     volumes:
       - .:/app              # source code (hot-reload)
       - api-db-data:/data   # DB tách riêng — không mất khi rebuild image
@@ -63,19 +85,19 @@ services:
     networks:
       - test-net
 
-  # test-bot:
-  #   build: ./test_bot
-  #   image: poly-arena-test/test-bot
-  #   environment:
-  #     - API_URL=http://api-test:8099/poly-arena
-  #     - BOT_NAME=random-trader
-  #     - INTERVAL_SEC=300
-  #     - TRADES_PER_TICK=3
-  #   depends_on:
-  #     - api-test
-  #   restart: unless-stopped
-  #   networks:
-  #     - test-net
+  test-bot:
+    build: ./test_bot
+    image: poly-arena-test/test-bot
+    environment:
+      - API_URL=http://api-test:8099/poly-arena
+      - BOT_NAME=random-trader
+      - INTERVAL_SEC=300
+      - TRADES_PER_TICK=3
+    depends_on:
+      - api-test
+    restart: unless-stopped
+    networks:
+      - test-net
 
   ui-test:
     build: ./ui
@@ -90,18 +112,18 @@ services:
     networks:
       - test-net
 
-  nginx-test:
-    image: nginx:alpine
-    ports:
-      - "8007:6007"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - api-test
-      - ui-test
-    restart: unless-stopped
-    networks:
-      - test-net
+  # nginx-test:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "8007:6007"
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+  #   depends_on:
+  #     - api-test
+  #     - ui-test
+  #   restart: unless-stopped
+  #   networks:
+  #     - test-net
 
 networks:
   test-net:

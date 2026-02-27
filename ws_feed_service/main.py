@@ -66,7 +66,7 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
         for bo in pending:
             has_bracket = bo.tp_price is not None or bo.sl_price is not None
             is_limit = bo.limit_price is not None
-            if not (has_bracket or is_limit):
+            if not (has_bracket or is_limit) and bo.me_order_status != "PENDING":
                 continue
 
             # Skip orders already processed by matching engine (FILLED/CANCELED)

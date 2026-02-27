@@ -143,9 +143,7 @@ def client():
     """
     from unittest.mock import patch as _patch
 
-    with _patch("services.scheduler.start_scheduler"), \
-         _patch("services.scheduler.stop_scheduler"), \
-         _patch("main._consume_bracket_exits", _noop_consumer), \
+    with _patch("main._consume_bracket_exits", _noop_consumer), \
          _patch("main._consume_order_cancels", _noop_consumer), \
          _patch("main._consume_order_fills", _noop_consumer):
         from fastapi.testclient import TestClient
