@@ -17,6 +17,11 @@ import httpx
 from sqlalchemy.orm import Session
 
 from models import BalanceHistory, BinaryOption, Bot, BOResult
+from config.timing import (
+    HTTP_TIMEOUT,
+    STUCK_ORDER_THRESHOLD_MIN,
+    NULL_SETTLE_THRESHOLD_HOURS,
+)
 from services.order_trace import make_trace, append_trace
 
 logger = logging.getLogger(__name__)
@@ -49,8 +54,8 @@ _TF_BINANCE: dict[str, str] = {
 _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 # Stuck order sweeper thresholds
-_STUCK_THRESHOLD = timedelta(minutes=10)   # settlement_at + 10min
-_NULL_SETTLE_THRESHOLD = timedelta(hours=2)  # created_at + 2h for orders with no settlement_at
+_STUCK_THRESHOLD = timedelta(minutes=STUCK_ORDER_THRESHOLD_MIN)
+_NULL_SETTLE_THRESHOLD = timedelta(hours=NULL_SETTLE_THRESHOLD_HOURS)
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -100,7 +105,7 @@ def fetch_binance_candle(
                 "startTime": open_time_ms,
                 "limit":     1,
             },
-            timeout=10.0,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()

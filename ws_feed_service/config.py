@@ -2,6 +2,12 @@
 Constants and configuration for the WS Feed Service.
 """
 
+from config.timing import (                         # noqa: F401 — re-exported
+    PRICE_CACHE_TTL_S,
+    PRICE_STALE_THRESHOLD_S as STALE_THRESHOLD_S,
+    BRPOP_TIMEOUT_S,
+)
+
 # ── Redis keys ───────────────────────────────────────────────────────────────
 
 QUEUE_ORDERS_NEW = "queue:orders:new"
@@ -13,8 +19,6 @@ STREAM_MARKET_RESOLVED = "stream:market:resolved"
 # ── Price cache ──────────────────────────────────────────────────────────────
 
 PRICE_KEY_PREFIX = "price"          # price:{SYM}:{TF}:{DIR}
-PRICE_CACHE_TTL_S = 120             # EXPIRE on each HSET (2 min to survive session gaps)
-STALE_THRESHOLD_S = 45              # FastAPI treats older prices as stale
 
 # ── Orderbook depth ─────────────────────────────────────────────────────────
 
@@ -23,7 +27,6 @@ ORDERBOOK_DEPTH_LEVELS = 20         # Top N levels to publish per side
 
 # ── Queue / stream tuning ────────────────────────────────────────────────────
 
-BRPOP_TIMEOUT_S = 1                 # OrderConsumer BRPOP blocking timeout
 STREAM_MAXLEN = 10_000              # XADD MAXLEN ~ for bracket exits
 
 # ── Market constants ─────────────────────────────────────────────────────────

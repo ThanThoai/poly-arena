@@ -15,6 +15,10 @@ from database import get_db
 from models import BinaryOption, BalanceHistory, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast
 from services.settlement import calc_settlement_time
 from services.polymarket import PolymarketClient
+from config.timing import (
+    HTTP_TIMEOUT, HTTP_TIMEOUT_FAST,
+    API_PRICE_CACHE_TTL_S, API_ORDERBOOK_CACHE_TTL_S,
+)
 from ws_feed_service.config import (
     PRICE_KEY_PREFIX, STALE_THRESHOLD_S, QUEUE_ORDERS_NEW,
     ORDERBOOK_KEY_PREFIX,
@@ -96,48 +100,6 @@ def _try_redis_price(
         return None, None
 
 
-def _get_token_id_from_redis(
-    symbol: str, timeframe: str, pm_status: str,
-) -> Optional[str]:
-    """
-    Read token_id from Redis price cache WITHOUT staleness check.
-
-    TokenRegistry (ws_feed_service) keeps token_ids up-to-date at every candle
-    boundary. Even when the price is stale (feed gap between sessions), the
-    token_id stored in the hash is still the correct current token — so we can
-    use it for virtual order placement without needing a REST call.
-
-    Fallback: if Redis has no price key (e.g. after token rotation clears
-    stale keys), fetch token_id from Polymarket REST via PolymarketClient.
-    """
-    try:
-        from services.redis_client import get_sync_redis
-        sr = get_sync_redis()
-
-        key = f"{PRICE_KEY_PREFIX}:{symbol}:{timeframe}:{pm_status}"
-        token_id = sr.hget(key, "token_id")
-        if token_id:
-            logger.debug(
-                "Token ID from Redis: %s %s %s → %s",
-                symbol, timeframe, pm_status, token_id[:16],
-            )
-            return token_id
-    except Exception as exc:
-        logger.warning("Redis token_id lookup failed: %s", exc)
-
-    # Fallback: fetch token_id from Polymarket REST (without fetching book prices)
-    try:
-        with PolymarketClient() as pm:
-            token_id = pm.get_token_id(symbol, timeframe, pm_status)
-            logger.info(
-                "Token ID from REST fallback: %s %s %s → %s",
-                symbol, timeframe, pm_status, token_id[:16],
-            )
-            return token_id
-    except Exception as exc:
-        logger.warning("REST token_id fallback failed: %s", exc)
-        return None
-
 
 
 def _settle_immediate_bracket_exit(
@@ -199,7 +161,7 @@ def _settle_immediate_bracket_exit(
 
 
 def _queue_prefilled_to_me(
-    bo: "BinaryOption", token_id: str,
+    bo: "BinaryOption",
     avg_price: float, num_shares: float,
     payload: "BOCreate",
 ) -> None:
@@ -209,7 +171,8 @@ def _queue_prefilled_to_me(
         sr = get_sync_redis()
         order_payload = json.dumps({
             "bo_id": bo.id,
-            "token_id": token_id,
+            "symbol": payload.symbol.value,
+            "forecast": payload.forecast.value,
             "side": "BUY",
             "prefilled": True,
             "prefilled_avg_price": avg_price,
@@ -269,7 +232,7 @@ def _try_fill_limit_from_rest(
         resp = httpx.get(
             "https://clob.polymarket.com/book",
             params={"token_id": token_id},
-            timeout=10.0,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         book = resp.json()
@@ -362,7 +325,7 @@ def _fill_market_from_rest(
         resp = httpx.get(
             "https://clob.polymarket.com/book",
             params={"token_id": token_id},
-            timeout=10.0,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         book = resp.json()
@@ -466,7 +429,7 @@ def create_bo(
         if best_ask_val is None:
             # Fallback to REST
             try:
-                with PolymarketClient(timeout=8.0) as pm:
+                with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm:
                     ob = pm.get_orderbook(
                         payload.symbol.value, payload.timeframe.value, pm_status_val,
                     )
@@ -633,16 +596,16 @@ def create_bo(
                             )
                         else:
                             _queue_prefilled_to_me(
-                                bo, token_id, avg_price, num_shares, payload,
+                                bo, avg_price, num_shares, payload,
                             )
                     else:
                         _queue_prefilled_to_me(
-                            bo, token_id, avg_price, num_shares, payload,
+                            bo, avg_price, num_shares, payload,
                         )
                 else:
                     # Normal bracket: TP > entry / SL < entry → ME monitors
                     _queue_prefilled_to_me(
-                        bo, token_id, avg_price, num_shares, payload,
+                        bo, avg_price, num_shares, payload,
                     )
 
         else:
@@ -650,22 +613,6 @@ def create_bo(
             num_shares     = round(payload.amount / entry_price, 8)
             ask_fetched_at = datetime.now(timezone.utc)
             price_source   = "limit"
-
-            # token_id needed for ME virtual order
-            token_id = _get_token_id_from_redis(
-                payload.symbol.value, payload.timeframe.value, pm_status,
-            )
-            if token_id is None:
-                bot.balance = round(bot.balance + payload.amount, 8)
-                db.commit()
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"Matching engine unavailable for "
-                        f"{payload.symbol.value} {payload.timeframe.value} "
-                        f"— ws_feed_service may not be running"
-                    ),
-                )
 
             latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
             logger.info(
@@ -707,7 +654,8 @@ def create_bo(
                 sr = get_sync_redis()
                 order_payload = json.dumps({
                     "bo_id": bo.id,
-                    "token_id": token_id,
+                    "symbol": payload.symbol.value,
+                    "forecast": payload.forecast.value,
                     "side": "BUY",
                     "price": entry_price,
                     "expected_price": entry_price,
@@ -847,7 +795,7 @@ def create_bo(
                             bo.id,
                         )
                         _queue_prefilled_to_me(
-                            bo, token_id, avg_price, num_shares, payload,
+                            bo, avg_price, num_shares, payload,
                         )
                 else:
                     logger.warning(
@@ -856,12 +804,12 @@ def create_bo(
                         bo.id,
                     )
                     _queue_prefilled_to_me(
-                        bo, token_id, avg_price, num_shares, payload,
+                        bo, avg_price, num_shares, payload,
                     )
             else:
                 # Normal case: TP > entry and SL < entry → queue to ME
                 _queue_prefilled_to_me(
-                    bo, token_id, avg_price, num_shares, payload,
+                    bo, avg_price, num_shares, payload,
                 )
 
     # Persist any traces added after initial commit (e.g. from _queue_prefilled_to_me)
@@ -1036,7 +984,7 @@ def engine_status():
 
 _OB_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 _OB_DIRECTIONS = ["UP", "DOWN"]
-_OB_CACHE_TTL = 5  # seconds
+_OB_CACHE_TTL = API_ORDERBOOK_CACHE_TTL_S
 _ob_cache: dict = {}  # key: "SYM:TF:DIR" → {"bids": [...], "asks": [...], "fetched_at": float}
 
 
@@ -1060,14 +1008,14 @@ def _fetch_orderbooks_rest(combos: set[tuple[str, str, str]]) -> dict[tuple[str,
         return results
 
     try:
-        with PolymarketClient(timeout=8.0) as pm:
+        with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm:
             for sym, tf, dir_ in to_fetch:
                 try:
                     ob = pm.get_orderbook(sym, tf, dir_)
                     resp = httpx.get(
                         "https://clob.polymarket.com/book",
                         params={"token_id": ob.token_id},
-                        timeout=8.0,
+                        timeout=HTTP_TIMEOUT_FAST,
                     )
                     resp.raise_for_status()
                     book = resp.json()
@@ -1176,7 +1124,7 @@ def engine_orderbook(
 _PRICE_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 _PRICE_TIMEFRAMES = ["M5", "M15", "H1"]
 _PRICE_DIRECTIONS = ["UP", "DOWN"]
-_PRICE_CACHE_TTL = 5          # seconds — UI polls every 5s
+_PRICE_CACHE_TTL = API_PRICE_CACHE_TTL_S
 
 # In-memory cache: {"prices": [...], "fetched_at": float}
 _price_cache: dict = {"prices": [], "fetched_at": 0.0}
@@ -1192,7 +1140,7 @@ def _fetch_all_prices() -> list[dict]:
     """
     results: list[dict] = []
     try:
-        with PolymarketClient(timeout=8.0) as pm:
+        with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm:
             for sym in _PRICE_SYMBOLS:
                 for tf in _PRICE_TIMEFRAMES:
                     for direction in _PRICE_DIRECTIONS:

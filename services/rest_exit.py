@@ -13,6 +13,8 @@ from typing import Optional, Tuple
 
 import httpx
 
+from config.timing import HTTP_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,7 +28,7 @@ def fetch_best_bid_from_rest(token_id: str) -> Tuple[Optional[float], list]:
         resp = httpx.get(
             "https://clob.polymarket.com/book",
             params={"token_id": token_id},
-            timeout=10.0,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         book = resp.json()

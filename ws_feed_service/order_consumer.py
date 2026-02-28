@@ -24,8 +24,12 @@ from services.matching_engine import (
     MatchingEngine, OrderSide, OrderStatus, OrderStateChangeEvent,
     BracketFillResult,
 )
+from services.token_registry import TokenRegistry
 from ws_feed_service.config import QUEUE_ORDERS_NEW, BRPOP_TIMEOUT_S
 from ws_feed_service.redis_writer import RedisWriter
+
+# GREEN → UP, RED → DOWN
+_FORECAST_TO_DIR = {"GREEN": "UP", "RED": "DOWN"}
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +64,13 @@ class OrderConsumer:
         engine: MatchingEngine,
         redis_writer: RedisWriter,
         loop: asyncio.AbstractEventLoop,
+        registry: Optional[TokenRegistry] = None,
     ) -> None:
         self._r = sync_redis
         self._engine = engine
         self._writer = redis_writer
         self._loop = loop
+        self._registry = registry
         self._running = False
         self._thread: Optional[threading.Thread] = None
         # ── Centralized monitoring state ──────────────────────────────────
@@ -113,6 +119,34 @@ class OrderConsumer:
         bo_id = data.get("bo_id")
         token_id = data.get("token_id")
         is_prefilled = data.get("prefilled", False)
+
+        # Resolve token_id from registry if not in payload (v2: API sends
+        # symbol/timeframe/forecast instead of token_id to avoid REST latency)
+        if token_id is None and self._registry is not None:
+            forecast = data.get("forecast")  # "GREEN" or "RED"
+            symbol = data.get("symbol")
+            timeframe = data.get("timeframe")
+            if forecast and symbol and timeframe:
+                direction = _FORECAST_TO_DIR.get(forecast, "UP")
+                token_id = self._registry.get_token_id(symbol, timeframe, direction)
+                if token_id is None:
+                    logger.warning(
+                        "OrderConsumer: no token_id for %s/%s/%s (bo_id=%s) — rejecting",
+                        symbol, timeframe, direction, bo_id,
+                    )
+                    if bo_id is not None:
+                        self._publish_async(
+                            self._writer.publish_order_cancel(
+                                bo_id=bo_id, order_id="",
+                                reason="NO_TOKEN_ID",
+                                filled=0.0, avg_entry_price=0.0,
+                            )
+                        )
+                    return
+                logger.info(
+                    "Resolved token_id from registry: %s/%s/%s → %s",
+                    symbol, timeframe, direction, token_id[:16],
+                )
 
         tp_price = data.get("tp_price")
         sl_price = data.get("sl_price")
@@ -177,6 +211,22 @@ class OrderConsumer:
             for br in bracket_results:
                 if on_bracket_exit is not None:
                     on_bracket_exit(br)
+        except ValueError as exc:
+            # Book expired (token rotated) — publish cancel
+            logger.warning(
+                "Prefilled order rejected (expired book) for bo_id=%s: %s",
+                bo_id, exc,
+            )
+            if bo_id is not None:
+                self._publish_async(
+                    self._writer.publish_order_cancel(
+                        bo_id=bo_id,
+                        order_id="",
+                        reason="TOKEN_ROTATED",
+                        filled=0.0,
+                        avg_entry_price=0.0,
+                    )
+                )
         except Exception as exc:
             logger.error(
                 "Failed to place prefilled bracket order for bo_id=%s: %s",
