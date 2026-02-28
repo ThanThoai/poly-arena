@@ -1319,6 +1319,11 @@ class MatchingEngine:
             "Registered %d valid token(s)", len(token_ids),
         )
 
+    def add_valid_token(self, token_id: str) -> None:
+        """Add a single token_id to the valid set (e.g. from API REST lookup)."""
+        with self._lock:
+            self._valid_token_ids.add(token_id)
+
     def is_valid_token(self, token_id: str) -> bool:
         """Check if a token_id belongs to the current candle session."""
         with self._lock:

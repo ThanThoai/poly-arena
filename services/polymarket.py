@@ -96,12 +96,13 @@ class PolymarketClient:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _next_settlement(self, tf_norm: str) -> int:
-        """Return the settlement timestamp of the current candle.
+        """Return the candle-open timestamp for the current candle.
 
-        Examples (period = 5 min):
-            22:58 → 23:00   (2 min remaining in current candle)
-            22:55 → 23:00   (exactly on boundary → end of THIS period)
-            23:00 → 23:05   (new candle just started)
+        Polymarket slug uses candle OPEN timestamp (not close).
+        Examples (period = 5 min = 300s):
+            22:58 → 22:55   (in candle that opened at :55)
+            23:00 → 23:00   (new candle just opened)
+            23:00:09 → 23:00 (still in candle that opened at :00)
         """
         period = _TF_SECONDS[tf_norm]
         now = int(time.time())

@@ -33,7 +33,7 @@ import requests
 BASE = os.environ.get("API_URL", "http://localhost:8099/poly-arena")
 TEST_USER = os.environ.get("TEST_USER", "test-trader")
 TEST_PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
-BOT_NAME = os.environ.get("BOT_NAME", "bot-random-m5-2941")
+BOT_NAME = os.environ.get("BOT_NAME", "bot-random-m5-9816")
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -274,8 +274,8 @@ def run(
                     continue
                 last_trigger_min = current_min
                 print(f"[cron] Triggered at {now.strftime('%H:%M:%S')} UTC")
-
-            run_once(api_key, symbol, timeframe)
+            for s in ["BTC", "ETH", "SOL", "XRP"]:
+                run_once(api_key, s, timeframe)
             i += 1
 
             if count and i >= count:
@@ -289,4 +289,4 @@ def run(
 
 
 if __name__ == "__main__":
-    run(cron="*/5 * * * *", cron_second=1)
+    run(cron="*/5 * * * *", cron_second=0)

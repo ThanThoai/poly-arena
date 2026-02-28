@@ -164,6 +164,7 @@ def _queue_prefilled_to_me(
     bo: "BinaryOption",
     avg_price: float, num_shares: float,
     payload: "BOCreate",
+    token_id: Optional[str] = None,
 ) -> None:
     """Queue a pre-filled MARKET bracket order to the matching engine via Redis."""
     try:
@@ -171,6 +172,7 @@ def _queue_prefilled_to_me(
         sr = get_sync_redis()
         order_payload = json.dumps({
             "bo_id": bo.id,
+            "token_id": token_id,
             "symbol": payload.symbol.value,
             "forecast": payload.forecast.value,
             "side": "BUY",
@@ -212,13 +214,13 @@ _DEFAULT_SLIPPAGE_TOLERANCE = 0.10  # 10%
 def _try_fill_limit_from_rest(
     symbol: str, timeframe: str, pm_status: str,
     amount: float, limit_price: float,
-) -> Optional[Tuple[float, float, str, list]]:
+) -> Tuple[Optional[str], Optional[Tuple[float, float, list]]]:
     """
     Check Polymarket REST for current asks and try to fill a LIMIT BUY.
 
-    Returns (avg_price, num_shares, token_id, walk_levels) if best_ask <= limit_price,
-    i.e. there is liquidity at or below the limit price to fill against.
-    Returns None if the order cannot fill now (best_ask > limit_price or no asks).
+    Returns (token_id, (avg_price, num_shares, walk_levels)) if best_ask <= limit_price.
+    Returns (token_id, None) if can't fill now but token_id was resolved.
+    Returns (None, None) if Polymarket REST is unavailable.
     """
     try:
         with PolymarketClient() as pm:
@@ -226,7 +228,7 @@ def _try_fill_limit_from_rest(
             token_id = ob.token_id
     except Exception as e:
         logger.warning("LIMIT REST check failed (Polymarket unavailable): %s", e)
-        return None
+        return None, None
 
     try:
         resp = httpx.get(
@@ -238,7 +240,7 @@ def _try_fill_limit_from_rest(
         book = resp.json()
     except Exception as e:
         logger.warning("LIMIT REST check failed (book fetch): %s", e)
-        return None
+        return token_id, None
 
     asks = sorted(
         [
@@ -250,7 +252,7 @@ def _try_fill_limit_from_rest(
     )
 
     if not asks:
-        return None
+        return token_id, None
 
     best_ask = asks[0][0]
     limit_dec = Decimal(str(limit_price))
@@ -261,7 +263,7 @@ def _try_fill_limit_from_rest(
             "LIMIT REST check: best_ask=%s > limit=%s — defer to ME",
             best_ask, limit_dec,
         )
-        return None
+        return token_id, None
 
     # Simulate fill: sweep asks up to limit_price
     remaining_budget = Decimal(str(amount))
@@ -287,7 +289,7 @@ def _try_fill_limit_from_rest(
         })
 
     if total_shares <= 0:
-        return None
+        return token_id, None
 
     avg_price = float(total_cost / total_shares)
     num_shares = float(total_shares)
@@ -299,7 +301,7 @@ def _try_fill_limit_from_rest(
         avg_price, num_shares, len(walk_levels),
     )
 
-    return avg_price, num_shares, token_id, walk_levels
+    return token_id, (avg_price, num_shares, walk_levels)
 
 
 def _fill_market_from_rest(
@@ -495,14 +497,14 @@ def create_bo(
         #   If best_ask >  limit_price → defer to Matching Engine.
         entry_price = payload.limit_price  # type: ignore[assignment]
 
-        rest_fill = _try_fill_limit_from_rest(
+        token_id, rest_fill = _try_fill_limit_from_rest(
             payload.symbol.value, payload.timeframe.value, pm_status,
             payload.amount, entry_price,
         )
 
         if rest_fill is not None:
             # ── Phase 1a: Immediate REST fill ────────────────────────────
-            avg_price, num_shares, token_id, walk_levels = rest_fill
+            avg_price, num_shares, walk_levels = rest_fill
             ask_fetched_at = datetime.now(timezone.utc)
             price_source = "rest_limit"
 
@@ -597,15 +599,18 @@ def create_bo(
                         else:
                             _queue_prefilled_to_me(
                                 bo, avg_price, num_shares, payload,
+                                token_id=token_id,
                             )
                     else:
                         _queue_prefilled_to_me(
                             bo, avg_price, num_shares, payload,
+                            token_id=token_id,
                         )
                 else:
                     # Normal bracket: TP > entry / SL < entry → ME monitors
                     _queue_prefilled_to_me(
                         bo, avg_price, num_shares, payload,
+                        token_id=token_id,
                     )
 
         else:
@@ -654,6 +659,7 @@ def create_bo(
                 sr = get_sync_redis()
                 order_payload = json.dumps({
                     "bo_id": bo.id,
+                    "token_id": token_id,
                     "symbol": payload.symbol.value,
                     "forecast": payload.forecast.value,
                     "side": "BUY",
@@ -796,6 +802,7 @@ def create_bo(
                         )
                         _queue_prefilled_to_me(
                             bo, avg_price, num_shares, payload,
+                            token_id=token_id,
                         )
                 else:
                     logger.warning(
@@ -805,11 +812,13 @@ def create_bo(
                     )
                     _queue_prefilled_to_me(
                         bo, avg_price, num_shares, payload,
+                        token_id=token_id,
                     )
             else:
                 # Normal case: TP > entry and SL < entry → queue to ME
                 _queue_prefilled_to_me(
                     bo, avg_price, num_shares, payload,
+                    token_id=token_id,
                 )
 
     # Persist any traces added after initial commit (e.g. from _queue_prefilled_to_me)

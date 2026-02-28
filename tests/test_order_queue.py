@@ -24,7 +24,7 @@ def _mock_fill_market_from_rest(symbol, timeframe, pm_status, amount, slippage_t
 # ── create_bo → LPUSH ────────────────────────────────────────────────────────
 
 
-@patch("routers.binary_options._try_fill_limit_from_rest", return_value=None)
+@patch("routers.binary_options._try_fill_limit_from_rest", return_value=("fake-token-btc-m5-up", None))
 def test_create_bo_limit_order_pushes_to_queue(mock_rest, client, test_bot, fake_sync_redis):
     """LIMIT order where best_ask > limit should LPUSH to queue:orders:new."""
     bot_name, api_key = test_bot
@@ -55,17 +55,15 @@ def test_create_bo_limit_order_pushes_to_queue(mock_rest, client, test_bot, fake
     assert order["side"] == "BUY"
     assert order["limit_price"] == 0.45
     assert order["timeframe"] == "M5"
-    # v2: API sends symbol/forecast instead of token_id;
-    # OrderConsumer resolves token_id from TokenRegistry in-memory
     assert order["symbol"] == "BTC"
     assert order["forecast"] == "GREEN"
-    assert "token_id" not in order
+    assert order["token_id"] == "fake-token-btc-m5-up"
 
 
 def _mock_try_fill_limit(symbol, timeframe, pm_status, amount, limit_price):
     """Mock REST fill for LIMIT order that CAN fill now."""
     walk_levels = [{"price": 0.42, "qty": round(amount / 0.42, 8), "cost": amount}]
-    return (0.42, round(amount / 0.42, 8), "fake-token-btc-m5-up", walk_levels)
+    return ("fake-token-btc-m5-up", (0.42, round(amount / 0.42, 8), walk_levels))
 
 
 @patch("routers.binary_options._try_fill_limit_from_rest", side_effect=_mock_try_fill_limit)
@@ -127,10 +125,9 @@ def test_create_bo_limit_immediate_fill_with_bracket(mock_rest, client, test_bot
     order = json.loads(raw)
     assert order["prefilled"] is True
     assert order["tp_price"] == 0.70
-    # v2: symbol/forecast instead of token_id
     assert order["symbol"] == "BTC"
     assert order["forecast"] == "GREEN"
-    assert "token_id" not in order
+    assert order["token_id"] == "fake-token-btc-m5-up"
 
 
 @patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
@@ -171,10 +168,9 @@ def test_create_bo_market_with_bracket_pushes_to_queue(mock_fill, mock_price, cl
     assert order["prefilled_avg_price"] == 0.52
     assert order["tp_price"] == 0.70
     assert order["sl_price"] is None
-    # v2: symbol/forecast instead of token_id
     assert order["symbol"] == "BTC"
     assert order["forecast"] == "GREEN"
-    assert "token_id" not in order
+    assert order["token_id"] == "fake-token-btc-m5-up"
 
 
 @patch("routers.binary_options._fill_market_from_rest", side_effect=_mock_fill_market_from_rest)

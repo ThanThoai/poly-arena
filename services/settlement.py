@@ -336,6 +336,18 @@ def settle_pending_trades(db: Session) -> None:
 
     db.commit()
 
+    # Check achievements for all settled trades
+    try:
+        from services.achievements import on_trade_resolved
+        for bo in pending:
+            if bo.result in (BOResult.WIN, BOResult.LOSS):
+                try:
+                    on_trade_resolved(bo, db)
+                except Exception as exc:
+                    logger.debug("Achievement check failed for BO #%d: %s", bo.id, exc)
+    except Exception as exc:
+        logger.debug("Achievement module unavailable: %s", exc)
+
 
 # ── Stuck Order Sweeper ───────────────────────────────────────────────────────
 
@@ -441,5 +453,17 @@ def sweep_stuck_orders(db: Session) -> int:
     if resolved > 0:
         db.commit()
         logger.info("[STUCK_SWEEP] Resolved %d stuck/orphaned trade(s)", resolved)
+
+        # Check achievements for swept trades
+        try:
+            from services.achievements import on_trade_resolved
+            for bo in stuck_with_settle + orphaned:
+                if bo.result in (BOResult.WIN, BOResult.LOSS):
+                    try:
+                        on_trade_resolved(bo, db)
+                    except Exception as exc:
+                        logger.debug("Achievement check failed for BO #%d: %s", bo.id, exc)
+        except Exception as exc:
+            logger.debug("Achievement module unavailable: %s", exc)
 
     return resolved
