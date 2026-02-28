@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from models import BalanceHistory, BinaryOption, Bot, BOResult
+from services.order_trace import make_trace, append_trace
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,7 @@ def _settle_single_trade(
     # Update bot balance
     # Amount was deducted upfront at order creation → return cost + profit
     bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
+    payout = 0.0
     if bot:
         payout = round(bo.amount + profit, 8)
         bot.balance = round(bot.balance + payout, 8)
@@ -226,10 +228,32 @@ def _settle_single_trade(
             trade_id    = bo.id,
         ))
 
+    # SETTLEMENT trace — candle comparison and payout
+    if bo.exit_trigger in ("TP", "SL"):
+        append_trace(bo, make_trace(
+            "SETTLEMENT", "CANDLE_SETTLED",
+            f"Final Settlement: Candle {candle_dir} (open=${open_price:.2f}, "
+            f"close=${close_price:.2f}). {bo.exit_trigger} exit profit: ${profit:.4f} "
+            f"({result.value}). Payout: ${payout:.4f}.",
+            {"candle_dir": candle_dir, "open_price": open_price,
+             "close_price": close_price, "profit": profit, "payout": payout,
+             "result": result.value, "exit_trigger": bo.exit_trigger},
+        ))
+    else:
+        append_trace(bo, make_trace(
+            "SETTLEMENT", "CANDLE_SETTLED",
+            f"Final Settlement: Candle {candle_dir} (open=${open_price:.2f}, "
+            f"close=${close_price:.2f}). Forecast: {bo.forecast} → {result.value}. "
+            f"Profit: ${profit:.4f}. Payout: ${payout:.4f}.",
+            {"candle_dir": candle_dir, "open_price": open_price,
+             "close_price": close_price, "forecast": str(bo.forecast),
+             "profit": profit, "payout": payout, "result": result.value},
+        ))
+
     logger.info(
         "%sSettled #%d %s %s forecast=%s candle=%s → %s profit=%.8f payout=%.8f balance=%.2f",
         prefix, bo.id, bo.symbol, bo.timeframe, bo.forecast,
-        candle_dir, result.value, profit, payout if bot else 0,
+        candle_dir, result.value, profit, payout,
         bot.balance if bot else float("nan"),
     )
 
@@ -262,6 +286,10 @@ def settle_pending_trades(db: Session) -> None:
         # Skip cancelled orders (TTL expired)
         if bo.result != BOResult.PENDING:
             continue
+        # Skip orders already resolved by market resolution (v2 spec)
+        if bo.position_closed:
+            logger.info("Trade #%d skipped — position already closed (market resolved)", bo.id)
+            continue
         # ME never filled this order — cancel with refund immediately.
         if bo.me_order_status == "PENDING":
             logger.warning(
@@ -271,6 +299,13 @@ def settle_pending_trades(db: Session) -> None:
             bo.result = BOResult.CANCELLED
             bo.profit = 0.0
             bo.me_order_status = "CANCELED"
+
+            append_trace(bo, make_trace(
+                "SETTLEMENT", "UNFILLED_CANCEL",
+                f"Order never filled at settlement time. "
+                f"Cancelled with full refund: ${bo.amount:.4f}.",
+                {"refund": bo.amount},
+            ))
 
             bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
             if bot:

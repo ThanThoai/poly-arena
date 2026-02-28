@@ -1,8 +1,8 @@
+name: poly-arena-prod
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg16
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_DB: polyarena
       POSTGRES_USER: polyarena
@@ -15,11 +15,11 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
+    networks:
+      - prod-net
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     command: >
       redis-server
       --maxmemory 256mb
@@ -32,11 +32,14 @@ services:
     volumes:
       - redis-data:/data
     restart: unless-stopped
+    networks:
+      - prod-net
 
-  ws_feed:
+  ws-feed:
     build:
       context: .
       dockerfile: Dockerfile.ws_feed
+    image: poly-arena-prod/ws-feed
     depends_on:
       redis:
         condition: service_healthy
@@ -50,11 +53,14 @@ services:
     restart: unless-stopped
     deploy:
       replicas: 1
+    networks:
+      - prod-net
 
   scheduler:
     build:
       context: .
       dockerfile: Dockerfile.scheduler
+    image: poly-arena-prod/scheduler
     depends_on:
       redis:
         condition: service_healthy
@@ -66,11 +72,14 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    networks:
+      - prod-net
 
   api:
     build: .
+    image: poly-arena-prod/api
     ports:
-      - "8010:8010"
+      - "${API_PORT:-8010}:8010"
     depends_on:
       redis:
         condition: service_healthy
@@ -79,6 +88,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://polyarena:${POSTGRES_PASSWORD:-polyarena_prod}@timescaledb:5432/polyarena
       - REDIS_URL=redis://redis:6379
+      - DISABLE_DOCS=1
     env_file:
       - .env
     command: >
@@ -89,6 +99,44 @@ services:
       --access-logfile -
       --error-logfile -
     restart: unless-stopped
+    networks:
+      - prod-net
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    image: poly-arena-prod/ui
+    ports:
+      - "${UI_PORT:-3000}:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8010/poly-arena}
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - prod-net
+
+  test-bot:
+    build:
+      context: ./test_bot
+      dockerfile: Dockerfile
+    image: poly-arena-prod/test-bot
+    environment:
+      - API_URL=http://api:8010/poly-arena
+      - TEST_USER=${TEST_USER:-test-trader}
+      - TEST_PASSWORD=${TEST_PASSWORD:-testpass123}
+      - NUM_BOTS=${NUM_BOTS:-5}
+      - INTERVAL_SEC=${INTERVAL_SEC:-300}
+      - TRADES_PER_TICK=${TRADES_PER_TICK:-15}
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - prod-net
+
+networks:
+  prod-net:
 
 volumes:
   redis-data:

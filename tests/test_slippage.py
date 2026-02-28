@@ -244,3 +244,51 @@ def test_limit_order_ignores_slippage():
 
     assert order.filled == Decimal("100")
     assert order.status == OrderStatus.FILLED
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. LIMIT order fills on best_bid_ask event
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_limit_order_fills_on_best_bid_ask_event():
+    """LIMIT BUY order should fill when a best_bid_ask event brings the ask
+    below the limit price.  Regression test: previously _handle_best_bid_ask
+    did not call run_matching(), leaving LIMIT orders stuck as PENDING."""
+    engine = MatchingEngine()
+    token_id = "tok-limit-bba-fill"
+
+    # Start with asks above the limit price
+    engine.dispatch_event({
+        "event_type": "book",
+        "asset_id": token_id,
+        "bids": [{"price": "0.40", "size": "100"}],
+        "asks": [{"price": "0.60", "size": "100"}],
+    })
+
+    book = engine.get_or_create_book(token_id)
+
+    # Place a LIMIT BUY at 0.55 — should stay PENDING since ask=0.60 > 0.55
+    order, _ = book.place_virtual_order(
+        side=OrderSide.BUY,
+        price=Decimal("0.55"),
+        quantity=Decimal("50"),
+        order_type="LIMIT",
+    )
+    assert order.status == OrderStatus.PENDING
+    assert order.filled == Decimal("0")
+
+    # Simulate a best_bid_ask event with ask dropping to 0.52 (below limit 0.55)
+    engine.dispatch_event({
+        "event_type": "best_bid_ask",
+        "asset_id": token_id,
+        "bid": "0.45",
+        "bid_size": "80",
+        "ask": "0.52",
+        "ask_size": "200",
+    })
+
+    # The LIMIT order should now be filled
+    assert order.status == OrderStatus.FILLED
+    assert order.filled == Decimal("50")
+    assert order.avg_entry_price == Decimal("0.52")

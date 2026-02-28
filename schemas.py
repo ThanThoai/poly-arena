@@ -47,22 +47,10 @@ class BOCreate(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_bracket_prices(self) -> "BOCreate":
-        tp = self.tp_price
-        sl = self.sl_price
-        limit = self.limit_price
-
-        # TP must be greater than SL
-        if tp is not None and sl is not None and tp <= sl:
-            raise ValueError("tp_price must be greater than sl_price")
-
-        # For LIMIT orders, validate TP/SL relative to limit_price
-        if limit is not None:
-            if tp is not None and tp <= limit:
-                raise ValueError("tp_price must be greater than limit_price for LIMIT BUY orders")
-            if sl is not None and sl >= limit:
-                raise ValueError("sl_price must be less than limit_price for LIMIT BUY orders")
-
+    def validate_single_condition(self) -> "BOCreate":
+        """Single Condition Policy: an order can have at most one condition (TP or SL, not both)."""
+        if self.tp_price is not None and self.sl_price is not None:
+            raise ValueError("Only one condition allowed: set tp_price OR sl_price, not both")
         return self
 
 
@@ -98,6 +86,8 @@ class BOResponse(BaseModel):
     me_order_status: Optional[str]   = None
     ttl:             Optional[int]   = None
     walk_prices:     Optional[dict]  = None
+    traces:          Optional[list]  = None
+    position_closed: Optional[bool]  = None
 
     model_config = {"from_attributes": True}
 

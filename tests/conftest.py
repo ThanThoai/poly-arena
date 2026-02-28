@@ -88,12 +88,19 @@ _db_mod.get_db = _get_test_db
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
-@pytest.fixture(autouse=True)
-def setup_test_db():
-    """Create all tables before each test, truncate after (preserves schema)."""
+@pytest.fixture(autouse=True, scope="session")
+def _create_test_schema():
+    """Drop and recreate all tables once per test session to pick up schema changes."""
+    Base.metadata.drop_all(bind=_test_engine)
     Base.metadata.create_all(bind=_test_engine)
     yield
-    # Truncate all rows but keep tables intact — safe for shared databases
+
+
+@pytest.fixture(autouse=True)
+def setup_test_db(_create_test_schema):
+    """Truncate all tables before each test."""
+    yield
+    # Truncate all rows but keep tables intact
     with _test_engine.begin() as conn:
         for table in reversed(Base.metadata.sorted_tables):
             conn.execute(table.delete())
@@ -150,7 +157,8 @@ def client():
 
     with _patch("main._consume_bracket_exits", _noop_consumer), \
          _patch("main._consume_order_cancels", _noop_consumer), \
-         _patch("main._consume_order_fills", _noop_consumer):
+         _patch("main._consume_order_fills", _noop_consumer), \
+         _patch("main._consume_market_resolved", _noop_consumer):
         from fastapi.testclient import TestClient
         from main import app
         with TestClient(app, base_url="http://testserver:8099") as c:

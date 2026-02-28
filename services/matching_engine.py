@@ -1,12 +1,13 @@
 """
 Shadow Matching Engine for Polymarket binary-options orderbooks.
 
-Implements the full specification from docs/matching_engine.md including:
+Implements the v2 specification from docs/maching_engine_v2.md including:
+  - Single Condition Policy: each order has at most one condition (TP or SL)
   - Section 2: SimulatedOrder with Bracket Order (TP/SL) fields
   - Section 3: WebSocket event handlers (book, price_change, best_bid_ask,
                last_trade_price, market_resolved)
   - Section 4: Core matching algorithm with shadow liquidity deduction
-  - Section 5: Workflow E — Bracket Order TP/SL monitoring with OCO logic
+  - Section 5: Bracket Order TP/SL monitoring with single-condition logic
                and realistic slippage through multiple bid levels
   - Section 6: Decimal precision, partial-fill awareness, slippage handling
 
@@ -531,15 +532,14 @@ class ShadowOrderbook:
             # instead of waiting for next WS event (#2).
             # Bracket results are returned to the caller — callbacks are NOT
             # fired here so the caller can publish fill events FIRST.
+            # Single condition: check whichever is set (TP or SL, never both)
             if order.is_eligible_for_bracket and self.bids:
                 current_best_bid = max(self.bids.keys())
-                triggered = False
                 if order.tp_price is not None and current_best_bid >= order.tp_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "TP")
                     self._bracket_log.append(result)
                     immediate_bracket_results.append(result)
-                    triggered = True
-                if not triggered and order.sl_price is not None and current_best_bid <= order.sl_price:
+                elif order.sl_price is not None and current_best_bid <= order.sl_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "SL")
                     self._bracket_log.append(result)
                     immediate_bracket_results.append(result)
@@ -589,16 +589,14 @@ class ShadowOrderbook:
         with self._lock:
             self._virtual_orders.append(order)
 
-            # Check TP/SL immediately against current best_bid
+            # Single condition: check whichever is set (TP or SL, never both)
             if order.is_eligible_for_bracket and self.bids:
                 current_best_bid = max(self.bids.keys())
-                triggered = False
                 if order.tp_price is not None and current_best_bid >= order.tp_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "TP")
                     self._bracket_log.append(result)
                     immediate_bracket_results.append(result)
-                    triggered = True
-                if not triggered and order.sl_price is not None and current_best_bid <= order.sl_price:
+                elif order.sl_price is not None and current_best_bid <= order.sl_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "SL")
                     self._bracket_log.append(result)
                     immediate_bracket_results.append(result)
@@ -1004,11 +1002,12 @@ class ShadowOrderbook:
         """
         Evaluate all active bracket orders against current best bid.
 
-        Implements spec Section 5 in full:
-          - OCO logic: TP checked first; if hit, SL is skipped for that order.
-          - Liquidation executes through standard matching algo against shadow
-            bids — realistic multi-level slippage (spec Section 6 constraint 2).
-          - Only the `filled` portion is liquidated (Section 6 constraint 3).
+        Single condition policy (v2 spec): each order has at most one condition
+        (TP or SL), so we simply check whichever is set.
+
+        Liquidation executes through standard matching algo against shadow
+        bids — realistic multi-level slippage.  Only the `filled` portion
+        is liquidated.
 
         Returns list of BracketFillResult for all exits executed this tick.
         """
@@ -1017,19 +1016,15 @@ class ShadowOrderbook:
         pending_callbacks: list[tuple[Callable, BracketFillResult]] = []
 
         with self._lock:
-            # Step 1: fetch current best bid (spec 5, step 1)
             if not self.bids:
                 return results
             current_best_bid = max(self.bids.keys())
 
             for order in self._virtual_orders:
-                # Step 2: eligibility check (spec 5, step 2)
                 if not order.is_eligible_for_bracket:
                     continue
 
-                triggered = False
-
-                # ── Take Profit check (spec 5, "Check Take Profit") ──────────
+                # ── Take Profit check ─────────────────────────────────────────
                 if order.tp_price is not None and current_best_bid >= order.tp_price:
                     logger.info(
                         "Take Profit triggered for Order %s at price %s "
@@ -1044,11 +1039,9 @@ class ShadowOrderbook:
                     self._bracket_log.append(result)
                     if order._on_bracket_exit is not None:
                         pending_callbacks.append((order._on_bracket_exit, result))
-                    triggered = True
 
-                # ── Stop Loss check (spec 5, "Check Stop Loss") ──────────────
-                # OCO: only check SL if TP did not fire for this order
-                if not triggered and order.sl_price is not None and current_best_bid <= order.sl_price:
+                # ── Stop Loss check ───────────────────────────────────────────
+                elif order.sl_price is not None and current_best_bid <= order.sl_price:
                     logger.info(
                         "Stop Loss triggered for Order %s at price %s "
                         "(sl_price=%s, qty_to_close=%s)",
@@ -1258,6 +1251,7 @@ class MatchingEngine:
         self._books:   dict[str, ShadowOrderbook] = {}
         self._lock     = threading.Lock()
         self._running  = True
+        self._on_market_resolved: Optional[Callable] = None  # callback(asset_id, orders)
 
     def get_or_create_book(self, token_id: str) -> ShadowOrderbook:
         with self._lock:
@@ -1348,6 +1342,9 @@ class MatchingEngine:
                 changes.append({"side": "ask", "price": raw_ask, "size": event.get("ask_size", "0")})
             if any(c["size"] != "0" for c in changes):
                 book.apply_changes(changes)
+                # Run matching so pending LIMIT orders can fill when
+                # the best ask drops to or below their limit price.
+                book.run_matching()
             else:
                 # Prices unchanged but feed is alive — touch last_update to
                 # prevent the book from becoming stale
@@ -1384,14 +1381,43 @@ class MatchingEngine:
             )
 
     def _handle_market_resolved(self, asset_id: str) -> None:
-        """Market finalized — cancel all open virtual orders (spec 3.5)."""
+        """
+        Market finalized — cancel TP/SL monitoring and mark positions closed (v2 spec Section 5).
+
+        Sets position_closed=True and clears tp/sl on all affected orders so
+        bracket monitoring stops.  Also cancels any unfilled orders.
+        """
         book = self.get_book(asset_id)
-        if book:
-            canceled = book.cancel_all_virtual()
+        if book is None:
+            return
+
+        resolved_orders: list[SimulatedOrder] = []
+        with book._lock:
+            for order in book._virtual_orders:
+                if order.position_closed:
+                    continue
+                # Cancel unfilled orders
+                if order.status in (OrderStatus.PENDING, OrderStatus.PARTIAL):
+                    order.status = OrderStatus.CANCELED
+                # Clear TP/SL conditions and mark position closed
+                order.tp_price = None
+                order.sl_price = None
+                order.position_closed = True
+                resolved_orders.append(order)
+
+        if resolved_orders:
             logger.info(
-                "Market resolved %s: canceled %d virtual order(s)",
-                asset_id[:16], canceled,
+                "Market resolved %s: marked %d order(s) as position_closed, "
+                "cleared all TP/SL conditions",
+                asset_id[:16], len(resolved_orders),
             )
+
+        # Publish resolution event via callback if registered
+        if self._on_market_resolved is not None:
+            try:
+                self._on_market_resolved(asset_id, resolved_orders)
+            except Exception as exc:
+                logger.error("market_resolved callback error: %s", exc, exc_info=True)
 
     # ── Public API ───────────────────────────────────────────────────────────
 

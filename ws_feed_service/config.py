@@ -8,6 +8,7 @@ QUEUE_ORDERS_NEW = "queue:orders:new"
 STREAM_BRACKET_EXITS = "stream:bracket:exits"
 STREAM_ORDER_CANCELS = "stream:order:cancels"
 STREAM_ORDER_FILLS   = "stream:order:fills"
+STREAM_MARKET_RESOLVED = "stream:market:resolved"
 
 # ── Price cache ──────────────────────────────────────────────────────────────
 

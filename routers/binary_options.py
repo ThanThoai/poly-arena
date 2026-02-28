@@ -23,6 +23,11 @@ from schemas import (
     BOBotStats, BOCreate, BOForecastStats, BOResponse,
     BOStats, BOTimeframeStats,
 )
+from services.order_trace import make_trace, append_trace
+from services.rest_exit import (
+    fetch_best_bid_from_rest as _fetch_best_bid_from_rest,
+    simulate_bracket_exit_from_rest as _simulate_bracket_exit_from_rest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,67 +139,6 @@ def _get_token_id_from_redis(
         return None
 
 
-def _fetch_best_bid_from_rest(token_id: str) -> Tuple[Optional[float], list]:
-    """
-    Fetch the current best_bid and bid levels from Polymarket REST API.
-    Returns (best_bid, bid_levels) where bid_levels is [(price, size), ...].
-    Returns (None, []) on failure.
-    """
-    try:
-        resp = httpx.get(
-            "https://clob.polymarket.com/book",
-            params={"token_id": token_id},
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        book = resp.json()
-    except Exception as e:
-        logger.warning("Failed to fetch bid levels from REST: %s", e)
-        return None, []
-
-    bids = sorted(
-        [
-            (Decimal(str(level["price"])), Decimal(str(level["size"])))
-            for level in book.get("bids", [])
-            if float(level["size"]) > 0
-        ],
-        key=lambda x: x[0],
-        reverse=True,
-    )
-    if not bids:
-        return None, []
-
-    return float(bids[0][0]), bids
-
-
-def _simulate_bracket_exit_from_rest(
-    num_shares: float, bid_levels: list,
-) -> Tuple[float, float, list]:
-    """
-    Simulate selling num_shares against REST bid levels (walk bids descending).
-    Returns (avg_exit_price, qty_exited, exit_walk_levels).
-    """
-    qty_remaining = Decimal(str(num_shares))
-    total_value = Decimal("0")
-    qty_exited = Decimal("0")
-    exit_walk: list = []
-
-    for bid_price, bid_size in bid_levels:
-        if qty_remaining <= 0:
-            break
-        fill_qty = min(qty_remaining, bid_size)
-        total_value += fill_qty * bid_price
-        qty_exited += fill_qty
-        qty_remaining -= fill_qty
-        exit_walk.append({
-            "price": float(bid_price),
-            "qty": float(fill_qty),
-            "cost": round(float(fill_qty * bid_price), 8),
-        })
-
-    avg_exit = float(total_value / qty_exited) if qty_exited > 0 else 0.0
-    return avg_exit, float(qty_exited), exit_walk
-
 
 def _settle_immediate_bracket_exit(
     db: Session, bo: "BinaryOption", bot: "Bot",
@@ -235,6 +179,16 @@ def _settle_immediate_bracket_exit(
         )
     )
 
+    append_trace(bo, make_trace(
+        "SETTLEMENT", "IMMEDIATE_BRACKET_SETTLED",
+        f"Immediate bracket exit settled. {trigger} triggered at entry. "
+        f"Entry: ${bo.avg_price:.4f} → Exit: ${exit_price:.4f}. "
+        f"Profit: ${profit:.4f} ({result.value}). Payout: ${payout:.4f}.",
+        {"trigger": trigger, "entry_price": bo.avg_price,
+         "exit_price": exit_price, "exit_filled": exit_filled,
+         "profit": profit, "result": result.value, "payout": payout},
+    ))
+
     db.commit()
     logger.info(
         "Immediate bracket exit settled: BO #%d trigger=%s "
@@ -265,6 +219,17 @@ def _queue_prefilled_to_me(
             "timeframe": payload.timeframe.value,
         })
         sr.lpush(QUEUE_ORDERS_NEW, order_payload)
+
+        condition_type = "TP" if payload.tp_price else "SL"
+        condition_price = payload.tp_price or payload.sl_price
+        append_trace(bo, make_trace(
+            "MONITORING", "BRACKET_QUEUED",
+            f"Active Monitoring started. Condition {condition_type} at "
+            f"${condition_price:.4f}. Watching for trigger via WebSocket.",
+            {"condition_type": condition_type, "condition_price": condition_price,
+             "avg_entry_price": avg_price, "num_shares": num_shares},
+        ))
+
         logger.info(
             "Prefilled bracket order queued for BO #%d: "
             "avg_price=%.6f shares=%.4f tp=%s sl=%s",
@@ -279,6 +244,99 @@ def _queue_prefilled_to_me(
 
 
 _DEFAULT_SLIPPAGE_TOLERANCE = 0.10  # 10%
+
+
+def _try_fill_limit_from_rest(
+    symbol: str, timeframe: str, pm_status: str,
+    amount: float, limit_price: float,
+) -> Optional[Tuple[float, float, str, list]]:
+    """
+    Check Polymarket REST for current asks and try to fill a LIMIT BUY.
+
+    Returns (avg_price, num_shares, token_id, walk_levels) if best_ask <= limit_price,
+    i.e. there is liquidity at or below the limit price to fill against.
+    Returns None if the order cannot fill now (best_ask > limit_price or no asks).
+    """
+    try:
+        with PolymarketClient() as pm:
+            ob = pm.get_orderbook(symbol, timeframe, pm_status)
+            token_id = ob.token_id
+    except Exception as e:
+        logger.warning("LIMIT REST check failed (Polymarket unavailable): %s", e)
+        return None
+
+    try:
+        resp = httpx.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        book = resp.json()
+    except Exception as e:
+        logger.warning("LIMIT REST check failed (book fetch): %s", e)
+        return None
+
+    asks = sorted(
+        [
+            (Decimal(str(level["price"])), Decimal(str(level["size"])))
+            for level in book.get("asks", [])
+            if float(level["size"]) > 0
+        ],
+        key=lambda x: x[0],
+    )
+
+    if not asks:
+        return None
+
+    best_ask = asks[0][0]
+    limit_dec = Decimal(str(limit_price))
+
+    if best_ask > limit_dec:
+        # Can't fill now — best ask is above limit price
+        logger.info(
+            "LIMIT REST check: best_ask=%s > limit=%s — defer to ME",
+            best_ask, limit_dec,
+        )
+        return None
+
+    # Simulate fill: sweep asks up to limit_price
+    remaining_budget = Decimal(str(amount))
+    total_cost = Decimal("0")
+    total_shares = Decimal("0")
+    walk_levels: list = []
+
+    for ask_price, ask_size in asks:
+        if ask_price > limit_dec:
+            break  # Don't fill above limit price
+        if remaining_budget <= 0:
+            break
+        max_shares_at_level = remaining_budget / ask_price
+        fill_shares = min(ask_size, max_shares_at_level)
+        fill_cost = fill_shares * ask_price
+        total_cost += fill_cost
+        total_shares += fill_shares
+        remaining_budget -= fill_cost
+        walk_levels.append({
+            "price": float(ask_price),
+            "qty": float(fill_shares),
+            "cost": round(float(fill_cost), 8),
+        })
+
+    if total_shares <= 0:
+        return None
+
+    avg_price = float(total_cost / total_shares)
+    num_shares = float(total_shares)
+
+    logger.info(
+        "LIMIT REST fill: %s %s %s amount=%.4f limit=%.4f → "
+        "avg=%.6f shares=%.4f levels=%d",
+        symbol, timeframe, pm_status, amount, limit_price,
+        avg_price, num_shares, len(walk_levels),
+    )
+
+    return avg_price, num_shares, token_id, walk_levels
 
 
 def _fill_market_from_rest(
@@ -397,6 +455,65 @@ def create_bo(
             detail=f"Insufficient balance: {bot.balance:.2f} < {payload.amount:.2f}",
         )
 
+    # ── Pre-validation: condition price vs Best Ask (v2 spec Section 2) ────
+    # Prevents "logical suicide" orders where the condition is already met
+    pending_traces: list[dict] = []
+    if payload.tp_price is not None or payload.sl_price is not None:
+        pm_status_val = _FORECAST_TO_STATUS[payload.forecast.value]
+        best_ask_val, _ = _try_redis_price(
+            payload.symbol.value, payload.timeframe.value, pm_status_val,
+        )
+        if best_ask_val is None:
+            # Fallback to REST
+            try:
+                with PolymarketClient(timeout=8.0) as pm:
+                    ob = pm.get_orderbook(
+                        payload.symbol.value, payload.timeframe.value, pm_status_val,
+                    )
+                    best_ask_val = ob.min_ask
+            except Exception:
+                best_ask_val = None
+
+        if best_ask_val is not None:
+            if payload.sl_price is not None and payload.sl_price >= best_ask_val:
+                pending_traces.append(make_trace(
+                    "VALIDATION", "PRE_VALIDATION_FAILED",
+                    f"Validation Failed: SL ${payload.sl_price:.4f} must be lower than "
+                    f"estimated entry ${best_ask_val:.4f}. Order Rejected.",
+                    {"sl_price": payload.sl_price, "best_ask": best_ask_val},
+                ))
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"SL price ({payload.sl_price:.4f}) must be lower than "
+                        f"current Best Ask ({best_ask_val:.4f})"
+                    ),
+                )
+            if payload.tp_price is not None and payload.tp_price <= best_ask_val:
+                pending_traces.append(make_trace(
+                    "VALIDATION", "PRE_VALIDATION_FAILED",
+                    f"Validation Failed: TP ${payload.tp_price:.4f} must be higher than "
+                    f"estimated entry ${best_ask_val:.4f}. Order Rejected.",
+                    {"tp_price": payload.tp_price, "best_ask": best_ask_val},
+                ))
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"TP price ({payload.tp_price:.4f}) must be higher than "
+                        f"current Best Ask ({best_ask_val:.4f})"
+                    ),
+                )
+            # Validation passed
+            condition_type = "TP" if payload.tp_price is not None else "SL"
+            condition_price = payload.tp_price if payload.tp_price is not None else payload.sl_price
+            pending_traces.append(make_trace(
+                "VALIDATION", "PRE_VALIDATION_OK",
+                f"Pre-validation successful. Condition {condition_type} at "
+                f"${condition_price:.4f} is valid against current Best Ask ${best_ask_val:.4f}.",
+                {"condition_type": condition_type, "condition_price": condition_price,
+                 "best_ask": best_ask_val},
+            ))
+
     # Deduct amount from balance upfront — refunded on cancel, settled on WIN/LOSS
     bot.balance = round(bot.balance - payload.amount, 8)
 
@@ -409,86 +526,223 @@ def create_bo(
     settlement_at = calc_settlement_time(payload.timeframe, datetime.now(timezone.utc))
 
     if is_limit:
-        # ── LIMIT order: giá do bot chỉ định ─────────────────────────────────
-        entry_price    = payload.limit_price  # type: ignore[assignment]
-        num_shares     = round(payload.amount / entry_price, 8)
-        ask_fetched_at = datetime.now(timezone.utc)
-        price_source   = "limit"
+        # ── LIMIT order: two-phase flow ─────────────────────────────────────
+        # Phase 1: Check Polymarket REST for current asks.
+        #   If best_ask <= limit_price → fill immediately via REST.
+        #   If best_ask >  limit_price → defer to Matching Engine.
+        entry_price = payload.limit_price  # type: ignore[assignment]
 
-        # token_id cần cho virtual order — lấy từ Redis (không check staleness)
-        # TokenRegistry đã cache sẵn và tự refresh tại mỗi candle boundary.
-        token_id = _get_token_id_from_redis(
+        rest_fill = _try_fill_limit_from_rest(
             payload.symbol.value, payload.timeframe.value, pm_status,
-        )
-        if token_id is None:
-            # LIMIT orders require matching engine — refund balance and reject
-            bot.balance = round(bot.balance + payload.amount, 8)
-            db.commit()
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Matching engine unavailable for {payload.symbol.value} "
-                    f"{payload.timeframe.value} — ws_feed_service may not be running"
-                ),
-            )
-
-        latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
-        logger.info(
-            "BO LIMIT %s %s %s: price=%.4f src=%s latency=%.0fms tp=%s sl=%s",
-            payload.symbol.value, payload.timeframe.value, payload.forecast.value,
-            entry_price, price_source, latency_ms,
-            payload.tp_price, payload.sl_price,
+            payload.amount, entry_price,
         )
 
-        bo = BinaryOption(
-            bot_name          = bot.bot_name,
-            symbol            = payload.symbol,
-            timeframe         = payload.timeframe,
-            forecast          = payload.forecast,
-            amount            = payload.amount,
-            result            = BOResult.PENDING,
-            avg_price         = None,
-            num_shares        = None,
-            reason            = payload.reason,
-            order_received_at = order_received_at,
-            ask_fetched_at    = ask_fetched_at,
-            settlement_at     = settlement_at,
-            limit_price       = payload.limit_price,
-            tp_price          = payload.tp_price,
-            sl_price          = payload.sl_price,
-            ttl               = payload.ttl,
-            me_order_status   = "PENDING",
-        )
-        db.add(bo)
-        db.commit()
-        db.refresh(bo)
+        if rest_fill is not None:
+            # ── Phase 1a: Immediate REST fill ────────────────────────────
+            avg_price, num_shares, token_id, walk_levels = rest_fill
+            ask_fetched_at = datetime.now(timezone.utc)
+            price_source = "rest_limit"
 
-        # Push LIMIT order to ME via Redis queue
-        try:
-            from services.redis_client import get_sync_redis
-            sr = get_sync_redis()
-            order_payload = json.dumps({
-                "bo_id": bo.id,
-                "token_id": token_id,
-                "side": "BUY",
-                "price": entry_price,
-                "expected_price": entry_price,
-                "quantity": num_shares,
-                "amount": payload.amount,
-                "limit_price": payload.limit_price,
-                "tp_price": payload.tp_price,
-                "sl_price": payload.sl_price,
-                "timeframe": payload.timeframe.value,
-                "ttl": payload.ttl,
-                "slippage_tolerance": payload.slippage_tolerance,
-            })
-            sr.lpush(QUEUE_ORDERS_NEW, order_payload)
+            latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
             logger.info(
-                "Virtual order queued for BO #%d: type=LIMIT tp=%s sl=%s",
-                bo.id, payload.tp_price, payload.sl_price,
+                "BO LIMIT %s %s %s: IMMEDIATE fill via REST "
+                "avg=%.6f shares=%.4f limit=%.4f latency=%.0fms tp=%s sl=%s",
+                payload.symbol.value, payload.timeframe.value,
+                payload.forecast.value,
+                avg_price, num_shares, entry_price, latency_ms,
+                payload.tp_price, payload.sl_price,
             )
-        except Exception as exc:
-            logger.error("Failed to queue virtual order for BO #%d: %s", bo.id, exc)
+
+            limit_traces = list(pending_traces)
+            limit_traces.append(make_trace(
+                "MATCHING", "LIMIT_REST_FILL",
+                f"Limit Order filled immediately via REST. "
+                f"Best Ask <= Limit ${entry_price:.4f}. "
+                f"Avg Entry: ${avg_price:.4f}, Shares: {num_shares:.4f}.",
+                {"limit_price": entry_price, "avg_entry_price": avg_price,
+                 "num_shares": num_shares, "levels": len(walk_levels)},
+            ))
+
+            bo = BinaryOption(
+                bot_name          = bot.bot_name,
+                symbol            = payload.symbol,
+                timeframe         = payload.timeframe,
+                forecast          = payload.forecast,
+                amount            = payload.amount,
+                result            = BOResult.PENDING,
+                avg_price         = avg_price,
+                num_shares        = num_shares,
+                reason            = payload.reason,
+                order_received_at = order_received_at,
+                ask_fetched_at    = ask_fetched_at,
+                settlement_at     = settlement_at,
+                limit_price       = payload.limit_price,
+                tp_price          = payload.tp_price,
+                sl_price          = payload.sl_price,
+                ttl               = payload.ttl,
+                me_order_status   = "FILLED" if has_bracket else None,
+                walk_prices       = {"entry": walk_levels} if walk_levels else None,
+                traces            = limit_traces if limit_traces else None,
+            )
+            db.add(bo)
+            db.commit()
+            db.refresh(bo)
+
+            # Handle bracket (TP/SL) — same logic as MARKET fill path
+            if has_bracket:
+                tp_already_met = payload.tp_price is not None and avg_price >= payload.tp_price
+                sl_already_met = payload.sl_price is not None and avg_price <= payload.sl_price
+
+                if tp_already_met or sl_already_met:
+                    trigger = "TP" if tp_already_met else "SL"
+                    condition_price = payload.tp_price if tp_already_met else payload.sl_price
+                    logger.info(
+                        "LIMIT fill slippage violation: BO #%d %s met at entry: "
+                        "entry=%.6f %s=%s — Auto-Exit",
+                        bo.id, trigger, avg_price, trigger, condition_price,
+                    )
+                    append_trace(bo, make_trace(
+                        "MONITORING", "SLIPPAGE_VIOLATION",
+                        f"Post-fill check: Avg Entry ${avg_price:.4f} violates "
+                        f"{trigger} threshold ${condition_price:.4f}. "
+                        f"Triggering Auto-Exit...",
+                        {"avg_entry_price": avg_price, "trigger": trigger,
+                         "condition_price": condition_price},
+                    ))
+
+                    best_bid, bid_levels = _fetch_best_bid_from_rest(token_id)
+                    if best_bid is not None and bid_levels:
+                        exit_price, exit_filled, exit_walk = (
+                            _simulate_bracket_exit_from_rest(
+                                num_shares, bid_levels,
+                            )
+                        )
+                        if exit_filled > 0:
+                            append_trace(bo, make_trace(
+                                "MONITORING", "AUTO_EXIT_SWEEP",
+                                f"Auto-Exit REST Sweep: Selling "
+                                f"{exit_filled:.4f} against current Bids. "
+                                f"Avg Exit: ${exit_price:.4f}.",
+                                {"exit_price": exit_price,
+                                 "exit_filled": exit_filled,
+                                 "reason": "Slippage Violation"},
+                            ))
+                            _settle_immediate_bracket_exit(
+                                db, bo, bot, trigger,
+                                exit_price, exit_filled, exit_walk,
+                            )
+                        else:
+                            _queue_prefilled_to_me(
+                                bo, token_id, avg_price, num_shares, payload,
+                            )
+                    else:
+                        _queue_prefilled_to_me(
+                            bo, token_id, avg_price, num_shares, payload,
+                        )
+                else:
+                    # Normal bracket: TP > entry / SL < entry → ME monitors
+                    _queue_prefilled_to_me(
+                        bo, token_id, avg_price, num_shares, payload,
+                    )
+
+        else:
+            # ── Phase 1b: Cannot fill now → defer to ME ──────────────────
+            num_shares     = round(payload.amount / entry_price, 8)
+            ask_fetched_at = datetime.now(timezone.utc)
+            price_source   = "limit"
+
+            # token_id needed for ME virtual order
+            token_id = _get_token_id_from_redis(
+                payload.symbol.value, payload.timeframe.value, pm_status,
+            )
+            if token_id is None:
+                bot.balance = round(bot.balance + payload.amount, 8)
+                db.commit()
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Matching engine unavailable for "
+                        f"{payload.symbol.value} {payload.timeframe.value} "
+                        f"— ws_feed_service may not be running"
+                    ),
+                )
+
+            latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
+            logger.info(
+                "BO LIMIT %s %s %s: price=%.4f src=%s latency=%.0fms "
+                "tp=%s sl=%s → deferred to ME",
+                payload.symbol.value, payload.timeframe.value,
+                payload.forecast.value,
+                entry_price, price_source, latency_ms,
+                payload.tp_price, payload.sl_price,
+            )
+
+            bo = BinaryOption(
+                bot_name          = bot.bot_name,
+                symbol            = payload.symbol,
+                timeframe         = payload.timeframe,
+                forecast          = payload.forecast,
+                amount            = payload.amount,
+                result            = BOResult.PENDING,
+                avg_price         = None,
+                num_shares        = None,
+                reason            = payload.reason,
+                order_received_at = order_received_at,
+                ask_fetched_at    = ask_fetched_at,
+                settlement_at     = settlement_at,
+                limit_price       = payload.limit_price,
+                tp_price          = payload.tp_price,
+                sl_price          = payload.sl_price,
+                ttl               = payload.ttl,
+                me_order_status   = "PENDING",
+                traces            = pending_traces if pending_traces else None,
+            )
+            db.add(bo)
+            db.commit()
+            db.refresh(bo)
+
+            # Push LIMIT order to ME via Redis queue
+            try:
+                from services.redis_client import get_sync_redis
+                sr = get_sync_redis()
+                order_payload = json.dumps({
+                    "bo_id": bo.id,
+                    "token_id": token_id,
+                    "side": "BUY",
+                    "price": entry_price,
+                    "expected_price": entry_price,
+                    "quantity": num_shares,
+                    "amount": payload.amount,
+                    "limit_price": payload.limit_price,
+                    "tp_price": payload.tp_price,
+                    "sl_price": payload.sl_price,
+                    "timeframe": payload.timeframe.value,
+                    "ttl": payload.ttl,
+                    "slippage_tolerance": payload.slippage_tolerance,
+                })
+                sr.lpush(QUEUE_ORDERS_NEW, order_payload)
+
+                append_trace(bo, make_trace(
+                    "MATCHING", "LIMIT_ORDER_QUEUED",
+                    f"Limit Order queued to Matching Engine. "
+                    f"Best Ask > Limit ${entry_price:.4f}. "
+                    f"Waiting for ask to reach limit price.",
+                    {"limit_price": entry_price, "quantity": num_shares,
+                     "tp_price": payload.tp_price,
+                     "sl_price": payload.sl_price,
+                     "ttl": payload.ttl},
+                ))
+                db.commit()
+
+                logger.info(
+                    "Virtual order queued for BO #%d: type=LIMIT tp=%s sl=%s",
+                    bo.id, payload.tp_price, payload.sl_price,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to queue virtual order for BO #%d: %s",
+                    bo.id, exc,
+                )
 
     else:
         # ── MARKET order: fill immediately via Polymarket REST API ─────────
@@ -507,6 +761,16 @@ def create_bo(
             avg_price, num_shares, price_source, latency_ms,
             payload.tp_price, payload.sl_price,
         )
+
+        # Add MATCHING traces for REST sweep
+        market_traces = list(pending_traces)
+        market_traces.append(make_trace(
+            "MATCHING", "REST_SWEEP",
+            f"Market Order filled. Avg Entry Price: ${avg_price:.4f}. "
+            f"Total Slippage: {((avg_price - walk_levels[0]['price']) / walk_levels[0]['price'] * 100) if walk_levels else 0:.2f}%.",
+            {"avg_entry_price": avg_price, "num_shares": num_shares,
+             "levels": len(walk_levels)},
+        ))
 
         bo = BinaryOption(
             bot_name          = bot.bot_name,
@@ -529,6 +793,7 @@ def create_bo(
             # MARKET without bracket → None (scheduler settles)
             me_order_status   = "PREFILLED" if has_bracket else None,
             walk_prices       = {"entry": walk_levels} if walk_levels else None,
+            traces            = market_traces if market_traces else None,
         )
         db.add(bo)
         db.commit()
@@ -536,21 +801,27 @@ def create_bo(
 
         # Only queue to ME when MARKET order has TP/SL bracket
         if has_bracket:
-            # Edge case: bracket condition already met at entry
-            # BUY order: TP triggers when bid >= TP, SL triggers when bid <= SL
-            # If TP <= entry or SL >= entry, condition is already met → settle immediately
-            tp_already_met = payload.tp_price is not None and payload.tp_price <= avg_price
-            sl_already_met = payload.sl_price is not None and payload.sl_price >= avg_price
+            # Post-fill edge case (v2 spec Section 3.1): if avg_entry_price
+            # violates the condition due to slippage, trigger Auto-Exit immediately.
+            tp_already_met = payload.tp_price is not None and avg_price >= payload.tp_price
+            sl_already_met = payload.sl_price is not None and avg_price <= payload.sl_price
 
             if tp_already_met or sl_already_met:
-                # Fetch current bid levels from REST to simulate exit
+                # Post-fill check failed — slippage violation (v2 spec Section 4.1)
                 trigger = "TP" if tp_already_met else "SL"
+                condition_price = payload.tp_price if tp_already_met else payload.sl_price
                 logger.info(
-                    "Bracket %s already met at entry for BO #%d: "
-                    "entry=%.6f tp=%s sl=%s — settling immediately via REST",
-                    trigger, bo.id, avg_price,
-                    payload.tp_price, payload.sl_price,
+                    "Slippage violation: BO #%d %s already met at entry: "
+                    "entry=%.6f %s=%s — triggering Auto-Exit via REST",
+                    bo.id, trigger, avg_price, trigger, condition_price,
                 )
+                append_trace(bo, make_trace(
+                    "MONITORING", "SLIPPAGE_VIOLATION",
+                    f"Post-fill check failed: Avg Entry ${avg_price:.4f} violates "
+                    f"{trigger} threshold ${condition_price:.4f}. Triggering Auto-Exit...",
+                    {"avg_entry_price": avg_price, "trigger": trigger,
+                     "condition_price": condition_price},
+                ))
 
                 best_bid, bid_levels = _fetch_best_bid_from_rest(token_id)
                 if best_bid is not None and bid_levels:
@@ -558,6 +829,13 @@ def create_bo(
                         num_shares, bid_levels,
                     )
                     if exit_filled > 0:
+                        append_trace(bo, make_trace(
+                            "MONITORING", "AUTO_EXIT_SWEEP",
+                            f"Auto-Exit REST Sweep: Selling {exit_filled:.4f} against "
+                            f"current Bids. Avg Exit Price: ${exit_price:.4f}.",
+                            {"exit_price": exit_price, "exit_filled": exit_filled,
+                             "reason": "Slippage Violation"},
+                        ))
                         _settle_immediate_bracket_exit(
                             db, bo, bot, trigger,
                             exit_price, exit_filled, exit_walk,
@@ -568,7 +846,6 @@ def create_bo(
                             "— falling back to ME",
                             bo.id,
                         )
-                        # Fallback: queue to ME
                         _queue_prefilled_to_me(
                             bo, token_id, avg_price, num_shares, payload,
                         )
@@ -578,7 +855,6 @@ def create_bo(
                         "— falling back to ME",
                         bo.id,
                     )
-                    # Fallback: queue to ME
                     _queue_prefilled_to_me(
                         bo, token_id, avg_price, num_shares, payload,
                     )
@@ -588,7 +864,20 @@ def create_bo(
                     bo, token_id, avg_price, num_shares, payload,
                 )
 
+    # Persist any traces added after initial commit (e.g. from _queue_prefilled_to_me)
+    db.commit()
     db.refresh(bo)
+
+    # Publish latest trace to Redis for real-time UI
+    if bo.traces:
+        try:
+            from services.redis_client import get_sync_redis
+            from services.order_trace import publish_trace_to_redis
+            sr = get_sync_redis()
+            publish_trace_to_redis(sr, bo.id, bo.traces[-1])
+        except Exception:
+            pass
+
     return bo
 
 

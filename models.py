@@ -122,3 +122,7 @@ class BinaryOption(Base):
 
     # ── Walk prices: per-level fill details ────────────────────────────────────
     walk_prices     = Column(JSON, nullable=True)        # {"entry": [{price, qty, cost}], "exit": [{price, qty, cost}]}
+
+    # ── Order Trace & Market Resolution ──────────────────────────────────────
+    traces          = Column(JSON, nullable=True)        # [{timestamp, stage, action, details, data}]
+    position_closed = Column(Boolean, default=False)     # True when market resolved or bracket fully exited
