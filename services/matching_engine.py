@@ -702,11 +702,28 @@ class ShadowOrderbook:
 
     def run_matching(self) -> None:
         """Re-run matching for all active virtual orders (after book updates).
-        Also expires stale PENDING orders whose TTL has elapsed."""
+        Also expires stale PENDING orders whose TTL has elapsed.
+
+        Skips matching entirely when the book is stale (>120s without
+        updates) to prevent fills against outdated price data.
+        """
         state_events: list[OrderStateChangeEvent] = []
         with self._lock:
             self._expire_pending_orders()
+
+            # Guard: do not match against a stale book — price data may
+            # be outdated (e.g. post-settlement collapse, feed gap).
+            _skip_matching = self.is_stale(max_age_s=120)
+            if _skip_matching:
+                logger.warning(
+                    "run_matching SKIPPED on %s — book stale (last_update=%s)",
+                    self.token_id[:16],
+                    self.last_update.isoformat() if self.last_update else "never",
+                )
+
             for order in self._virtual_orders:
+                if _skip_matching:
+                    break
                 if order.status in (OrderStatus.FILLED, OrderStatus.CANCELED):
                     continue
                 had_liquidity = (
@@ -1336,11 +1353,15 @@ class MatchingEngine:
         raw_ask = event.get("ask")
         if raw_bid or raw_ask:
             changes = []
-            if raw_bid:
-                changes.append({"side": "bid", "price": raw_bid, "size": event.get("bid_size", "0")})
-            if raw_ask:
-                changes.append({"side": "ask", "price": raw_ask, "size": event.get("ask_size", "0")})
-            if any(c["size"] != "0" for c in changes):
+            # Only include a side if its size is present and non-zero.
+            # best_bid_ask events may omit *_size fields — treating
+            # missing size as "0" would incorrectly DELETE the price
+            # level from the shadow book, causing stale-data fills.
+            if raw_bid and event.get("bid_size"):
+                changes.append({"side": "bid", "price": raw_bid, "size": event["bid_size"]})
+            if raw_ask and event.get("ask_size"):
+                changes.append({"side": "ask", "price": raw_ask, "size": event["ask_size"]})
+            if changes:
                 book.apply_changes(changes)
                 # Run matching so pending LIMIT orders can fill when
                 # the best ask drops to or below their limit price.
