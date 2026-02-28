@@ -336,6 +336,7 @@ class ShadowOrderbook:
         self._virtual_orders: list[SimulatedOrder]   = []
         self._bracket_log:    list[BracketFillResult] = []
         self._cleanup_counter: int = 0
+        self._expired = False  # set True when token rotates — blocks new orders & matching
         # ── Centralized state-change tracking ─────────────────────────────
         self._last_reported: dict[str, tuple[Decimal, OrderStatus]] = {}
         self._state_change_callbacks: list[Callable] = []
@@ -427,6 +428,32 @@ class ShadowOrderbook:
         if self.last_update is None:
             return True
         return (datetime.now(timezone.utc) - self.last_update).total_seconds() > max_age_s
+
+    def expire_book(self) -> int:
+        """Mark this book as expired (token rotated).
+
+        Cancels all pending LIMIT orders and prevents new orders from being
+        placed or matched.  Fires state-change callbacks so the API can
+        refund balances.  Returns the number of orders cancelled.
+        """
+        cancelled = 0
+        state_events: list[OrderStateChangeEvent] = []
+        with self._lock:
+            self._expired = True
+            for order in self._virtual_orders:
+                if order.status not in (OrderStatus.FILLED, OrderStatus.CANCELED):
+                    order.status = OrderStatus.CANCELED
+                    cancelled += 1
+            self.bids.clear()
+            self.asks.clear()
+            state_events = self.collect_state_changes()
+        # Fire callbacks outside lock
+        self._fire_state_change_callbacks(state_events)
+        logger.info(
+            "Book EXPIRED: token=%s, cancelled %d pending order(s)",
+            self.token_id[:16], cancelled,
+        )
+        return cancelled
 
     # ── Virtual order placement ──────────────────────────────────────────────
 
@@ -711,9 +738,8 @@ class ShadowOrderbook:
         with self._lock:
             self._expire_pending_orders()
 
-            # Guard: do not match against a stale book — price data may
-            # be outdated (e.g. post-settlement collapse, feed gap).
-            _skip_matching = self.is_stale(max_age_s=120)
+            # Guard: do not match against expired or stale books.
+            _skip_matching = self._expired or self.is_stale(max_age_s=120)
             if _skip_matching:
                 logger.warning(
                     "run_matching SKIPPED on %s — book stale (last_update=%s)",
@@ -1281,6 +1307,26 @@ class MatchingEngine:
         with self._lock:
             return self._books.get(token_id)
 
+    def invalidate_books(self, token_ids: list[str]) -> int:
+        """Expire books for rotated token_ids.
+
+        Cancels all pending orders and prevents new orders from matching
+        against stale book data from the previous candle session.
+
+        Returns total number of cancelled orders.
+        """
+        total_cancelled = 0
+        for tid in token_ids:
+            book = self.get_book(tid)
+            if book is not None:
+                total_cancelled += book.expire_book()
+        if total_cancelled:
+            logger.info(
+                "invalidate_books: expired %d book(s), cancelled %d order(s)",
+                len(token_ids), total_cancelled,
+            )
+        return total_cancelled
+
     # ── Event dispatch ───────────────────────────────────────────────────────
 
     def dispatch_event(self, event: dict) -> None:
@@ -1489,6 +1535,10 @@ class MatchingEngine:
                           Matching stops when cumulative cost reaches this limit.
         """
         book = self.get_or_create_book(token_id)
+        if book._expired:
+            raise ValueError(
+                f"Cannot place order on expired book (token rotated): {token_id[:16]}"
+            )
         return book.place_virtual_order(
             side, price, quantity, tp_price, sl_price, timeframe, ttl_seconds,
             on_bracket_exit, order_type, max_slippage, max_cost,
