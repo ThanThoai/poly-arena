@@ -21,6 +21,8 @@ BASE = os.environ.get("API_URL", "http://localhost:8099/poly-arena")
 NUM_BOTS = int(os.environ.get("NUM_BOTS", "5"))
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))  # 5 phút
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
+TEST_USER = os.environ.get("TEST_USER", "test-trader")
+TEST_PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
 
 SYMBOLS = ["BTC"]
 TIMEFRAMES = ["M5"]
@@ -169,10 +171,44 @@ def wait_for_api() -> bool:
     return False
 
 
-def create_bot(bot_name: str) -> str:
-    """Tạo bot, trả về api_key."""
+def register_or_login_user(username: str, password: str) -> str:
+    """Register a new user or login if already exists. Returns JWT token."""
+    # Try register first
+    r = requests.post(
+        f"{BASE}/auth/register",
+        json={"username": username, "password": password},
+        timeout=10,
+    )
+    if r.status_code == 201:
+        token = r.json()["access_token"]
+        log.info("User registered: %s", username)
+        return token
+
+    if r.status_code == 409:
+        # User already exists — login instead
+        r = requests.post(
+            f"{BASE}/auth/login",
+            json={"username": username, "password": password},
+            timeout=10,
+        )
+        r.raise_for_status()
+        token = r.json()["access_token"]
+        log.info("User logged in: %s", username)
+        return token
+
+    r.raise_for_status()
+    return ""  # unreachable
+
+
+def create_bot(bot_name: str, jwt_token: str) -> str:
+    """Tạo bot (authenticated via JWT), trả về api_key."""
     log.info("Creating bot '%s' ...", bot_name)
-    r = requests.post(f"{BASE}/bots/", json={"bot_name": bot_name}, timeout=10)
+    r = requests.post(
+        f"{BASE}/bots/",
+        json={"bot_name": bot_name},
+        headers={"Authorization": f"Bearer {jwt_token}"},
+        timeout=10,
+    )
     r.raise_for_status()
     data = r.json()
     api_key = data["api_key"]
@@ -276,14 +312,22 @@ def main():
     if not wait_for_api():
         return
 
+    # Step 1: Register or login test user
+    try:
+        jwt_token = register_or_login_user(TEST_USER, TEST_PASSWORD)
+    except Exception as e:
+        log.error("Failed to register/login user '%s': %s", TEST_USER, e)
+        return
+
     threads = []
 
+    # Step 2: Create bots under the authenticated user
     for i in range(NUM_BOTS):
         profile = BOT_PROFILES[i % len(BOT_PROFILES)]
         bot_name = f"bot-{profile['suffix']}-{random.randint(1000, 9999)}"
 
         try:
-            api_key = create_bot(bot_name)
+            api_key = create_bot(bot_name, jwt_token)
         except Exception as e:
             log.error("Failed to create bot '%s': %s", bot_name, e)
             continue

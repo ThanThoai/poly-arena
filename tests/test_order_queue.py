@@ -17,7 +17,8 @@ from ws_feed_service.config import QUEUE_ORDERS_NEW
 
 def _mock_fill_market_from_rest(symbol, timeframe, pm_status, amount, slippage_tolerance):
     """Mock REST fill returning predictable values."""
-    return (0.52, round(amount / 0.52, 8), "fake-token-btc-m5-up")
+    walk_levels = [{"price": 0.52, "qty": round(amount / 0.52, 8), "cost": amount}]
+    return (0.52, round(amount / 0.52, 8), "fake-token-btc-m5-up", walk_levels)
 
 
 # ── create_bo → LPUSH ────────────────────────────────────────────────────────

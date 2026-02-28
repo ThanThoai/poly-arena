@@ -136,6 +136,8 @@ class SimulatedOrder:
     _entry_cost: Decimal        = field(default_factory=lambda: Decimal("0"))
     # Slippage reference price — locked in at first match when book has data
     _slippage_ref_price: Optional[Decimal] = field(default=None, compare=False, repr=False)
+    # Per-level fill details: list of (price, qty) tuples accumulated during matching
+    _fill_levels: list          = field(default_factory=list, compare=False, repr=False)
     # cumulative cost = Σ(fill_qty × fill_price) — avg_entry_price = _entry_cost / filled
 
     # ── Bracket Order fields (Section 2.1) ───────────────────────────────────
@@ -282,6 +284,7 @@ class OrderStateChangeEvent:
     avg_entry_price: Optional[Decimal]
     status: OrderStatus
     cancel_reason: Optional[str] = None
+    fill_levels: list = field(default_factory=list)  # [(price, qty)] new fills since last report
 
 
 @dataclass
@@ -295,6 +298,7 @@ class BracketFillResult:
     qty_exited:   Decimal        # shares actually filled (slippage)
     avg_exit_price: Decimal      # weighted avg across bid levels consumed
     levels_consumed: int         # how many bid price levels were eaten
+    fill_levels:  list = field(default_factory=list)  # [(price, qty)] per-level exit fills
     timestamp:    datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -650,12 +654,16 @@ class ShadowOrderbook:
 
             # FILL event: filled increased
             if order.filled > prev_filled:
+                # Extract only new fill levels since last report
+                new_fill_levels = list(order._fill_levels)
+                order._fill_levels = []  # reset for next report
                 events.append(OrderStateChangeEvent(
                     order_id=order.order_id,
                     event_type="FILL",
                     filled=order.filled,
                     avg_entry_price=order.avg_entry_price,
                     status=order.status,
+                    fill_levels=new_fill_levels,
                 ))
 
             # CANCEL event: status transitioned to CANCELED
@@ -920,6 +928,7 @@ class ShadowOrderbook:
 
                 order.filled          += match_qty
                 order._entry_cost     += match_qty * ask_price  # track weighted entry cost
+                order._fill_levels.append((ask_price, match_qty))
                 self.asks[ask_price]  -= match_qty
                 if self.asks[ask_price] < _DUST_THRESHOLD:
                     del self.asks[ask_price]
@@ -962,6 +971,7 @@ class ShadowOrderbook:
                 match_qty = min(order.remaining_qty, bid_size)
                 order.filled          += match_qty
                 order._entry_cost     += match_qty * bid_price  # track weighted entry cost
+                order._fill_levels.append((bid_price, match_qty))
                 self.bids[bid_price]  -= match_qty
                 if self.bids[bid_price] < _DUST_THRESHOLD:
                     del self.bids[bid_price]
@@ -1082,6 +1092,7 @@ class ShadowOrderbook:
         qty_exited   = Decimal("0")
         total_value  = Decimal("0")
         levels_hit   = 0
+        exit_levels: list = []
 
         # Walk bids descending — consume as much as needed (with slippage)
         for bid_price in sorted(self.bids.keys(), reverse=True):
@@ -1092,6 +1103,7 @@ class ShadowOrderbook:
             fill_qty = min(qty_to_close - qty_exited, bid_size)
             qty_exited          += fill_qty
             total_value         += fill_qty * bid_price
+            exit_levels.append((bid_price, fill_qty))
             self.bids[bid_price] -= fill_qty
             if self.bids[bid_price] < _DUST_THRESHOLD:
                 del self.bids[bid_price]
@@ -1134,6 +1146,7 @@ class ShadowOrderbook:
             qty_exited      = qty_exited,
             avg_exit_price  = avg_exit,
             levels_consumed = levels_hit,
+            fill_levels     = exit_levels,
         )
 
         logger.info(

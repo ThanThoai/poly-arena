@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import BinaryOption, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast
+from models import BinaryOption, BalanceHistory, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast
 from services.settlement import calc_settlement_time
 from services.polymarket import PolymarketClient
 from ws_feed_service.config import (
@@ -134,13 +134,157 @@ def _get_token_id_from_redis(
         return None
 
 
+def _fetch_best_bid_from_rest(token_id: str) -> Tuple[Optional[float], list]:
+    """
+    Fetch the current best_bid and bid levels from Polymarket REST API.
+    Returns (best_bid, bid_levels) where bid_levels is [(price, size), ...].
+    Returns (None, []) on failure.
+    """
+    try:
+        resp = httpx.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        book = resp.json()
+    except Exception as e:
+        logger.warning("Failed to fetch bid levels from REST: %s", e)
+        return None, []
+
+    bids = sorted(
+        [
+            (Decimal(str(level["price"])), Decimal(str(level["size"])))
+            for level in book.get("bids", [])
+            if float(level["size"]) > 0
+        ],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    if not bids:
+        return None, []
+
+    return float(bids[0][0]), bids
+
+
+def _simulate_bracket_exit_from_rest(
+    num_shares: float, bid_levels: list,
+) -> Tuple[float, float, list]:
+    """
+    Simulate selling num_shares against REST bid levels (walk bids descending).
+    Returns (avg_exit_price, qty_exited, exit_walk_levels).
+    """
+    qty_remaining = Decimal(str(num_shares))
+    total_value = Decimal("0")
+    qty_exited = Decimal("0")
+    exit_walk: list = []
+
+    for bid_price, bid_size in bid_levels:
+        if qty_remaining <= 0:
+            break
+        fill_qty = min(qty_remaining, bid_size)
+        total_value += fill_qty * bid_price
+        qty_exited += fill_qty
+        qty_remaining -= fill_qty
+        exit_walk.append({
+            "price": float(bid_price),
+            "qty": float(fill_qty),
+            "cost": round(float(fill_qty * bid_price), 8),
+        })
+
+    avg_exit = float(total_value / qty_exited) if qty_exited > 0 else 0.0
+    return avg_exit, float(qty_exited), exit_walk
+
+
+def _settle_immediate_bracket_exit(
+    db: Session, bo: "BinaryOption", bot: "Bot",
+    trigger: str, exit_price: float, exit_filled: float,
+    exit_walk: list,
+) -> None:
+    """
+    Immediately settle a bracket exit when TP/SL condition is already met at entry.
+    Updates the BO record and bot balance in a single DB commit.
+    """
+    now = datetime.now(timezone.utc)
+
+    bo.exit_trigger = trigger
+    bo.exit_price = exit_price
+    bo.exit_filled = exit_filled
+    bo.exit_at = now
+    bo.me_order_status = "FILLED"
+
+    # Persist exit walk prices
+    wp = bo.walk_prices or {}
+    wp["exit"] = exit_walk
+    bo.walk_prices = wp
+
+    # Calculate profit and settle
+    profit = round((exit_price - bo.avg_price) * exit_filled, 8)
+    result = BOResult.WIN if profit >= 0 else BOResult.LOSS
+
+    bo.result = result
+    bo.profit = profit
+
+    payout = round(bo.amount + profit, 8)
+    bot.balance = round(bot.balance + payout, 8)
+    db.add(
+        BalanceHistory(
+            bot_name=bo.bot_name,
+            balance=bot.balance,
+            trade_id=bo.id,
+        )
+    )
+
+    db.commit()
+    logger.info(
+        "Immediate bracket exit settled: BO #%d trigger=%s "
+        "entry=%.6f exit=%.6f shares=%.4f → %s profit=%.8f balance=%.2f",
+        bo.id, trigger, bo.avg_price, exit_price, exit_filled,
+        result.value, profit, bot.balance,
+    )
+
+
+def _queue_prefilled_to_me(
+    bo: "BinaryOption", token_id: str,
+    avg_price: float, num_shares: float,
+    payload: "BOCreate",
+) -> None:
+    """Queue a pre-filled MARKET bracket order to the matching engine via Redis."""
+    try:
+        from services.redis_client import get_sync_redis
+        sr = get_sync_redis()
+        order_payload = json.dumps({
+            "bo_id": bo.id,
+            "token_id": token_id,
+            "side": "BUY",
+            "prefilled": True,
+            "prefilled_avg_price": avg_price,
+            "prefilled_filled": num_shares,
+            "tp_price": payload.tp_price,
+            "sl_price": payload.sl_price,
+            "timeframe": payload.timeframe.value,
+        })
+        sr.lpush(QUEUE_ORDERS_NEW, order_payload)
+        logger.info(
+            "Prefilled bracket order queued for BO #%d: "
+            "avg_price=%.6f shares=%.4f tp=%s sl=%s",
+            bo.id, avg_price, num_shares,
+            payload.tp_price, payload.sl_price,
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to queue prefilled bracket order for BO #%d: %s",
+            bo.id, exc,
+        )
+
+
 _DEFAULT_SLIPPAGE_TOLERANCE = 0.10  # 10%
 
 
 def _fill_market_from_rest(
     symbol: str, timeframe: str, pm_status: str,
     amount: float, slippage_tolerance: Optional[float],
-) -> Tuple[float, float, str]:
+) -> Tuple[float, float, str, list]:
     """
     Fetch full orderbook from Polymarket REST, simulate MARKET BUY fill.
     Returns (avg_price, num_shares, token_id).
@@ -184,6 +328,7 @@ def _fill_market_from_rest(
     remaining_budget = Decimal(str(amount))
     total_cost = Decimal("0")
     total_shares = Decimal("0")
+    walk_levels: list = []
 
     for ask_price, ask_size in asks:
         if ask_price > slippage_limit:
@@ -197,6 +342,11 @@ def _fill_market_from_rest(
         total_cost += fill_cost
         total_shares += fill_shares
         remaining_budget -= fill_cost
+        walk_levels.append({
+            "price": float(ask_price),
+            "qty": float(fill_shares),
+            "cost": round(float(fill_cost), 8),
+        })
 
     if total_shares <= 0:
         raise HTTPException(status_code=502, detail="No liquidity available within slippage tolerance")
@@ -211,7 +361,7 @@ def _fill_market_from_rest(
         len(asks), float(slippage_limit),
     )
 
-    return avg_price, num_shares, token_id
+    return avg_price, num_shares, token_id, walk_levels
 
 
 @router.post("/", response_model=BOResponse, status_code=201)
@@ -342,7 +492,7 @@ def create_bo(
 
     else:
         # ── MARKET order: fill immediately via Polymarket REST API ─────────
-        avg_price, num_shares, token_id = _fill_market_from_rest(
+        avg_price, num_shares, token_id, walk_levels = _fill_market_from_rest(
             payload.symbol.value, payload.timeframe.value, pm_status,
             payload.amount, payload.slippage_tolerance,
         )
@@ -378,6 +528,7 @@ def create_bo(
             # MARKET+bracket → "PREFILLED" (ME monitors TP/SL only)
             # MARKET without bracket → None (scheduler settles)
             me_order_status   = "PREFILLED" if has_bracket else None,
+            walk_prices       = {"entry": walk_levels} if walk_levels else None,
         )
         db.add(bo)
         db.commit()
@@ -385,31 +536,56 @@ def create_bo(
 
         # Only queue to ME when MARKET order has TP/SL bracket
         if has_bracket:
-            try:
-                from services.redis_client import get_sync_redis
-                sr = get_sync_redis()
-                order_payload = json.dumps({
-                    "bo_id": bo.id,
-                    "token_id": token_id,
-                    "side": "BUY",
-                    "prefilled": True,
-                    "prefilled_avg_price": avg_price,
-                    "prefilled_filled": num_shares,
-                    "tp_price": payload.tp_price,
-                    "sl_price": payload.sl_price,
-                    "timeframe": payload.timeframe.value,
-                })
-                sr.lpush(QUEUE_ORDERS_NEW, order_payload)
+            # Edge case: bracket condition already met at entry
+            # BUY order: TP triggers when bid >= TP, SL triggers when bid <= SL
+            # If TP <= entry or SL >= entry, condition is already met → settle immediately
+            tp_already_met = payload.tp_price is not None and payload.tp_price <= avg_price
+            sl_already_met = payload.sl_price is not None and payload.sl_price >= avg_price
+
+            if tp_already_met or sl_already_met:
+                # Fetch current bid levels from REST to simulate exit
+                trigger = "TP" if tp_already_met else "SL"
                 logger.info(
-                    "Prefilled bracket order queued for BO #%d: "
-                    "avg_price=%.6f shares=%.4f tp=%s sl=%s",
-                    bo.id, avg_price, num_shares,
+                    "Bracket %s already met at entry for BO #%d: "
+                    "entry=%.6f tp=%s sl=%s — settling immediately via REST",
+                    trigger, bo.id, avg_price,
                     payload.tp_price, payload.sl_price,
                 )
-            except Exception as exc:
-                logger.error(
-                    "Failed to queue prefilled bracket order for BO #%d: %s",
-                    bo.id, exc,
+
+                best_bid, bid_levels = _fetch_best_bid_from_rest(token_id)
+                if best_bid is not None and bid_levels:
+                    exit_price, exit_filled, exit_walk = _simulate_bracket_exit_from_rest(
+                        num_shares, bid_levels,
+                    )
+                    if exit_filled > 0:
+                        _settle_immediate_bracket_exit(
+                            db, bo, bot, trigger,
+                            exit_price, exit_filled, exit_walk,
+                        )
+                    else:
+                        logger.warning(
+                            "No bid liquidity for immediate bracket exit BO #%d "
+                            "— falling back to ME",
+                            bo.id,
+                        )
+                        # Fallback: queue to ME
+                        _queue_prefilled_to_me(
+                            bo, token_id, avg_price, num_shares, payload,
+                        )
+                else:
+                    logger.warning(
+                        "Failed to fetch bids for immediate bracket exit BO #%d "
+                        "— falling back to ME",
+                        bo.id,
+                    )
+                    # Fallback: queue to ME
+                    _queue_prefilled_to_me(
+                        bo, token_id, avg_price, num_shares, payload,
+                    )
+            else:
+                # Normal case: TP > entry and SL < entry → queue to ME
+                _queue_prefilled_to_me(
+                    bo, token_id, avg_price, num_shares, payload,
                 )
 
     db.refresh(bo)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -8,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from database import SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
-from routers import binary_options, bots, dashboard
+from routers import auth, binary_options, bots, dashboard
 from services.redis_client import get_async_redis, close_async_redis
 from ws_feed_service.config import (
     STREAM_BRACKET_EXITS,
@@ -66,6 +67,17 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                 if order_id and not bo.me_order_id:
                     bo.me_order_id = order_id
                 bo.me_order_status = "FILLED"
+
+                # Persist exit walk prices
+                wp_str = data.get("walk_prices", "")
+                if wp_str:
+                    try:
+                        exit_levels = json.loads(wp_str)
+                        wp = bo.walk_prices or {}
+                        wp["exit"] = wp.get("exit", []) + exit_levels
+                        bo.walk_prices = wp
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
                 num_shares = bo.num_shares or 0.0
                 is_full_exit = exit_filled >= num_shares and num_shares > 0
@@ -239,6 +251,18 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     bo.me_order_status = status
                 if order_id and not bo.me_order_id:
                     bo.me_order_id = order_id
+
+                # Persist entry walk prices (append for partial fills)
+                wp_str = data.get("walk_prices", "")
+                if wp_str:
+                    try:
+                        new_levels = json.loads(wp_str)
+                        wp = bo.walk_prices or {}
+                        wp["entry"] = wp.get("entry", []) + new_levels
+                        bo.walk_prices = wp
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
                 db.commit()
                 log.info(
                     "Fill update: BO #%d filled=%.4f avg=%.6f status=%s",
@@ -526,6 +550,7 @@ app.add_middleware(
 )
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
 
+app.include_router(auth.router, prefix="/poly-arena/auth", tags=["Auth"])
 app.include_router(
     binary_options.router, prefix="/poly-arena/binary-options", tags=["Binary Options"]
 )
