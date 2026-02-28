@@ -28,12 +28,13 @@ from typing import Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from config.timing import WS_PING_INTERVAL_S, WS_CLOSE_TIMEOUT_S
 from services.matching_engine import get_engine
 
 logger = logging.getLogger(__name__)
 
 _WS_URI = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-_PING_INTERVAL = 10  # seconds
+_PING_INTERVAL = WS_PING_INTERVAL_S
 _RECONNECT_BASE = 2  # seconds
 _RECONNECT_MAX = 60  # seconds
 
@@ -154,7 +155,7 @@ class PolymarketFeed:
         async with websockets.connect(
             _WS_URI,
             ping_interval=None,  # we handle pings manually
-            close_timeout=5,
+            close_timeout=WS_CLOSE_TIMEOUT_S,
         ) as ws:
             self._ws = ws
             logger.info("Connected to Polymarket Market Channel")

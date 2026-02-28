@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, ForeignKey, Integer, JSON, Numeric, String
+from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, ForeignKey, Integer, JSON, Numeric, String, UniqueConstraint
 
 from database import Base
 
@@ -126,3 +126,36 @@ class BinaryOption(Base):
     # ── Order Trace & Market Resolution ──────────────────────────────────────
     traces          = Column(JSON, nullable=True)        # [{timestamp, stage, action, details, data}]
     position_closed = Column(Boolean, default=False)     # True when market resolved or bracket fully exited
+
+
+# ── Achievement System ─────────────────────────────────────────────────────
+
+class AchievementTier(str, enum.Enum):
+    BRONZE   = "BRONZE"
+    SILVER   = "SILVER"
+    GOLD     = "GOLD"
+    PLATINUM = "PLATINUM"
+
+
+class AchievementDefinition(Base):
+    __tablename__ = "achievement_definitions"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    slug        = Column(String(100), unique=True, nullable=False, index=True)
+    name        = Column(String(200), nullable=False)
+    description = Column(String(500), nullable=False)
+    tier        = Column(String(20), nullable=False)
+    category    = Column(String(100), nullable=False)
+
+
+class BotAchievement(Base):
+    __tablename__ = "bot_achievements"
+    __table_args__ = (
+        UniqueConstraint("bot_id", "achievement_id", name="uq_bot_achievement"),
+    )
+
+    id             = Column(Integer, primary_key=True, index=True)
+    bot_id         = Column(Integer, ForeignKey("bots.id"), nullable=False, index=True)
+    achievement_id = Column(Integer, ForeignKey("achievement_definitions.id"), nullable=False)
+    earned_at      = Column(DateTime(timezone=True), default=_now)
+    metadata_      = Column("metadata", JSON, nullable=True)

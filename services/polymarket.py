@@ -17,6 +17,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 import httpx
 
+from config.timing import HTTP_TIMEOUT, SLUG_CACHE_TTL_S, TF_SECONDS
+
 _GAMMA_URL = "https://gamma-api.polymarket.com/events"
 _CLOB_URL = "https://clob.polymarket.com/book"
 
@@ -31,9 +33,9 @@ _TF_NORMALIZE: dict[str, str] = {
 }
 
 _TF_SECONDS: dict[str, int] = {
-    "5m": 5 * 60,
-    "15m": 15 * 60,
-    "1h": 60 * 60,
+    "5m": TF_SECONDS["M5"],
+    "15m": TF_SECONDS["M15"],
+    "1h": TF_SECONDS["H1"],
 }
 
 # Polymarket token index: 0 = UP, 1 = DOWN
@@ -80,19 +82,27 @@ def get_current_time_et():
     return f"{month}-{day}-{hour}{ampm}-et"
 
 
+# Slug → token_ids cache (slug is stable for entire candle duration)
+# Shared across all PolymarketClient instances within the same process.
+_slug_cache: dict[str, list[str]] = {}
+_slug_cache_ts: dict[str, float] = {}   # slug → timestamp when cached
+_SLUG_CACHE_TTL = SLUG_CACHE_TTL_S
+
+
 class PolymarketClient:
-    def __init__(self, timeout: float = 10.0):
+    def __init__(self, timeout: float = HTTP_TIMEOUT):
         self._http = httpx.Client(timeout=timeout)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _next_settlement(self, tf_norm: str) -> int:
-        """Return the settlement timestamp of the current candle.
+        """Return the candle-open timestamp for the current candle.
 
-        Examples (period = 5 min):
-            22:58 → 23:00   (2 min remaining in current candle)
-            22:55 → 23:00   (exactly on boundary → end of THIS period)
-            23:00 → 23:05   (new candle just started)
+        Polymarket slug uses candle OPEN timestamp (not close).
+        Examples (period = 5 min = 300s):
+            22:58 → 22:55   (in candle that opened at :55)
+            23:00 → 23:00   (new candle just opened)
+            23:00:09 → 23:00 (still in candle that opened at :00)
         """
         period = _TF_SECONDS[tf_norm]
         now = int(time.time())
@@ -123,12 +133,24 @@ class PolymarketClient:
         return f"{sym}-up-or-down-{month}-{day}-{hour}{ampm}-et"
 
     def _token_ids(self, slug: str) -> list[str]:
+        # Check slug cache first (stable for entire candle)
+        now = time.time()
+        if slug in _slug_cache:
+            age = now - _slug_cache_ts.get(slug, 0)
+            if age < _SLUG_CACHE_TTL:
+                return _slug_cache[slug]
+
         resp = self._http.get(_GAMMA_URL, params={"slug": slug})
         resp.raise_for_status()
         data = resp.json()
         raw = data[0]["markets"][0]["clobTokenIds"]
         ids = raw[2:-2].replace('"', "").split(",")
-        return [i.strip() for i in ids]
+        ids = [i.strip() for i in ids]
+
+        # Cache by slug
+        _slug_cache[slug] = ids
+        _slug_cache_ts[slug] = now
+        return ids
 
     def _best_prices(self, token_id: str) -> tuple[float, float]:
         """Return (min_ask, max_bid) for the given token."""

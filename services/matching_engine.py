@@ -44,21 +44,19 @@ from decimal import Decimal
 from enum import Enum
 from typing import Callable, Optional
 
+from config.timing import (
+    ME_DUST_THRESHOLD as _DUST_THRESHOLD,
+    ME_DEFAULT_SLIPPAGE as _DEFAULT_SLIPPAGE,
+    ME_BOOK_STALE_MAX_S,
+    ME_BOOK_STALE_DEFAULT_S,
+    ME_CLEANUP_INTERVAL,
+    TF_SECONDS as _TF_SECONDS,
+)
+
 logger = logging.getLogger(__name__)
-
-# ── Constants ────────────────────────────────────────────────────────────────
-
-_DUST_THRESHOLD = Decimal("0.000001")  # residual size below this is treated as zero
-_DEFAULT_SLIPPAGE = Decimal("0.10")    # 10% max slippage for MARKET orders
 
 
 # ── Timeframe helpers ─────────────────────────────────────────────────────────
-
-_TF_SECONDS: dict[str, int] = {
-    "M5":  300,
-    "M15": 900,
-    "H1":  3600,
-}
 
 
 def candle_expire_at(timeframe: str, now: Optional[datetime] = None) -> datetime:
@@ -424,7 +422,7 @@ class ShadowOrderbook:
                 threshold = best * (1 - Decimal(str(within_pct)))
                 return sum(sz for p, sz in book.items() if p >= threshold)
 
-    def is_stale(self, max_age_s: float = 30.0) -> bool:
+    def is_stale(self, max_age_s: float = ME_BOOK_STALE_DEFAULT_S) -> bool:
         if self.last_update is None:
             return True
         return (datetime.now(timezone.utc) - self.last_update).total_seconds() > max_age_s
@@ -725,7 +723,7 @@ class ShadowOrderbook:
     # ── Matching algorithm (Section 4) ───────────────────────────────────────
 
     _BRACKET_LOG_MAX = 500
-    _CLEANUP_INTERVAL = 50   # run cleanup every N calls to run_matching
+    _CLEANUP_INTERVAL = ME_CLEANUP_INTERVAL
 
     def run_matching(self) -> None:
         """Re-run matching for all active virtual orders (after book updates).
@@ -739,7 +737,7 @@ class ShadowOrderbook:
             self._expire_pending_orders()
 
             # Guard: do not match against expired or stale books.
-            _skip_matching = self._expired or self.is_stale(max_age_s=120)
+            _skip_matching = self._expired or self.is_stale(max_age_s=ME_BOOK_STALE_MAX_S)
             if _skip_matching:
                 logger.warning(
                     "run_matching SKIPPED on %s — book stale (last_update=%s)",
@@ -1295,6 +1293,8 @@ class MatchingEngine:
         self._lock     = threading.Lock()
         self._running  = True
         self._on_market_resolved: Optional[Callable] = None  # callback(asset_id, orders)
+        # Set of token_ids known to be current (updated by register_valid_tokens / invalidate_books)
+        self._valid_token_ids: set[str] = set()
 
     def get_or_create_book(self, token_id: str) -> ShadowOrderbook:
         with self._lock:
@@ -1307,15 +1307,43 @@ class MatchingEngine:
         with self._lock:
             return self._books.get(token_id)
 
+    def register_valid_tokens(self, token_ids: list[str]) -> None:
+        """Replace the set of valid (current-session) token_ids.
+
+        Called at startup and on every token rotation so that
+        place_virtual_order() can reject orders targeting stale tokens.
+        """
+        with self._lock:
+            self._valid_token_ids = set(token_ids)
+        logger.info(
+            "Registered %d valid token(s)", len(token_ids),
+        )
+
+    def add_valid_token(self, token_id: str) -> None:
+        """Add a single token_id to the valid set (e.g. from API REST lookup)."""
+        with self._lock:
+            self._valid_token_ids.add(token_id)
+
+    def is_valid_token(self, token_id: str) -> bool:
+        """Check if a token_id belongs to the current candle session."""
+        with self._lock:
+            # If no tokens registered yet (startup), allow all
+            if not self._valid_token_ids:
+                return True
+            return token_id in self._valid_token_ids
+
     def invalidate_books(self, token_ids: list[str]) -> int:
         """Expire books for rotated token_ids.
 
         Cancels all pending orders and prevents new orders from matching
         against stale book data from the previous candle session.
+        Also removes them from the valid token set.
 
         Returns total number of cancelled orders.
         """
         total_cancelled = 0
+        with self._lock:
+            self._valid_token_ids -= set(token_ids)
         for tid in token_ids:
             book = self.get_book(tid)
             if book is not None:
@@ -1534,6 +1562,12 @@ class MatchingEngine:
         max_cost:         Cost cap for MARKET BUY orders (user's dollar amount).
                           Matching stops when cumulative cost reaches this limit.
         """
+        # Validate token_id is still current (prevents filling against
+        # stale books from previous candle sessions)
+        if not self.is_valid_token(token_id):
+            raise ValueError(
+                f"Stale token_id (not in current session): {token_id[:16]}"
+            )
         book = self.get_or_create_book(token_id)
         if book._expired:
             raise ValueError(
@@ -1558,7 +1592,15 @@ class MatchingEngine:
         Convenience wrapper: get/create book and register a pre-filled bracket order.
         Used for MARKET orders filled via REST that need TP/SL monitoring.
         """
+        if not self.is_valid_token(token_id):
+            raise ValueError(
+                f"Stale token_id (not in current session): {token_id[:16]}"
+            )
         book = self.get_or_create_book(token_id)
+        if book._expired:
+            raise ValueError(
+                f"Cannot place order on expired book (token rotated): {token_id[:16]}"
+            )
         return book.place_prefilled_bracket_order(
             side, avg_entry_price, filled, tp_price, sl_price, on_bracket_exit,
         )

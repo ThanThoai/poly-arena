@@ -14,7 +14,9 @@ Uses event-driven centralized monitoring:
 import asyncio
 import json
 import logging
+import os
 import threading
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -28,6 +30,56 @@ from ws_feed_service.config import QUEUE_ORDERS_NEW, BRPOP_TIMEOUT_S
 from ws_feed_service.redis_writer import RedisWriter
 
 logger = logging.getLogger(__name__)
+
+# ── Limit order fill file logger ─────────────────────────────────────────
+
+_FILL_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+_FILL_LOG_PATH = os.path.join(_FILL_LOG_DIR, "limit_fills.log")
+
+_fill_logger = logging.getLogger("limit_fill_log")
+_fill_logger.setLevel(logging.INFO)
+_fill_logger.propagate = False
+
+try:
+    os.makedirs(_FILL_LOG_DIR, exist_ok=True)
+    _fill_fh = logging.FileHandler(_FILL_LOG_PATH, encoding="utf-8")
+    _fill_fh.setFormatter(logging.Formatter("%(message)s"))
+    _fill_logger.addHandler(_fill_fh)
+except Exception as _exc:
+    logger.warning("Cannot create limit fill log at %s: %s", _FILL_LOG_PATH, _exc)
+
+
+def _log_limit_fill(
+    bo_id: int,
+    order_id: str,
+    filled: float,
+    avg_entry_price: float,
+    status: str,
+    fill_levels: list,
+    bids_snapshot: list,
+    asks_snapshot: list,
+    token_id: str = "",
+) -> None:
+    """Write a structured JSON line to the limit fill log file."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "bo_id": bo_id,
+        "order_id": order_id,
+        "filled": filled,
+        "avg_entry_price": avg_entry_price,
+        "status": status,
+        "fill_levels": [
+            {"price": float(p), "qty": float(q)} for p, q in fill_levels
+        ] if fill_levels else [],
+        "orderbook_bids": [
+            {"price": float(p), "size": float(s)} for p, s in bids_snapshot
+        ],
+        "orderbook_asks": [
+            {"price": float(p), "size": float(s)} for p, s in asks_snapshot
+        ],
+        "token_id": token_id,
+    }
+    _fill_logger.info(json.dumps(record, ensure_ascii=False))
 
 
 def _serialize_fill_levels(levels: list) -> str:
@@ -60,6 +112,7 @@ class OrderConsumer:
         engine: MatchingEngine,
         redis_writer: RedisWriter,
         loop: asyncio.AbstractEventLoop,
+        registry=None,
     ) -> None:
         self._r = sync_redis
         self._engine = engine
@@ -69,6 +122,7 @@ class OrderConsumer:
         self._thread: Optional[threading.Thread] = None
         # ── Centralized monitoring state ──────────────────────────────────
         self._order_to_bo: dict[str, int] = {}       # order_id → bo_id
+        self._order_to_token: dict[str, str] = {}    # order_id → token_id
         self._registered_books: set[str] = set()      # token_ids with callback
 
     def start(self) -> None:
@@ -113,6 +167,25 @@ class OrderConsumer:
         bo_id = data.get("bo_id")
         token_id = data.get("token_id")
         is_prefilled = data.get("prefilled", False)
+
+        if token_id is None:
+            logger.warning(
+                "OrderConsumer: no token_id in payload (bo_id=%s) — rejecting",
+                bo_id,
+            )
+            if bo_id is not None:
+                self._publish_async(
+                    self._writer.publish_order_cancel(
+                        bo_id=bo_id, order_id="",
+                        reason="NO_TOKEN_ID",
+                        filled=0.0, avg_entry_price=0.0,
+                    )
+                )
+            return
+
+        # Token_id comes from API's Polymarket REST lookup — ensure the
+        # matching engine accepts it even if TokenRegistry hasn't refreshed yet.
+        self._engine.add_valid_token(token_id)
 
         tp_price = data.get("tp_price")
         sl_price = data.get("sl_price")
@@ -159,6 +232,7 @@ class OrderConsumer:
             # Register for centralized monitoring (bracket exits)
             if bo_id is not None:
                 self._order_to_bo[order.order_id] = bo_id
+                self._order_to_token[order.order_id] = token_id
                 book = self._engine.get_book(token_id)
                 if book is not None:
                     # Seed as FILLED so no duplicate fill events are emitted
@@ -177,6 +251,22 @@ class OrderConsumer:
             for br in bracket_results:
                 if on_bracket_exit is not None:
                     on_bracket_exit(br)
+        except ValueError as exc:
+            # Book expired (token rotated) — publish cancel
+            logger.warning(
+                "Prefilled order rejected (expired book) for bo_id=%s: %s",
+                bo_id, exc,
+            )
+            if bo_id is not None:
+                self._publish_async(
+                    self._writer.publish_order_cancel(
+                        bo_id=bo_id,
+                        order_id="",
+                        reason="TOKEN_ROTATED",
+                        filled=0.0,
+                        avg_entry_price=0.0,
+                    )
+                )
         except Exception as exc:
             logger.error(
                 "Failed to place prefilled bracket order for bo_id=%s: %s",
@@ -260,6 +350,7 @@ class OrderConsumer:
             # Step 1: Publish fill event FIRST so DB has avg_price/num_shares
             # before any bracket exit arrives.
             if bo_id is not None and order.filled > 0:
+                fill_levels_snapshot = list(order._fill_levels)
                 wp = _serialize_fill_levels(order._fill_levels)
                 order._fill_levels = []  # reset after serialization
                 self._publish_async(
@@ -277,9 +368,27 @@ class OrderConsumer:
                     bo_id, order.filled, order.avg_entry_price, order.status.value,
                 )
 
+                # Log limit order fill to file with orderbook snapshot
+                if not is_market:
+                    book = self._engine.get_book(token_id)
+                    bids_snap = book.depth(side="bid", levels=10) if book else []
+                    asks_snap = book.depth(side="ask", levels=10) if book else []
+                    _log_limit_fill(
+                        bo_id=bo_id,
+                        order_id=order.order_id,
+                        filled=float(order.filled),
+                        avg_entry_price=float(order.avg_entry_price) if order.avg_entry_price else 0.0,
+                        status=order.status.value,
+                        fill_levels=fill_levels_snapshot,
+                        bids_snapshot=bids_snap,
+                        asks_snapshot=asks_snap,
+                        token_id=token_id,
+                    )
+
             # Step 2: Register for centralized monitoring
             if bo_id is not None:
                 self._order_to_bo[order.order_id] = bo_id
+                self._order_to_token[order.order_id] = token_id
                 # Seed last_reported so callback won't duplicate the immediate fill
                 book = self._engine.get_book(token_id)
                 if book is not None:
@@ -350,6 +459,24 @@ class OrderConsumer:
                     bo_id, event.order_id[:12], event.filled, event.status.value,
                 )
 
+                # Log limit order fill to file with orderbook snapshot
+                token_id = self._order_to_token.get(event.order_id, "")
+                if token_id:
+                    book = self._engine.get_book(token_id)
+                    bids_snap = book.depth(side="bid", levels=10) if book else []
+                    asks_snap = book.depth(side="ask", levels=10) if book else []
+                    _log_limit_fill(
+                        bo_id=bo_id,
+                        order_id=event.order_id,
+                        filled=float(event.filled),
+                        avg_entry_price=float(event.avg_entry_price) if event.avg_entry_price else 0.0,
+                        status=event.status.value,
+                        fill_levels=event.fill_levels,
+                        bids_snapshot=bids_snap,
+                        asks_snapshot=asks_snap,
+                        token_id=token_id,
+                    )
+
             elif event.event_type == "CANCEL":
                 self._publish_async(
                     self._writer.publish_order_cancel(
@@ -368,6 +495,7 @@ class OrderConsumer:
             # Cleanup tracking for terminal states
             if event.status in (OrderStatus.FILLED, OrderStatus.CANCELED):
                 self._order_to_bo.pop(event.order_id, None)
+                self._order_to_token.pop(event.order_id, None)
 
     def _publish_async(self, coro) -> None:
         """Bridge an async coroutine to the event loop from a sync thread."""

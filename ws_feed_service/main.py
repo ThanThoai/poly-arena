@@ -240,8 +240,9 @@ async def main():
     if not token_ids:
         log.warning("No token IDs discovered — running without WS feed")
 
-    # 4. Register token mapping in RedisWriter
+    # 4. Register token mapping in RedisWriter + valid tokens in engine
     writer.register_token_mapping(registry._mapping)
+    engine.register_valid_tokens(list(registry._mapping.values()))
 
     # 5. Patch engine.dispatch_event to write Redis
     loop = asyncio.get_event_loop()
@@ -266,6 +267,8 @@ async def main():
             # "no data" instead of old prices while waiting for first
             # WS tick from the new session's token.
             asyncio.ensure_future(writer.clear_price_keys(rotated))
+        # Update valid token set: add new, remove old
+        engine.register_valid_tokens(list(registry._mapping.values()))
         if old_token_ids:
             # Expire old books so pending LIMIT orders don't fill against
             # stale asks from the previous candle (e.g. $0.01 after RED).
@@ -281,7 +284,7 @@ async def main():
     await registry.start()
 
     # 8. Start OrderConsumer daemon thread
-    consumer = OrderConsumer(sync_redis, engine, writer, loop)
+    consumer = OrderConsumer(sync_redis, engine, writer, loop, registry=registry)
     consumer.start()
 
     # 9. Recovery: re-push PENDING BOs

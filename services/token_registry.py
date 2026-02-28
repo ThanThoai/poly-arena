@@ -36,6 +36,15 @@ import math
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from config.timing import (
+    HTTP_TIMEOUT,
+    HTTP_TIMEOUT_DISCOVERY,
+    TOKEN_PREFETCH_CANDLES,
+    TOKEN_REFRESH_OFFSET_S,
+    TOKEN_REFRESH_MAX_RETRIES,
+    TOKEN_REFRESH_RETRY_DELAY_S,
+    TF_SECONDS as _TF_SECONDS,
+)
 from services.polymarket import PolymarketClient
 
 logger = logging.getLogger(__name__)
@@ -46,17 +55,11 @@ _SYMBOLS: list[str]    = ["BTC", "ETH", "SOL", "XRP"]
 _DIRECTIONS: list[str] = ["UP", "DOWN"]
 _TIMEFRAMES: list[str] = ["M5", "M15", "H1"]
 
-_TF_SECONDS: dict[str, int] = {"M5": 300, "M15": 900, "H1": 3600}
+_PREFETCH_CANDLES: int = TOKEN_PREFETCH_CANDLES
 
-# Number of future candles to prefetch token_ids for.
-_PREFETCH_CANDLES: int = 5
-
-# Seconds to wait AFTER candle boundary before fetching the new slug.
-# Polymarket needs a few seconds to publish the new market.
-# Retry logic handles the case where it's not ready yet.
-_REFRESH_OFFSET_S: int   = 5
-_REFRESH_MAX_RETRIES: int = 6
-_REFRESH_RETRY_DELAY: int = 5   # seconds between retries
+_REFRESH_OFFSET_S: int   = TOKEN_REFRESH_OFFSET_S
+_REFRESH_MAX_RETRIES: int = TOKEN_REFRESH_MAX_RETRIES
+_REFRESH_RETRY_DELAY: int = TOKEN_REFRESH_RETRY_DELAY_S
 
 
 # ── TokenRegistry ─────────────────────────────────────────────────────────────
@@ -125,7 +128,7 @@ class TokenRegistry:
         discovered: list[str] = []
 
         try:
-            with PolymarketClient(timeout=15.0) as pm:
+            with PolymarketClient(timeout=HTTP_TIMEOUT_DISCOVERY) as pm:
                 for sym in self._symbols:
                     for tf in self._timeframes:
                         for direction in _DIRECTIONS:
@@ -334,7 +337,7 @@ class TokenRegistry:
             local_new: list[str] = []
             local_ok = False
 
-            with PolymarketClient(timeout=10.0) as pm:
+            with PolymarketClient(timeout=HTTP_TIMEOUT) as pm:
                 for sym in self._symbols:
                     for direction in _DIRECTIONS:
                         # ── Current candle ──

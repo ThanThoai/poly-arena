@@ -220,3 +220,31 @@ class UserSettingsResponse(BaseModel):
     settings: dict
 
     model_config = {"from_attributes": True}
+
+
+# ── Achievement schemas ──────────────────────────────────────────────────────
+
+class AchievementDefinitionResponse(BaseModel):
+    id:          int
+    slug:        str
+    name:        str
+    description: str
+    tier:        str
+    category:    str
+
+    model_config = {"from_attributes": True}
+
+
+class BotAchievementResponse(BaseModel):
+    id:             int
+    bot_id:         int
+    bot_name:       str
+    achievement_id: int
+    slug:           str
+    name:           str
+    description:    str
+    tier:           str
+    earned_at:      Optional[datetime] = None
+    metadata_:      Optional[dict] = None
+
+    model_config = {"from_attributes": True}

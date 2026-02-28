@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from database import SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
-from routers import auth, binary_options, bots, dashboard
+from routers import achievements as achievements_router, auth, binary_options, bots, dashboard
 from services.redis_client import get_async_redis, close_async_redis
 from services.order_trace import make_trace, append_trace
 from services.rest_exit import (
@@ -35,6 +35,15 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
+
+
+def _check_achievements(bo, db):
+    """Run achievement checkers — failure must never block settlement."""
+    try:
+        from services.achievements import on_trade_resolved
+        on_trade_resolved(bo, db)
+    except Exception as exc:
+        log.debug("Achievement check failed for BO #%d: %s", bo.id, exc)
 
 
 def _get_token_id(symbol: str, timeframe: str, pm_status: str):
@@ -153,6 +162,7 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                     # Step 1: persist to DB
                     db.commit()
                     _publish_trace_sync(bo)
+                    _check_achievements(bo, db)
                     log.info(
                         "Bracket exit settled immediately: BO #%d trigger=%s "
                         "exit_price=%.6f exit_filled=%.4f → %s profit=%.8f balance=%.2f",
@@ -496,6 +506,7 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                                     ))
                                     db.commit()
                                     _publish_trace_sync(bo)
+                                    _check_achievements(bo, db)
                                     exit_done = True
                                     log.info(
                                         "Auto-Exit settled: BO #%d %s "
@@ -545,6 +556,7 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                                 bo, open_price, close_price, db, tag="LATE_FILL"
                             )
                             db.commit()
+                            _check_achievements(bo, db)
                         else:
                             log.warning(
                                 "Late fill BO #%d — no candle data, will be caught by sweeper",
@@ -644,6 +656,9 @@ async def _handle_market_resolved(r, stream, group, msg_id, data) -> None:
                 )
 
             db.commit()
+            for bo in pending_orders:
+                if bo.result in (BOResult.WIN, BOResult.LOSS):
+                    _check_achievements(bo, db)
         finally:
             db.close()
 
@@ -907,6 +922,17 @@ async def lifespan(app: FastAPI):
         name="market-resolved-consumer",
     )
 
+    # Seed achievement definitions
+    try:
+        from services.achievement_seeder import seed_achievements
+        _db = SessionLocal()
+        try:
+            seed_achievements(_db)
+        finally:
+            _db.close()
+    except Exception as exc:
+        log.warning("Failed to seed achievements: %s", exc)
+
     yield
 
     # ── Shutdown ────────────────────────────────────────────────────────────
@@ -954,6 +980,7 @@ app.include_router(
 )
 app.include_router(bots.router, prefix="/poly-arena/bots", tags=["Bots"])
 app.include_router(dashboard.router, prefix="/poly-arena/dashboard", tags=["Dashboard"])
+app.include_router(achievements_router.router, prefix="/poly-arena/achievements", tags=["Achievements"])
 
 
 @app.get("/health", tags=["Health"])
