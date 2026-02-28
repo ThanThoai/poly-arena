@@ -2,6 +2,11 @@
 Test bot — chạy đồng thời nhiều bot, mỗi bot tạo random trades mỗi 5 phút.
 Khi khởi động sẽ tạo N bot (mặc định 4), mỗi bot chạy trong 1 thread riêng.
 Mỗi bot có phong cách giao dịch riêng (aggressive, conservative, scalper, mixed).
+
+v2 changes:
+  - Single Condition Policy: only TP or SL, not both
+  - TP/SL must pass pre-validation: TP > best_ask, SL < best_ask
+  - Bot creation requires JWT auth (register/login first)
 """
 
 import os
@@ -21,6 +26,8 @@ BASE = os.environ.get("API_URL", "http://localhost:8099/poly-arena")
 NUM_BOTS = int(os.environ.get("NUM_BOTS", "5"))
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))  # 5 phút
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
+TEST_USER = os.environ.get("TEST_USER", "test-trader")
+TEST_PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
 
 SYMBOLS = ["BTC"]
 TIMEFRAMES = ["M5"]
@@ -113,8 +120,14 @@ def _base_payload(profile: dict) -> dict:
     }
 
 
-def build_trade(profile: dict) -> dict:
-    """Tạo 1 trade ngẫu nhiên theo phong cách của bot."""
+def build_trade(profile: dict, best_ask: float | None = None) -> dict:
+    """Tạo 1 trade ngẫu nhiên theo phong cách của bot.
+
+    v2: Single Condition Policy — only TP or SL, never both.
+    TP/SL prices are generated relative to best_ask to pass pre-validation:
+      - TP must be > best_ask (take profit above current price)
+      - SL must be < best_ask (stop loss below current price)
+    """
     p = _base_payload(profile)
 
     is_limit = random.random() < profile["limit_pct"]
@@ -125,13 +138,19 @@ def build_trade(profile: dict) -> dict:
         p["limit_price"] = round(random.uniform(0.20, 0.80), 2)
 
     if has_bracket:
-        entry = p.get("limit_price", 0.50)
-        # ~70% chance TP
-        if random.random() < 0.7:
-            p["tp_price"] = round(min(0.95, entry + random.uniform(0.10, 0.30)), 2)
-        # ~70% chance SL
-        if random.random() < 0.7:
-            p["sl_price"] = round(max(0.05, entry - random.uniform(0.10, 0.25)), 2)
+        # Use best_ask as reference for realistic pricing.
+        # Fallback to estimated entry if best_ask unavailable.
+        ref_price = best_ask or p.get("limit_price") or 0.50
+
+        # Single Condition Policy: choose ONE of TP or SL
+        if random.random() < 0.6:
+            # TP: must be > best_ask (pre-validation requirement)
+            tp = ref_price + random.uniform(0.05, 0.30)
+            p["tp_price"] = round(min(0.95, tp), 2)
+        else:
+            # SL: must be < best_ask (pre-validation requirement)
+            sl = ref_price - random.uniform(0.05, 0.25)
+            p["sl_price"] = round(max(0.05, sl), 2)
 
     if has_ttl and is_limit:
         if profile["suffix"] == "scalper":
@@ -169,10 +188,57 @@ def wait_for_api() -> bool:
     return False
 
 
-def create_bot(bot_name: str) -> str:
-    """Tạo bot, trả về api_key."""
+def register_or_login_user(username: str, password: str) -> str:
+    """Register a new user or login if already exists. Returns JWT token."""
+    # Try register first
+    r = requests.post(
+        f"{BASE}/auth/register",
+        json={"username": username, "password": password},
+        timeout=10,
+    )
+    if r.status_code == 201:
+        token = r.json()["access_token"]
+        log.info("User registered: %s", username)
+        return token
+
+    if r.status_code == 409:
+        # User already exists — login instead
+        r = requests.post(
+            f"{BASE}/auth/login",
+            json={"username": username, "password": password},
+            timeout=10,
+        )
+        r.raise_for_status()
+        token = r.json()["access_token"]
+        log.info("User logged in: %s", username)
+        return token
+
+    r.raise_for_status()
+    return ""  # unreachable
+
+
+def fetch_my_bots(jwt_token: str) -> list[dict]:
+    """Lấy danh sách bot của user hiện tại (GET /bots/my)."""
+    r = requests.get(
+        f"{BASE}/bots/my",
+        headers={"Authorization": f"Bearer {jwt_token}"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    bots = r.json()
+    log.info("Fetched %d existing bot(s) for user", len(bots))
+    return bots
+
+
+def create_bot(bot_name: str, jwt_token: str) -> str:
+    """Tạo bot (authenticated via JWT), trả về api_key."""
     log.info("Creating bot '%s' ...", bot_name)
-    r = requests.post(f"{BASE}/bots/", json={"bot_name": bot_name}, timeout=10)
+    r = requests.post(
+        f"{BASE}/bots/",
+        json={"bot_name": bot_name},
+        headers={"Authorization": f"Bearer {jwt_token}"},
+        timeout=10,
+    )
     r.raise_for_status()
     data = r.json()
     api_key = data["api_key"]
@@ -192,9 +258,11 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
     if r.ok:
         data = r.json()
         otype = "LIMIT" if payload.get("limit_price") else "MKT"
-        bracket = ""
-        if payload.get("tp_price") or payload.get("sl_price"):
-            bracket = f" [TP={payload.get('tp_price', '-')} SL={payload.get('sl_price', '-')}]"
+        condition = ""
+        if payload.get("tp_price"):
+            condition = f" [TP={payload['tp_price']}]"
+        elif payload.get("sl_price"):
+            condition = f" [SL={payload['sl_price']}]"
         ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
         log.info(
             "%s Trade #%d: %s %s %s %s $%.2f → avg=%.4f shares=%.2f%s%s",
@@ -207,16 +275,37 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
             payload["amount"],
             data.get("avg_price") or 0,
             data.get("num_shares") or 0,
-            bracket,
+            condition,
             ttl_str,
         )
     else:
         log.warning("%s Trade failed (%d): %s", bot_name, r.status_code, r.text[:200])
 
 
+def fetch_best_ask(symbol: str = "BTC", timeframe: str = "M5") -> float | None:
+    """Fetch current best_ask from the engine/prices endpoint for pre-validation reference."""
+    try:
+        r = requests.get(
+            f"{BASE}/binary-options/engine/prices",
+            timeout=10,
+        )
+        if r.ok:
+            for p in r.json().get("prices", []):
+                if p["symbol"] == symbol and p["timeframe"] == timeframe and p["direction"] == "UP":
+                    return p.get("best_ask")
+    except Exception:
+        pass
+    return None
+
+
 def run_batch(api_key: str, bot_name: str, profile: dict, count: int) -> None:
     """Tạo 1 batch trades cho 1 bot."""
-    trades = [build_trade(profile) for _ in range(count)]
+    # Fetch best_ask once per batch for realistic TP/SL pricing
+    best_ask = fetch_best_ask()
+    if best_ask:
+        log.info("%s Best ask reference: %.4f", bot_name, best_ask)
+
+    trades = [build_trade(profile, best_ask=best_ask) for _ in range(count)]
 
     for idx, payload in enumerate(trades, 1):
         otype = "LIMIT" if payload.get("limit_price") else "MKT"
@@ -272,22 +361,64 @@ def bot_loop(bot_name: str, api_key: str, profile: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _match_profile(bot_name: str) -> dict:
+    """Guess bot profile from its name suffix, fallback to random profile."""
+    for profile in BOT_PROFILES:
+        if profile["suffix"] in bot_name:
+            return profile
+    return random.choice(BOT_PROFILES)
+
+
 def main():
     if not wait_for_api():
         return
 
-    threads = []
+    # Step 1: Register or login test user
+    try:
+        jwt_token = register_or_login_user(TEST_USER, TEST_PASSWORD)
+    except Exception as e:
+        log.error("Failed to register/login user '%s': %s", TEST_USER, e)
+        return
 
-    for i in range(NUM_BOTS):
+    # Step 2: Fetch existing bots for this user
+    existing_bots: list[dict] = []
+    try:
+        existing_bots = fetch_my_bots(jwt_token)
+    except Exception as e:
+        log.warning("Failed to fetch existing bots: %s — will create new ones", e)
+
+    # Step 3: Reuse existing bots, create new ones only if needed
+    bot_slots: list[tuple[str, str, dict]] = []  # (name, api_key, profile)
+
+    # Reuse active existing bots (up to NUM_BOTS)
+    for bot_data in existing_bots:
+        if len(bot_slots) >= NUM_BOTS:
+            break
+        if not bot_data.get("is_active", True):
+            continue
+        name = bot_data["bot_name"]
+        api_key = bot_data["api_key"]
+        profile = _match_profile(name)
+        bot_slots.append((name, api_key, profile))
+        log.info("Reusing existing bot: %s (style=%s)", name, profile["suffix"])
+
+    # Create additional bots if we need more
+    for i in range(len(bot_slots), NUM_BOTS):
         profile = BOT_PROFILES[i % len(BOT_PROFILES)]
         bot_name = f"bot-{profile['suffix']}-{random.randint(1000, 9999)}"
-
         try:
-            api_key = create_bot(bot_name)
+            api_key = create_bot(bot_name, jwt_token)
+            bot_slots.append((bot_name, api_key, profile))
         except Exception as e:
             log.error("Failed to create bot '%s': %s", bot_name, e)
-            continue
 
+    if not bot_slots:
+        log.error("No bots available, exiting")
+        return
+
+    # Step 4: Launch bot threads
+    threads = []
+    for bot_name, api_key, profile in bot_slots:
         t = threading.Thread(
             target=bot_loop,
             args=(bot_name, api_key, profile),
@@ -298,13 +429,11 @@ def main():
         threads.append(t)
         log.info("Thread started for %s (%s)", bot_name, profile["suffix"])
 
-    if not threads:
-        log.error("No bots created, exiting")
-        return
-
     log.info(
-        "All %d bots running. Press Ctrl+C to stop.",
+        "All %d bots running (%d reused, %d new). Press Ctrl+C to stop.",
         len(threads),
+        min(len(existing_bots), NUM_BOTS),
+        max(0, len(threads) - min(len(existing_bots), NUM_BOTS)),
     )
 
     # Keep main thread alive

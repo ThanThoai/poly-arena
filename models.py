@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, Integer, Numeric, String
+from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, ForeignKey, Integer, JSON, Numeric, String
 
 from database import Base
 
@@ -10,7 +10,29 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+USER_INITIAL_BALANCE = 50_000.0
 INITIAL_BALANCE = 10_000.0
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    username        = Column(String(100), unique=True, nullable=False, index=True)
+    email           = Column(String(255), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
+    initial_balance = Column(Numeric(18, 8, asdecimal=False), default=USER_INITIAL_BALANCE)
+    is_active       = Column(Boolean, default=True)
+    created_at      = Column(DateTime(timezone=True), default=_now)
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    settings   = Column(JSON, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class Bot(Base):
@@ -22,6 +44,7 @@ class Bot(Base):
     is_active       = Column(Boolean, default=True)
     initial_balance = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)
     balance         = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)   # current equity
+    user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at      = Column(DateTime(timezone=True), default=_now)
 
 
@@ -96,3 +119,10 @@ class BinaryOption(Base):
     me_order_id     = Column(String(64), nullable=True)  # matching engine SimulatedOrder ID
     me_order_status = Column(String(20), nullable=True)  # PENDING | PARTIAL | FILLED | CANCELED
     ttl             = Column(Integer, nullable=True)     # TTL in seconds; None = use candle expiry
+
+    # ── Walk prices: per-level fill details ────────────────────────────────────
+    walk_prices     = Column(JSON, nullable=True)        # {"entry": [{price, qty, cost}], "exit": [{price, qty, cost}]}
+
+    # ── Order Trace & Market Resolution ──────────────────────────────────────
+    traces          = Column(JSON, nullable=True)        # [{timestamp, stage, action, details, data}]
+    position_closed = Column(Boolean, default=False)     # True when market resolved or bracket fully exited

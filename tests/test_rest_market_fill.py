@@ -64,7 +64,7 @@ def test_multi_level_fill(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, token_id = _fill_market_from_rest(
+    avg_price, num_shares, token_id, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=153.0, slippage_tolerance=0.10,
     )
 
@@ -93,7 +93,7 @@ def test_multi_level_weighted_avg(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=105.0, slippage_tolerance=0.50,
     )
 
@@ -124,7 +124,7 @@ def test_budget_exhausted_mid_level(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=10.0, slippage_tolerance=0.10,
     )
 
@@ -152,7 +152,7 @@ def test_budget_exhausted_across_levels(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=60.0, slippage_tolerance=0.50,
     )
 
@@ -186,7 +186,7 @@ def test_slippage_skips_expensive_levels(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=100.0, slippage_tolerance=0.05,
     )
 
@@ -254,7 +254,7 @@ def test_tight_slippage_partial_fill(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=100.0, slippage_tolerance=0.02,
     )
 
@@ -313,7 +313,7 @@ def test_default_slippage_tolerance(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=200.0, slippage_tolerance=None,
     )
 
@@ -346,7 +346,7 @@ def test_tiny_budget_partial_fill(mock_pm_cls, mock_httpx_get):
     mock_resp.raise_for_status = MagicMock()
     mock_httpx_get.return_value = mock_resp
 
-    avg_price, num_shares, _ = _fill_market_from_rest(
+    avg_price, num_shares, _, _walk = _fill_market_from_rest(
         "BTC", "M5", "UP", amount=1.0, slippage_tolerance=0.10,
     )
 

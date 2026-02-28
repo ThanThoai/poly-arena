@@ -26,7 +26,7 @@ if not config.get_main_option("sqlalchemy.url"):
         "sqlalchemy.url",
         os.getenv(
             "DATABASE_URL",
-            "postgresql://polyarena:polyarena@localhost:5432/polyarena",
+            "postgresql://polyarena:polyarena_test@localhost:5433/polyarena_test",
         ),
     )
 

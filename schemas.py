@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from models import BOResult, BOSymbol, BOTimeframe, BOForecast
 
@@ -47,22 +47,10 @@ class BOCreate(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_bracket_prices(self) -> "BOCreate":
-        tp = self.tp_price
-        sl = self.sl_price
-        limit = self.limit_price
-
-        # TP must be greater than SL
-        if tp is not None and sl is not None and tp <= sl:
-            raise ValueError("tp_price must be greater than sl_price")
-
-        # For LIMIT orders, validate TP/SL relative to limit_price
-        if limit is not None:
-            if tp is not None and tp <= limit:
-                raise ValueError("tp_price must be greater than limit_price for LIMIT BUY orders")
-            if sl is not None and sl >= limit:
-                raise ValueError("sl_price must be less than limit_price for LIMIT BUY orders")
-
+    def validate_single_condition(self) -> "BOCreate":
+        """Single Condition Policy: an order can have at most one condition (TP or SL, not both)."""
+        if self.tp_price is not None and self.sl_price is not None:
+            raise ValueError("Only one condition allowed: set tp_price OR sl_price, not both")
         return self
 
 
@@ -97,6 +85,9 @@ class BOResponse(BaseModel):
     me_order_id:     Optional[str]   = None
     me_order_status: Optional[str]   = None
     ttl:             Optional[int]   = None
+    walk_prices:     Optional[dict]  = None
+    traces:          Optional[list]  = None
+    position_closed: Optional[bool]  = None
 
     model_config = {"from_attributes": True}
 
@@ -158,11 +149,12 @@ class BalanceHistoryResponse(BaseModel):
 
 class BotCreate(BaseModel):
     bot_name: str
+    initial_balance: float = 10000.0
 
 
 class BotRename(BaseModel):
     new_bot_name: str
-    api_key: str
+    api_key: Optional[str] = None
 
 
 class BotResponse(BaseModel):
@@ -184,6 +176,47 @@ class BotPublic(BaseModel):
     is_active:       bool
     initial_balance: float
     balance:         float
+    user_id:         Optional[int] = None
+    owner_name:      Optional[str] = None
     created_at:      Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Auth schemas ──────────────────────────────────────────────────────────────
+
+class UserRegister(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100)
+    email: Optional[str] = None
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    initial_balance: float
+    allocated_balance: float
+    available_balance: float
+
+    model_config = {"from_attributes": True}
+
+
+class UserSettingsUpdate(BaseModel):
+    settings: dict
+
+
+class UserSettingsResponse(BaseModel):
+    settings: dict
 
     model_config = {"from_attributes": True}

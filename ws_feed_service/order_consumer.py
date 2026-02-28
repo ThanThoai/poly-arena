@@ -30,6 +30,21 @@ from ws_feed_service.redis_writer import RedisWriter
 logger = logging.getLogger(__name__)
 
 
+def _serialize_fill_levels(levels: list) -> str:
+    """Serialize fill levels [(price, qty)] to JSON string of [{price, qty, cost}]."""
+    if not levels:
+        return ""
+    import json
+    return json.dumps([
+        {
+            "price": float(p),
+            "qty": float(q),
+            "cost": round(float(p) * float(q), 8),
+        }
+        for p, q in levels
+    ])
+
+
 class OrderConsumer:
     """
     Daemon thread that pops virtual orders from Redis and places them
@@ -245,6 +260,8 @@ class OrderConsumer:
             # Step 1: Publish fill event FIRST so DB has avg_price/num_shares
             # before any bracket exit arrives.
             if bo_id is not None and order.filled > 0:
+                wp = _serialize_fill_levels(order._fill_levels)
+                order._fill_levels = []  # reset after serialization
                 self._publish_async(
                     self._writer.publish_order_fill(
                         bo_id=bo_id,
@@ -252,6 +269,7 @@ class OrderConsumer:
                         filled=float(order.filled),
                         avg_entry_price=float(order.avg_entry_price) if order.avg_entry_price else 0.0,
                         status=order.status.value,
+                        walk_prices=wp,
                     )
                 )
                 logger.info(
@@ -301,6 +319,7 @@ class OrderConsumer:
                 continue  # not our order
 
             if event.event_type == "FILL":
+                wp = _serialize_fill_levels(event.fill_levels)
                 self._publish_async(
                     self._writer.publish_order_fill(
                         bo_id=bo_id,
@@ -308,6 +327,7 @@ class OrderConsumer:
                         filled=float(event.filled),
                         avg_entry_price=float(event.avg_entry_price) if event.avg_entry_price else 0.0,
                         status=event.status.value,
+                        walk_prices=wp,
                     )
                 )
                 logger.info(
@@ -352,6 +372,7 @@ class OrderConsumer:
         """
         def callback(result: BracketFillResult) -> None:
             from datetime import datetime, timezone
+            wp = _serialize_fill_levels(result.fill_levels)
             self._publish_async(
                 self._writer.publish_bracket_exit(
                     bo_id=bo_id,
@@ -360,6 +381,7 @@ class OrderConsumer:
                     exit_filled=float(result.qty_exited),
                     order_id=result.order_id,
                     exit_at=datetime.now(timezone.utc).isoformat(),
+                    walk_prices=wp,
                 )
             )
         return callback

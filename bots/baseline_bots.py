@@ -126,23 +126,66 @@ def run_bot(bot_cfg: dict, api_base: str, api_key: str) -> None:
 # ── Registration ───────────────────────────────────────────────────────────────
 
 
+DEFAULT_USER = "baseline-trader"
+DEFAULT_PASS = "baseline123456"
+
+
+def _get_jwt_token(api_base: str, username: str, password: str) -> str:
+    """Register or login to get a JWT token for bot creation."""
+    # Try register first
+    resp = httpx.post(
+        f"{api_base}/auth/register",
+        json={"username": username, "password": password},
+        timeout=10.0,
+    )
+    if resp.status_code == 201:
+        log.info("User registered: %s", username)
+        return resp.json()["access_token"]
+
+    if resp.status_code == 409:
+        # User already exists — login
+        resp = httpx.post(
+            f"{api_base}/auth/login",
+            json={"username": username, "password": password},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        log.info("User logged in: %s", username)
+        return resp.json()["access_token"]
+
+    resp.raise_for_status()
+    return ""  # unreachable
+
+
 def ensure_bots(api_base: str) -> dict:
     """
     Create bots that don't exist yet, return {name: api_key}.
     Caches api_keys locally so restarts don't re-register.
+    Uses JWT auth for bot creation (v2 requirement).
     """
     keys = load_config()
 
-    for cfg in BOTS:
-        name = cfg["name"]
-        if name in keys:
-            log.info("Bot '%-14s' already registered (cached)", name)
-            continue
+    # Check if any bots need creating
+    need_create = [cfg for cfg in BOTS if cfg["name"] not in keys]
+    if not need_create:
+        for cfg in BOTS:
+            log.info("Bot '%-14s' already registered (cached)", cfg["name"])
+        return keys
 
+    # Get JWT token for bot creation
+    try:
+        jwt_token = _get_jwt_token(api_base, DEFAULT_USER, DEFAULT_PASS)
+    except Exception as exc:
+        log.error("Failed to get JWT token: %s", exc)
+        return keys
+
+    for cfg in need_create:
+        name = cfg["name"]
         try:
             resp = httpx.post(
-                f"{api_base}/api/bots/",
+                f"{api_base}/bots/",
                 json={"bot_name": name},
+                headers={"Authorization": f"Bearer {jwt_token}"},
                 timeout=10.0,
             )
             if resp.status_code == 409:

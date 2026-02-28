@@ -118,7 +118,8 @@ services:
     image: poly-arena-test/test-bot
     environment:
       - API_URL=http://api-test:8099/poly-arena
-      - BOT_NAME=random-trader
+      - TEST_USER=test-trader
+      - TEST_PASSWORD=testpass123
       - INTERVAL_SEC=300
       - TRADES_PER_TICK=3
     depends_on:

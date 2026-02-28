@@ -19,6 +19,7 @@ from ws_feed_service.config import (
     STREAM_BRACKET_EXITS,
     STREAM_ORDER_CANCELS,
     STREAM_ORDER_FILLS,
+    STREAM_MARKET_RESOLVED,
     STREAM_MAXLEN,
 )
 
@@ -183,6 +184,7 @@ class RedisWriter:
         exit_filled: float,
         order_id: str,
         exit_at: str | None = None,
+        walk_prices: str = "",
     ) -> None:
         """Publish a bracket exit event to the Redis stream."""
         try:
@@ -195,6 +197,8 @@ class RedisWriter:
             }
             if exit_at:
                 fields["exit_at"] = exit_at
+            if walk_prices:
+                fields["walk_prices"] = walk_prices
             await self._r.xadd(
                 STREAM_BRACKET_EXITS,
                 fields,
@@ -248,6 +252,7 @@ class RedisWriter:
         filled: float,
         avg_entry_price: float,
         status: str,
+        walk_prices: str = "",
     ) -> None:
         """Publish a fill update event to the Redis stream.
 
@@ -255,15 +260,18 @@ class RedisWriter:
         can keep avg_price / num_shares in sync with the matching engine.
         """
         try:
+            fields: dict[str, str] = {
+                "bo_id": str(bo_id),
+                "order_id": order_id,
+                "filled": str(filled),
+                "avg_entry_price": str(avg_entry_price),
+                "status": status,
+            }
+            if walk_prices:
+                fields["walk_prices"] = walk_prices
             await self._r.xadd(
                 STREAM_ORDER_FILLS,
-                {
-                    "bo_id": str(bo_id),
-                    "order_id": order_id,
-                    "filled": str(filled),
-                    "avg_entry_price": str(avg_entry_price),
-                    "status": status,
-                },
+                fields,
                 maxlen=STREAM_MAXLEN,
                 approximate=True,
             )
@@ -273,3 +281,31 @@ class RedisWriter:
             )
         except Exception as exc:
             logger.error("RedisWriter.publish_order_fill failed: %s", exc)
+
+    async def publish_market_resolved(
+        self,
+        asset_id: str,
+        winning_outcome: str = "",
+        timestamp: str = "",
+    ) -> None:
+        """Publish a market resolution event to the Redis stream."""
+        try:
+            fields: dict[str, str] = {
+                "asset_id": asset_id,
+            }
+            if winning_outcome:
+                fields["winning_outcome"] = winning_outcome
+            if timestamp:
+                fields["timestamp"] = timestamp
+            await self._r.xadd(
+                STREAM_MARKET_RESOLVED,
+                fields,
+                maxlen=STREAM_MAXLEN,
+                approximate=True,
+            )
+            logger.info(
+                "Market resolved published: asset_id=%s winning=%s",
+                asset_id[:16], winning_outcome,
+            )
+        except Exception as exc:
+            logger.error("RedisWriter.publish_market_resolved failed: %s", exc)

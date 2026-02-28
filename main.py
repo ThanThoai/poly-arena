@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -8,12 +9,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from database import SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
-from routers import binary_options, bots, dashboard
+from routers import auth, binary_options, bots, dashboard
 from services.redis_client import get_async_redis, close_async_redis
+from services.order_trace import make_trace, append_trace
+from services.rest_exit import (
+    fetch_best_bid_from_rest,
+    simulate_bracket_exit_from_rest,
+)
 from ws_feed_service.config import (
     STREAM_BRACKET_EXITS,
     STREAM_ORDER_CANCELS,
     STREAM_ORDER_FILLS,
+    STREAM_MARKET_RESOLVED,
 )
 
 _log_level = (
@@ -28,6 +35,31 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
+
+
+def _get_token_id(symbol: str, timeframe: str, pm_status: str):
+    """Resolve token_id from Redis price cache (same as router helper)."""
+    try:
+        from services.redis_client import get_sync_redis
+        from ws_feed_service.config import PRICE_KEY_PREFIX
+        sr = get_sync_redis()
+        key = f"{PRICE_KEY_PREFIX}:{symbol}:{timeframe}:{pm_status}"
+        return sr.hget(key, "token_id")
+    except Exception:
+        return None
+
+
+def _publish_trace_sync(bo) -> None:
+    """Publish the latest trace from a BO to Redis for real-time UI."""
+    if not bo.traces:
+        return
+    try:
+        from services.redis_client import get_sync_redis
+        from services.order_trace import publish_trace_to_redis
+        sr = get_sync_redis()
+        publish_trace_to_redis(sr, bo.id, bo.traces[-1])
+    except Exception as exc:
+        log.debug("Failed to publish trace to Redis for BO #%d: %s", bo.id, exc)
 
 
 async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
@@ -58,6 +90,13 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                 bo.exit_trigger = trigger
                 bo.exit_price = exit_price
                 bo.exit_filled = exit_filled
+                append_trace(bo, make_trace(
+                    "MONITORING", "BRACKET_EXIT",
+                    f"Active Monitoring: Best Bid hit {trigger} threshold. "
+                    f"Exit Price: ${exit_price:.4f}, Qty: {exit_filled:.4f}.",
+                    {"trigger": trigger, "exit_price": exit_price,
+                     "exit_filled": exit_filled},
+                ))
                 bo.exit_at = (
                     datetime.fromisoformat(exit_at_str)
                     if exit_at_str
@@ -66,6 +105,17 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                 if order_id and not bo.me_order_id:
                     bo.me_order_id = order_id
                 bo.me_order_status = "FILLED"
+
+                # Persist exit walk prices
+                wp_str = data.get("walk_prices", "")
+                if wp_str:
+                    try:
+                        exit_levels = json.loads(wp_str)
+                        wp = bo.walk_prices or {}
+                        wp["exit"] = wp.get("exit", []) + exit_levels
+                        bo.walk_prices = wp
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
                 num_shares = bo.num_shares or 0.0
                 is_full_exit = exit_filled >= num_shares and num_shares > 0
@@ -89,8 +139,20 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                             )
                         )
 
+                    append_trace(bo, make_trace(
+                        "SETTLEMENT", "BRACKET_SETTLED",
+                        f"Bracket exit settled. {trigger} triggered. "
+                        f"Entry: ${bo.avg_price:.4f} → Exit: ${exit_price:.4f}. "
+                        f"Profit: ${profit:.4f} ({result.value}).",
+                        {"trigger": trigger, "entry_price": bo.avg_price,
+                         "exit_price": exit_price, "exit_filled": exit_filled,
+                         "profit": profit, "result": result.value,
+                         "payout": payout},
+                    ))
+
                     # Step 1: persist to DB
                     db.commit()
+                    _publish_trace_sync(bo)
                     log.info(
                         "Bracket exit settled immediately: BO #%d trigger=%s "
                         "exit_price=%.6f exit_filled=%.4f → %s profit=%.8f balance=%.2f",
@@ -104,8 +166,17 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                     )
                 else:
                     # Partial exit — scheduler settles remainder via candle
+                    append_trace(bo, make_trace(
+                        "MONITORING", "PARTIAL_EXIT",
+                        f"Partial exit: {exit_filled:.4f} / {num_shares:.4f} shares "
+                        f"exited via {trigger}. Remainder pending candle settlement.",
+                        {"trigger": trigger, "exit_filled": exit_filled,
+                         "num_shares": num_shares},
+                    ))
+
                     # Step 1: persist to DB
                     db.commit()
+                    _publish_trace_sync(bo)
                     log.info(
                         "Bracket exit (partial): BO #%d trigger=%s "
                         "exit_filled=%.4f / num_shares=%.4f — pending candle settlement",
@@ -152,6 +223,16 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                     bo.amount = actual_cost
                     bo.me_order_status = "CANCELED"
 
+                    append_trace(bo, make_trace(
+                        "MATCHING", "PARTIAL_FILL_EXPIRY",
+                        f"Order expired with partial fill. "
+                        f"Filled: {filled:.4f} @ ${avg_entry:.4f}. "
+                        f"Unfilled refund: ${unfilled_refund:.4f}.",
+                        {"filled": filled, "avg_entry_price": avg_entry,
+                         "actual_cost": actual_cost, "unfilled_refund": unfilled_refund,
+                         "reason": reason},
+                    ))
+
                     # Hoàn trả phần chưa fill về balance ngay lập tức
                     if unfilled_refund > 0:
                         bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
@@ -166,6 +247,7 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                             )
 
                     db.commit()
+                    _publish_trace_sync(bo)
                     log.info(
                         "Partial fill expiry: BO #%d filled=%.4f avg=%.6f "
                         "actual_cost=%.2f unfilled_refund=%.2f — kept PENDING for settlement",
@@ -180,6 +262,13 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                     bo.profit = 0.0
                     bo.me_order_status = "CANCELED"
 
+                    append_trace(bo, make_trace(
+                        "MATCHING", "ORDER_CANCELLED",
+                        f"Order cancelled ({reason}). "
+                        f"No fills. Refund: ${bo.amount:.4f}.",
+                        {"reason": reason, "refund": bo.amount},
+                    ))
+
                     bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
                     if bot:
                         bot.balance = round(bot.balance + bo.amount, 8)
@@ -192,6 +281,7 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                         )
 
                     db.commit()
+                    _publish_trace_sync(bo)
                     log.info(
                         "Order cancelled (zero fill): BO #%d reason=%s refund=%.2f",
                         bo_id,
@@ -239,7 +329,40 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     bo.me_order_status = status
                 if order_id and not bo.me_order_id:
                     bo.me_order_id = order_id
+
+                # Persist entry walk prices (append for partial fills)
+                wp_str = data.get("walk_prices", "")
+                if wp_str:
+                    try:
+                        new_levels = json.loads(wp_str)
+                        wp = bo.walk_prices or {}
+                        wp["entry"] = wp.get("entry", []) + new_levels
+                        bo.walk_prices = wp
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # MATCHING trace
+                if status == "FILLED":
+                    append_trace(bo, make_trace(
+                        "MATCHING", "ORDER_FILLED",
+                        f"Order fully filled. Avg Entry Price: ${avg_entry:.4f}. "
+                        f"Shares: {filled:.4f}.",
+                        {"avg_entry_price": avg_entry, "filled": filled,
+                         "status": status},
+                    ))
+                elif status == "PARTIAL":
+                    append_trace(bo, make_trace(
+                        "MATCHING", "PARTIAL_FILL",
+                        f"Partial fill: {filled:.4f} shares @ ${avg_entry:.4f}.",
+                        {"avg_entry_price": avg_entry, "filled": filled,
+                         "status": status},
+                    ))
+
                 db.commit()
+
+                # Publish trace to Redis for real-time UI
+                _publish_trace_sync(bo)
+
                 log.info(
                     "Fill update: BO #%d filled=%.4f avg=%.6f status=%s",
                     bo_id,
@@ -248,10 +371,159 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     status,
                 )
 
+                # ── Auto-Exit: TP < entry hoặc SL > entry ──────────────
+                # Khi LIMIT order FILLED mà avg_entry_price đã vi phạm
+                # điều kiện TP/SL (do slippage hoặc book dynamics), tự
+                # động kích hoạt bracket exit ngay lập tức.
+                if (
+                    status == "FILLED"
+                    and bo.result == BOResult.PENDING
+                    and bo.exit_trigger is None
+                ):
+                    tp = bo.tp_price
+                    sl = bo.sl_price
+                    tp_violated = tp is not None and avg_entry >= tp
+                    sl_violated = sl is not None and avg_entry <= sl
+
+                    if tp_violated or sl_violated:
+                        trigger = "TP" if tp_violated else "SL"
+                        cond_price = tp if tp_violated else sl
+                        log.info(
+                            "Auto-Exit: BO #%d %s violated at fill — "
+                            "entry=%.6f %s=%.6f",
+                            bo_id, trigger, avg_entry, trigger, cond_price,
+                        )
+                        append_trace(bo, make_trace(
+                            "MONITORING", "SLIPPAGE_VIOLATION",
+                            f"Post-fill check: Avg Entry ${avg_entry:.4f} "
+                            f"violates {trigger} ${cond_price:.4f}. "
+                            f"Triggering Auto-Exit...",
+                            {"avg_entry_price": avg_entry, "trigger": trigger,
+                             "condition_price": cond_price},
+                        ))
+
+                        # Resolve token_id for REST bid lookup
+                        _FORECAST_MAP = {"GREEN": "UP", "RED": "DOWN"}
+                        pm_dir = _FORECAST_MAP.get(
+                            bo.forecast.value
+                            if hasattr(bo.forecast, "value")
+                            else str(bo.forecast),
+                            "UP",
+                        )
+                        token_id = _get_token_id(
+                            bo.symbol.value
+                            if hasattr(bo.symbol, "value")
+                            else str(bo.symbol),
+                            bo.timeframe.value
+                            if hasattr(bo.timeframe, "value")
+                            else str(bo.timeframe),
+                            pm_dir,
+                        )
+
+                        exit_done = False
+                        if token_id:
+                            best_bid, bid_levels = fetch_best_bid_from_rest(
+                                token_id,
+                            )
+                            if best_bid is not None and bid_levels:
+                                exit_price, exit_filled, exit_walk = (
+                                    simulate_bracket_exit_from_rest(
+                                        filled, bid_levels,
+                                    )
+                                )
+                                if exit_filled > 0:
+                                    append_trace(bo, make_trace(
+                                        "MONITORING", "AUTO_EXIT_SWEEP",
+                                        f"Auto-Exit REST Sweep: Selling "
+                                        f"{exit_filled:.4f} @ avg "
+                                        f"${exit_price:.4f}.",
+                                        {"exit_price": exit_price,
+                                         "exit_filled": exit_filled,
+                                         "reason": "Slippage Violation"},
+                                    ))
+                                    # Settle immediately
+                                    bo.exit_trigger = trigger
+                                    bo.exit_price = exit_price
+                                    bo.exit_filled = exit_filled
+                                    bo.exit_at = datetime.now(timezone.utc)
+
+                                    wp = bo.walk_prices or {}
+                                    wp["exit"] = exit_walk
+                                    bo.walk_prices = wp
+
+                                    profit = round(
+                                        (exit_price - avg_entry) * exit_filled,
+                                        8,
+                                    )
+                                    result_val = (
+                                        BOResult.WIN
+                                        if profit >= 0
+                                        else BOResult.LOSS
+                                    )
+                                    bo.result = result_val
+                                    bo.profit = profit
+
+                                    payout = round(bo.amount + profit, 8)
+                                    bot = (
+                                        db.query(Bot)
+                                        .filter(Bot.bot_name == bo.bot_name)
+                                        .first()
+                                    )
+                                    if bot:
+                                        bot.balance = round(
+                                            bot.balance + payout, 8,
+                                        )
+                                        db.add(BalanceHistory(
+                                            bot_name=bo.bot_name,
+                                            balance=bot.balance,
+                                            trade_id=bo.id,
+                                        ))
+
+                                    append_trace(bo, make_trace(
+                                        "SETTLEMENT",
+                                        "AUTO_EXIT_SETTLED",
+                                        f"Auto-Exit settled. {trigger} "
+                                        f"violated at entry. Entry: "
+                                        f"${avg_entry:.4f} → Exit: "
+                                        f"${exit_price:.4f}. Profit: "
+                                        f"${profit:.4f} ({result_val.value}).",
+                                        {"trigger": trigger,
+                                         "entry_price": avg_entry,
+                                         "exit_price": exit_price,
+                                         "profit": profit,
+                                         "result": result_val.value,
+                                         "payout": payout},
+                                    ))
+                                    db.commit()
+                                    _publish_trace_sync(bo)
+                                    exit_done = True
+                                    log.info(
+                                        "Auto-Exit settled: BO #%d %s "
+                                        "entry=%.6f exit=%.6f → %s "
+                                        "profit=%.8f",
+                                        bo_id, trigger, avg_entry,
+                                        exit_price, result_val.value,
+                                        profit,
+                                    )
+
+                        if not exit_done:
+                            log.warning(
+                                "Auto-Exit BO #%d: no bid liquidity or "
+                                "token_id unavailable — ME will monitor",
+                                bo_id,
+                            )
+                            db.commit()
+                            _publish_trace_sync(bo)
+
                 # ── Immediate settlement khi fill đến muộn ────────────────
                 # Nếu lệnh đã FILLED và settlement_at đã qua, không cần chờ
                 # scheduler — settle ngay để lệnh rời khỏi open positions.
-                if status == "FILLED" and bo.settlement_at is not None:
+                # Skip if already settled by auto-exit above.
+                if (
+                    status == "FILLED"
+                    and bo.result == BOResult.PENDING
+                    and bo.settlement_at is not None
+                ):
                     now = datetime.now(timezone.utc)
                     settle_at = bo.settlement_at
                     if settle_at.tzinfo is None:
@@ -287,6 +559,97 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
     except Exception as exc:
         # Do NOT ack — message remains in PEL for reprocessing
         log.error("Error processing order fill %s: %s", msg_id, exc)
+
+
+async def _handle_market_resolved(r, stream, group, msg_id, data) -> None:
+    """
+    Process a market resolution event (v2 spec Section 5).
+
+    Oracle payout: winning token = qty × 1.0, losing token = qty × 0.0.
+    """
+    try:
+        asset_id = data.get("asset_id", "")
+        winning_outcome = data.get("winning_outcome", "")
+
+        db = SessionLocal()
+        try:
+            # Find all PENDING orders for this asset
+            # Since we don't store asset_id on BinaryOption, we look for orders
+            # that have position_closed=False and are PENDING
+            pending_orders = (
+                db.query(BinaryOption)
+                .filter(
+                    BinaryOption.result == BOResult.PENDING,
+                    BinaryOption.position_closed.isnot(True),
+                )
+                .all()
+            )
+
+            for bo in pending_orders:
+                # Skip orders without fills
+                if not bo.num_shares or bo.num_shares <= 0:
+                    continue
+                if not bo.avg_price or bo.avg_price <= 0:
+                    continue
+
+                # Determine if this order holds the winning or losing token
+                # GREEN forecast → UP direction, RED forecast → DOWN direction
+                forecast_dir = "UP" if bo.forecast == "GREEN" else "DOWN"
+
+                # If winning_outcome matches the forecast direction, it's a WIN
+                if winning_outcome.upper() in (forecast_dir, bo.forecast):
+                    # Winning token: payout = filled_qty × 1.0
+                    payout_per_share = 1.0
+                    result = BOResult.WIN
+                else:
+                    # Losing token: payout = filled_qty × 0.0
+                    payout_per_share = 0.0
+                    result = BOResult.LOSS
+
+                final_value = round(bo.num_shares * payout_per_share, 8)
+                profit = round(final_value - bo.amount, 8)
+
+                bo.result = result
+                bo.profit = profit
+                bo.position_closed = True
+                bo.tp_price = None
+                bo.sl_price = None
+
+                # Add settlement trace
+                append_trace(bo, make_trace(
+                    "SETTLEMENT", "MARKET_RESOLVED",
+                    f"Polymarket Event: market_resolved received. "
+                    f"Asset resolved as {winning_outcome}. "
+                    f"Payout calculated: {bo.num_shares:.4f} × ${payout_per_share:.2f} = ${final_value:.4f}.",
+                    {"winning_outcome": winning_outcome, "payout_per_share": payout_per_share,
+                     "final_value": final_value, "profit": profit},
+                ))
+
+                # Update bot balance
+                bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
+                if bot:
+                    payout = round(bo.amount + profit, 8)
+                    bot.balance = round(bot.balance + payout, 8)
+                    db.add(
+                        BalanceHistory(
+                            bot_name=bo.bot_name,
+                            balance=bot.balance,
+                            trade_id=bo.id,
+                        )
+                    )
+
+                log.info(
+                    "Market resolved: BO #%d winner=%s → %s profit=%.8f",
+                    bo.id, winning_outcome, result.value, profit,
+                )
+
+            db.commit()
+        finally:
+            db.close()
+
+        await r.xack(stream, group, msg_id)
+    except Exception as exc:
+        log.error("Error processing market resolved %s: %s", msg_id, exc)
 
 
 async def _drain_pending(r, stream: str, group: str, consumer: str, handler) -> int:
@@ -473,6 +836,54 @@ async def _consume_order_fills() -> None:
             await asyncio.sleep(1)
 
 
+async def _consume_market_resolved() -> None:
+    """
+    XREADGROUP consumer for market resolution events (v2 spec Section 5).
+
+    When Polymarket resolves a market, determines oracle payout and
+    updates all affected orders.
+    """
+    r = get_async_redis()
+    group = "api-workers"
+    consumer = f"api-resolved-{os.getpid()}"
+
+    try:
+        await r.xgroup_create(STREAM_MARKET_RESOLVED, group, id="0", mkstream=True)
+        log.info(
+            "Created consumer group '%s' on stream '%s'", group, STREAM_MARKET_RESOLVED
+        )
+    except Exception:
+        pass
+
+    log.info("Market resolved consumer started: group=%s consumer=%s", group, consumer)
+    await _drain_pending(r, STREAM_MARKET_RESOLVED, group, consumer, _handle_market_resolved)
+
+    while True:
+        try:
+            results = await r.xreadgroup(
+                group,
+                consumer,
+                {STREAM_MARKET_RESOLVED: ">"},
+                count=10,
+                block=5000,
+            )
+            if not results:
+                continue
+
+            for _stream, messages in results:
+                for msg_id, data in messages:
+                    await _handle_market_resolved(
+                        r, STREAM_MARKET_RESOLVED, group, msg_id, data
+                    )
+
+        except asyncio.CancelledError:
+            log.info("Market resolved consumer shutting down")
+            return
+        except Exception as exc:
+            log.error("Market resolved consumer error: %s", exc)
+            await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start bracket exit consumer (reads from Redis Stream)
@@ -490,6 +901,11 @@ async def lifespan(app: FastAPI):
         _consume_order_fills(),
         name="order-fill-consumer",
     )
+    # Start market resolved consumer (v2 spec Section 5)
+    resolved_task = asyncio.create_task(
+        _consume_market_resolved(),
+        name="market-resolved-consumer",
+    )
 
     yield
 
@@ -497,7 +913,8 @@ async def lifespan(app: FastAPI):
     consumer_task.cancel()
     cancel_task.cancel()
     fill_task.cancel()
-    for t in (consumer_task, cancel_task, fill_task):
+    resolved_task.cancel()
+    for t in (consumer_task, cancel_task, fill_task, resolved_task):
         try:
             await t
         except asyncio.CancelledError:
@@ -505,11 +922,16 @@ async def lifespan(app: FastAPI):
     await close_async_redis()
 
 
+_disable_docs = os.getenv("DISABLE_DOCS", "").strip() in ("1", "true", "yes")
+
 app = FastAPI(
     title="PolyArena BO API",
     description="Binary Options trading dashboard — order tracking, P&L, and bot analytics.",
     version="2.0.0",
     lifespan=lifespan,
+    docs_url=None if _disable_docs else "/docs",
+    redoc_url=None if _disable_docs else "/redoc",
+    openapi_url=None if _disable_docs else "/openapi.json",
 )
 
 app.add_middleware(
@@ -526,6 +948,7 @@ app.add_middleware(
 )
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
 
+app.include_router(auth.router, prefix="/poly-arena/auth", tags=["Auth"])
 app.include_router(
     binary_options.router, prefix="/poly-arena/binary-options", tags=["Binary Options"]
 )
