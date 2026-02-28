@@ -299,6 +299,21 @@ class OrderConsumer:
             for br in bracket_results:
                 if on_bracket_exit is not None:
                     on_bracket_exit(br)
+        except ValueError as exc:
+            # Book expired (token rotated) — publish cancel so API marks order CANCELLED
+            logger.warning(
+                "Order rejected (expired book) for bo_id=%s: %s", bo_id, exc,
+            )
+            if bo_id is not None:
+                self._publish_async(
+                    self._writer.publish_order_cancel(
+                        bo_id=bo_id,
+                        order_id="",
+                        reason="TOKEN_ROTATED",
+                        filled=0.0,
+                        avg_entry_price=0.0,
+                    )
+                )
         except Exception as exc:
             logger.error(
                 "Failed to place virtual order for bo_id=%s: %s", bo_id, exc,

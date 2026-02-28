@@ -259,17 +259,22 @@ async def main():
         if feed is not None:
             feed.add_tokens(ids)
         # Re-register mapping so new tokens get price writes.
-        # Returns combos whose token_id just rotated (new session started).
-        rotated = writer.register_token_mapping(registry._mapping)
+        # Returns combos whose token_id rotated + the old token_ids.
+        rotated, old_token_ids = writer.register_token_mapping(registry._mapping)
         if rotated:
             # Clear stale Redis price keys immediately so the UI shows
             # "no data" instead of old prices while waiting for first
             # WS tick from the new session's token.
             asyncio.ensure_future(writer.clear_price_keys(rotated))
+        if old_token_ids:
+            # Expire old books so pending LIMIT orders don't fill against
+            # stale asks from the previous candle (e.g. $0.01 after RED).
+            engine.invalidate_books(old_token_ids)
         log.info(
-            "TokenRegistry pushed %d new token(s)%s",
+            "TokenRegistry pushed %d new token(s)%s%s",
             len(ids),
             f", cleared {len(rotated)} stale price key(s)" if rotated else "",
+            f", expired {len(old_token_ids)} old book(s)" if old_token_ids else "",
         )
 
     registry._on_new_tokens = on_new_tokens

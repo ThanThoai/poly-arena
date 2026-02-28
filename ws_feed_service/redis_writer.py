@@ -36,14 +36,15 @@ class RedisWriter:
 
     def register_token_mapping(
         self, mapping: dict[tuple[str, str, str], str]
-    ) -> list[tuple[str, str, str]]:
+    ) -> tuple[list[tuple[str, str, str]], list[str]]:
         """
         Build reverse map from TokenRegistry._mapping.
 
         mapping: {(symbol, timeframe, direction): token_id}
 
-        Returns the list of (sym, tf, dir) combos whose token_id was rotated
-        (i.e. the new session started) so the caller can clear stale Redis keys.
+        Returns:
+          - rotated_combos: list of (sym, tf, dir) whose token_id changed
+          - old_token_ids: list of old token_ids that were replaced (for book invalidation)
         """
         # Build OLD forward map (combo → old token_id) before clearing
         old_forward: dict[tuple[str, str, str], str] = {
@@ -57,11 +58,13 @@ class RedisWriter:
             self._token_map.setdefault(token_id, []).append((sym, tf, direction))
 
         # Any combo whose token_id changed → its Redis price key is now stale
-        rotated_combos: list[tuple[str, str, str]] = [
-            combo
-            for combo, new_token_id in mapping.items()
-            if old_forward.get(combo) not in (None, new_token_id)
-        ]
+        rotated_combos: list[tuple[str, str, str]] = []
+        old_token_ids_set: set[str] = set()
+        for combo, new_token_id in mapping.items():
+            old_id = old_forward.get(combo)
+            if old_id is not None and old_id != new_token_id:
+                rotated_combos.append(combo)
+                old_token_ids_set.add(old_id)
 
         logger.info(
             "RedisWriter: registered %d token(s) → %d price key(s)%s",
@@ -69,7 +72,7 @@ class RedisWriter:
             sum(len(v) for v in self._token_map.values()),
             f", {len(rotated_combos)} key(s) rotated" if rotated_combos else "",
         )
-        return rotated_combos
+        return rotated_combos, list(old_token_ids_set)
 
     async def update_price(
         self,
