@@ -1733,6 +1733,31 @@ class MatchingEngine:
             token_ids = list(self._books.keys())
         return [s for tid in token_ids if (s := self.book_summary(tid)) is not None]
 
+    def expire_all_pending(self) -> int:
+        """Expire TTL-elapsed orders across ALL books.
+
+        Called periodically by the WS Feed Service to ensure orders expire
+        even when no WebSocket events are arriving (idle market).
+
+        Returns the total number of orders expired.
+        """
+        with self._lock:
+            token_ids = list(self._books.keys())
+        total = 0
+        for tid in token_ids:
+            book = self.get_book(tid)
+            if book is not None:
+                # Acquire book lock once for both expire + collect
+                state_events: list[OrderStateChangeEvent] = []
+                with book._lock:
+                    expired = book._expire_pending_orders()
+                    if expired:
+                        total += len(expired)
+                        state_events = book.collect_state_changes()
+                # Fire callbacks outside lock
+                book._fire_state_change_callbacks(state_events)
+        return total
+
     def shutdown(self) -> None:
         """Stop accepting events and cancel all virtual orders."""
         self._running = False
