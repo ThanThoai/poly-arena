@@ -199,10 +199,10 @@ def _patch_dispatch_event(engine: MatchingEngine, writer: RedisWriter, loop: asy
                     except Exception:
                         pass
 
-                # Publish orderbook depth
+                # Publish orderbook depth (raw Polymarket data, not shadow)
                 try:
-                    bid_depth = book.depth("bid", ORDERBOOK_DEPTH_LEVELS)
-                    ask_depth = book.depth("ask", ORDERBOOK_DEPTH_LEVELS)
+                    bid_depth = book.raw_depth("bid", ORDERBOOK_DEPTH_LEVELS)
+                    ask_depth = book.raw_depth("ask", ORDERBOOK_DEPTH_LEVELS)
                     depth_coro = writer.update_orderbook(
                         asset_id, bid_depth, ask_depth,
                     )
@@ -242,7 +242,24 @@ async def main():
 
     # 4. Register token mapping in RedisWriter + valid tokens in engine
     writer.register_token_mapping(registry._mapping)
+    # Register session-aware token mapping for future session orderbook writes
+    current_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
+    writer.register_session_tokens(registry.get_all_token_mapping(), current_sessions)
     engine.register_valid_tokens(list(registry._mapping.values()))
+
+    # Seed Redis with initial orderbook depth from REST discovery
+    initial_books = registry.pop_initial_books()
+    if initial_books:
+        from decimal import Decimal
+        for token_id, (bids, asks) in initial_books.items():
+            dec_bids = [(Decimal(str(p)), Decimal(str(s))) for p, s in bids]
+            dec_asks = [(Decimal(str(p)), Decimal(str(s))) for p, s in asks]
+            await writer.update_orderbook(token_id, dec_bids, dec_asks)
+            best_ask = min((p for p, _ in asks), default=None)
+            best_bid = max((p for p, _ in bids), default=None)
+            if best_ask is not None:
+                await writer.update_price(token_id, best_ask, best_bid)
+        log.info("Seeded Redis with %d initial orderbook(s) from REST", len(initial_books))
 
     # 5. Patch engine.dispatch_event to write Redis
     loop = asyncio.get_event_loop()
@@ -262,6 +279,9 @@ async def main():
         # Re-register mapping so new tokens get price writes.
         # Returns combos whose token_id rotated + the old token_ids.
         rotated, old_token_ids = writer.register_token_mapping(registry._mapping)
+        # Re-register session tokens with fresh data
+        fresh_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
+        writer.register_session_tokens(registry.get_all_token_mapping(), fresh_sessions)
         if rotated:
             # Clear stale Redis price keys immediately so the UI shows
             # "no data" instead of old prices while waiting for first
@@ -273,11 +293,30 @@ async def main():
             # Expire old books so pending LIMIT orders don't fill against
             # stale asks from the previous candle (e.g. $0.01 after RED).
             engine.invalidate_books(old_token_ids)
+
+        # Seed Redis with initial orderbook depth from REST fetch.
+        # Critical for M5: tokens rotate every 5 minutes and Polymarket WS
+        # may not send events for new tokens immediately, leaving Redis empty.
+        initial_books = registry.pop_initial_books()
+        if initial_books:
+            from decimal import Decimal
+            async def _seed():
+                for token_id, (bids, asks) in initial_books.items():
+                    dec_bids = [(Decimal(str(p)), Decimal(str(s))) for p, s in bids]
+                    dec_asks = [(Decimal(str(p)), Decimal(str(s))) for p, s in asks]
+                    await writer.update_orderbook(token_id, dec_bids, dec_asks)
+                    best_ask = min((p for p, _ in asks), default=None)
+                    best_bid = max((p for p, _ in bids), default=None)
+                    if best_ask is not None:
+                        await writer.update_price(token_id, best_ask, best_bid)
+            asyncio.ensure_future(_seed())
+
         log.info(
-            "TokenRegistry pushed %d new token(s)%s%s",
+            "TokenRegistry pushed %d new token(s)%s%s, seeded %d book(s)",
             len(ids),
             f", cleared {len(rotated)} stale price key(s)" if rotated else "",
             f", expired {len(old_token_ids)} old book(s)" if old_token_ids else "",
+            len(initial_books),
         )
 
     registry._on_new_tokens = on_new_tokens

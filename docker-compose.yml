@@ -132,9 +132,13 @@ services:
     build:
       context: ./ui
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8099/poly-arena}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
     image: poly-arena-test/ui
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8100/poly-arena
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8099/poly-arena}
+      - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-}
       - HOT_RELOAD=${HOT_RELOAD:-0}
     depends_on:
       - api-test

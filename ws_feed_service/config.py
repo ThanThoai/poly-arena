@@ -29,6 +29,11 @@ ORDERBOOK_DEPTH_LEVELS = 20         # Top N levels to publish per side
 
 STREAM_MAXLEN = 10_000              # XADD MAXLEN ~ for bracket exits
 
+# ── UI Future Sessions ──────────────────────────────────────────────────
+
+UI_FUTURE_SESSIONS = 2              # Number of future sessions to expose to UI
+UI_PAST_SESSIONS = 1                # Number of past sessions to keep for UI
+
 # ── Market constants ─────────────────────────────────────────────────────────
 
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]

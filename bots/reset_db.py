@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Reset toàn bộ DB về trạng thái ban đầu.
+Reset trades & balance — giữ nguyên bots và accounts.
 
-Xóa:
-  • Tất cả lệnh trong bảng binary_options
-  • Tất cả bot trong bảng bots
-  • Cache api_key tại bots/bots_config.json
+Thực hiện:
+  • Xóa toàn bộ bảng binary_options
+  • Xóa toàn bộ bảng balance_history
+  • Xóa toàn bộ bảng bot_achievements
+  • Reset balance của mỗi bot về initial_balance
+  • KHÔNG xóa bots hay users
 
 Usage:
     python bots/reset_db.py
@@ -21,37 +23,53 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sqlalchemy import text
 from database import SessionLocal, engine, Base
-
-CONFIG_FILE = Path(__file__).parent / "bots_config.json"
+from models import Bot
 
 
 def reset(skip_confirm: bool = False) -> None:
-    if not skip_confirm:
-        answer = input("Xóa toàn bộ dữ liệu DB? [y/N] ").strip().lower()
-        if answer != "y":
-            print("Hủy.")
-            return
-
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
     try:
+        bots = db.query(Bot).all()
+        if bots:
+            print(f"Tìm thấy {len(bots)} bot (sẽ giữ nguyên):")
+            for b in bots:
+                print(f"  • {b.bot_name}  balance: ${b.balance:,.2f} → ${b.initial_balance:,.2f}")
+
+        if not skip_confirm:
+            print()
+            answer = input(
+                "Xóa tất cả trades, balance history, achievements và reset balance?\n"
+                "Bots và users sẽ được giữ nguyên. [y/N] "
+            ).strip().lower()
+            if answer != "y":
+                print("Hủy.")
+                return
+
+        r_ach = db.execute(text("DELETE FROM bot_achievements"))
+        r_bh  = db.execute(text("DELETE FROM balance_history"))
         r_bo  = db.execute(text("DELETE FROM binary_options"))
-        r_bot = db.execute(text("DELETE FROM bots"))
+
+        for b in bots:
+            b.balance = b.initial_balance
+
         db.commit()
-        print(f"Đã xóa {r_bo.rowcount} lệnh, {r_bot.rowcount} bot.")
+
+        print()
+        print(f"✓ Đã xóa {r_bo.rowcount} lệnh")
+        print(f"✓ Đã xóa {r_bh.rowcount} balance history records")
+        print(f"✓ Đã xóa {r_ach.rowcount} achievements")
+        print(f"✓ Reset balance {len(bots)} bot về initial_balance")
+        print("✓ Bots và users được giữ nguyên")
+        print("\nDone.")
+
     finally:
         db.close()
 
-    if CONFIG_FILE.exists():
-        CONFIG_FILE.unlink()
-        print(f"Đã xóa cache api_key: {CONFIG_FILE}")
-
-    print("Done — DB sạch, sẵn sàng chạy lại.")
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reset toàn bộ DB PolyArena")
+    parser = argparse.ArgumentParser(description="Reset trades & balance, giữ nguyên bots & users")
     parser.add_argument("--yes", action="store_true", help="Bỏ qua xác nhận")
     args = parser.parse_args()
 

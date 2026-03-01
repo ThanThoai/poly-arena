@@ -1553,7 +1553,7 @@ function setPnlFilter(botName) {
 function renderBalanceLine() {
   const allBots     = allBotsData.map(b => b.bot_name).sort();
   const bots        = pnlBotFilter.size > 0 ? allBots.filter(b => pnlBotFilter.has(b)) : allBots;
-  const initBalance = (allBotsData[0]?.initial_balance) ?? 10000;
+  const initBalance = (allBotsData[0]?.initial_balance) ?? 1000;
   const intervalMs  = BALANCE_TF_MS[balanceTf] ?? BALANCE_TF_MS.H1;
   const stepMs      = intervalMs;
   const TF_WINDOW   = { M5: 6*60*60*1000, M15: 24*60*60*1000, H1: 7*24*60*60*1000 };

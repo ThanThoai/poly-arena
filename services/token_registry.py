@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -89,8 +90,12 @@ class TokenRegistry:
         # (symbol, timeframe, direction) → [token_id_1, ..., token_id_N]
         # future candles (index 0 = next candle, index 4 = 5th candle ahead)
         self._future_mapping: dict[tuple[str, str, str], list[str]] = {}
+        # token_id → candle_open_ts (session timestamp for each token)
+        self._token_sessions: dict[str, int] = {}
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # token_id → (bids, asks) from REST discovery — used to seed Redis
+        self._initial_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
 
     # ── Public helpers ────────────────────────────────────────────────────────
 
@@ -112,6 +117,37 @@ class TokenRegistry:
         for future_ids in self._future_mapping.values():
             ids.extend(future_ids)
         return list(dict.fromkeys(ids))
+
+    def get_all_token_mapping(self) -> dict[str, list[tuple[str, str, str, int]]]:
+        """
+        Return reverse map: token_id → [(sym, tf, dir, candle_ts), ...].
+
+        Includes both current and future tokens with their session timestamps.
+        """
+        result: dict[str, list[tuple[str, str, str, int]]] = {}
+        for (sym, tf, direction), token_id in self._mapping.items():
+            ts = self._token_sessions.get(token_id, 0)
+            result.setdefault(token_id, []).append((sym, tf, direction, ts))
+        for (sym, tf, direction), future_ids in self._future_mapping.items():
+            for token_id in future_ids:
+                ts = self._token_sessions.get(token_id, 0)
+                result.setdefault(token_id, []).append((sym, tf, direction, ts))
+        return result
+
+    def pop_initial_books(self) -> dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]]:
+        """Return and clear initial book data collected during discovery/refresh.
+
+        Returns: {token_id: (bids, asks)} where bids/asks are [(price, size), ...].
+        """
+        books = dict(self._initial_books)
+        self._initial_books.clear()
+        return books
+
+    def get_current_candle_open(self, tf: str) -> int:
+        """Return the candle-open timestamp for the current candle of the given timeframe."""
+        period_s = _TF_SECONDS[tf.upper()]
+        now = int(datetime.now(timezone.utc).timestamp())
+        return now - (now % period_s)
 
     # ── Initial discovery ─────────────────────────────────────────────────────
 
@@ -138,6 +174,14 @@ class TokenRegistry:
                                 key = (sym, tf, direction)
                                 self._mapping[key] = ob.token_id
                                 discovered.append(ob.token_id)
+                                # Store initial book depth for Redis seeding
+                                if ob.bids is not None and ob.asks is not None:
+                                    self._initial_books[ob.token_id] = (ob.bids, ob.asks)
+                                # Track session timestamp for current candle
+                                period_s = _TF_SECONDS[tf]
+                                now_ts = int(time.time())
+                                candle_open = now_ts - (now_ts % period_s)
+                                self._token_sessions[ob.token_id] = candle_open
                                 logger.info(
                                     "Token discovered: %s %s %s → %s",
                                     sym, tf, direction, ob.token_id[:24],
@@ -182,6 +226,8 @@ class TokenRegistry:
                 if token_id:
                     future_ids.append(token_id)
                     discovered.append(token_id)
+                    # Track session timestamp for future candle
+                    self._token_sessions[token_id] = ts
                     logger.info(
                         "Future token [+%d]: %s %s %s ts=%d → %s",
                         i + 1, sym, tf, direction, ts, token_id[:24],
@@ -346,6 +392,13 @@ class TokenRegistry:
                             key = (sym, tf, direction)
                             old_id = self._mapping.get(key)
                             self._mapping[key] = ob.token_id
+                            # Store initial book depth for Redis seeding
+                            if ob.bids is not None and ob.asks is not None:
+                                self._initial_books[ob.token_id] = (ob.bids, ob.asks)
+                            # Track session timestamp for rotated candle
+                            period_s = _TF_SECONDS[tf]
+                            now_epoch = int(time.time())
+                            self._token_sessions[ob.token_id] = now_epoch - (now_epoch % period_s)
                             local_ok = True
                             if ob.token_id != old_id:
                                 local_new.append(ob.token_id)

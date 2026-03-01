@@ -60,6 +60,8 @@ class OrderbookResult:
     min_ask: float
     max_bid: float
     token_id: str
+    bids: list[tuple[float, float]] | None = None  # [(price, size), ...]
+    asks: list[tuple[float, float]] | None = None
 
 
 def get_current_time_et():
@@ -85,7 +87,7 @@ def get_current_time_et():
 # Slug → token_ids cache (slug is stable for entire candle duration)
 # Shared across all PolymarketClient instances within the same process.
 _slug_cache: dict[str, list[str]] = {}
-_slug_cache_ts: dict[str, float] = {}   # slug → timestamp when cached
+_slug_cache_ts: dict[str, float] = {}  # slug → timestamp when cached
 _SLUG_CACHE_TTL = SLUG_CACHE_TTL_S
 
 
@@ -161,6 +163,19 @@ class PolymarketClient:
         max_bid = max(book["bids"], key=lambda x: float(x["price"]))
         return float(min_ask["price"]), float(max_bid["price"])
 
+    def _fetch_book_depth(self, token_id: str, levels: int = 20) -> tuple[float, float, list[tuple[float, float]], list[tuple[float, float]]]:
+        """Return (min_ask, max_bid, bid_depth, ask_depth) for the given token."""
+        resp = self._http.get(_CLOB_URL, params={"token_id": token_id})
+        resp.raise_for_status()
+        book = resp.json()
+        raw_bids = sorted(book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)[:levels]
+        raw_asks = sorted(book.get("asks", []), key=lambda x: float(x["price"]))[:levels]
+        bid_depth = [(float(l["price"]), float(l["size"])) for l in raw_bids]
+        ask_depth = [(float(l["price"]), float(l["size"])) for l in raw_asks]
+        min_ask = float(raw_asks[0]["price"]) if raw_asks else 0.0
+        max_bid = float(raw_bids[0]["price"]) if raw_bids else 0.0
+        return min_ask, max_bid, bid_depth, ask_depth
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def get_orderbook(
@@ -173,7 +188,7 @@ class PolymarketClient:
             symbol:        e.g. "ETH", "BTC"
             timeframe:     e.g. "5m", "15m", "1h"  (or "M5", "M15", "H1")
             status:        "UP" or "DOWN"
-            settlement_ts: Unix timestamp of the settlement candle.
+        settlement_ts: Unix timestamp of the settlement candle.
                            Defaults to the next candle boundary.
         """
         tf_norm = _TF_NORMALIZE.get(timeframe.upper(), timeframe.lower())
@@ -192,7 +207,7 @@ class PolymarketClient:
 
         ids = self._token_ids(slug)
         token_id = ids[_STATUS_INDEX[status]]
-        min_ask, max_bid = self._best_prices(token_id)
+        min_ask, max_bid, bid_depth, ask_depth = self._fetch_book_depth(token_id)
 
         return OrderbookResult(
             symbol=symbol.upper(),
@@ -201,10 +216,15 @@ class PolymarketClient:
             min_ask=min_ask,
             max_bid=max_bid,
             token_id=token_id,
+            bids=bid_depth,
+            asks=ask_depth,
         )
 
     def get_token_id(
-        self, symbol: str, timeframe: str, status: str,
+        self,
+        symbol: str,
+        timeframe: str,
+        status: str,
     ) -> str:
         """
         Resolve the current token_id for a symbol/timeframe/status combo

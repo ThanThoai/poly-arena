@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import os
 import time
 import sys
 
@@ -25,10 +26,54 @@ import requests
 # ── Config ───────────────────────────────────────────────────────────────────
 
 DEFAULT_API = "http://localhost:8099/poly-arena"
-BOT_API_KEY = "EDp6sJM7v45cs_vfgoRaAcaPjKgDrHT9jItPcR7YI0s"  # bot-scalper-9926
+TEST_USER = os.environ.get("TEST_USER", "test-trader")
+TEST_PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
+TEST_BOT_NAME = os.environ.get("TEST_BOT_NAME", "bot-scalper-9926")
 AMOUNT = 10.0
 POLL_INTERVAL = 2     # seconds between polls
 POLL_TIMEOUT = 30     # max seconds to wait for fill
+
+# Resolved at runtime via auth
+_BOT_API_KEY: str = ""
+
+
+# ── Auth helpers ─────────────────────────────────────────────────────────────
+
+def _register_or_login(api: str, username: str, password: str) -> str:
+    """Register or login, return JWT token."""
+    r = requests.post(f"{api}/auth/register", json={"username": username, "password": password}, timeout=10)
+    if r.status_code == 201:
+        return r.json()["access_token"]
+    if r.status_code == 409:
+        r = requests.post(f"{api}/auth/login", json={"username": username, "password": password}, timeout=10)
+        r.raise_for_status()
+        return r.json()["access_token"]
+    r.raise_for_status()
+    return ""
+
+
+def _get_or_create_bot(api: str, jwt: str, bot_name: str) -> str:
+    """Return api_key for an existing bot, or create one if needed."""
+    r = requests.get(f"{api}/bots/my", headers={"Authorization": f"Bearer {jwt}"}, timeout=10)
+    r.raise_for_status()
+    for bot in r.json():
+        if bot["bot_name"] == bot_name and bot.get("is_active", True):
+            print(f"[+] Reusing bot: {bot_name} (balance=${bot['balance']:.2f})")
+            return bot["api_key"]
+
+    # Not found — create
+    r = requests.post(f"{api}/bots/", json={"bot_name": bot_name}, headers={"Authorization": f"Bearer {jwt}"}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    print(f"[+] Created bot: {bot_name} (balance=${data['balance']:.2f})")
+    return data["api_key"]
+
+
+def _resolve_bot_api_key(api: str) -> str:
+    """Authenticate and resolve bot API key."""
+    jwt = _register_or_login(api, TEST_USER, TEST_PASSWORD)
+    return _get_or_create_bot(api, jwt, TEST_BOT_NAME)
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -36,7 +81,7 @@ def create_order(api: str, payload: dict) -> dict:
     resp = requests.post(
         f"{api}/binary-options/",
         json=payload,
-        headers={"X-API-Key": BOT_API_KEY},
+        headers={"X-API-Key": _BOT_API_KEY},
     )
     resp.raise_for_status()
     return resp.json()
@@ -45,7 +90,7 @@ def create_order(api: str, payload: dict) -> dict:
 def get_order(api: str, bo_id: int) -> dict:
     resp = requests.get(
         f"{api}/binary-options/{bo_id}",
-        headers={"X-API-Key": BOT_API_KEY},
+        headers={"X-API-Key": _BOT_API_KEY},
     )
     resp.raise_for_status()
     return resp.json()
@@ -222,14 +267,19 @@ def test_market_tp_sl(api: str) -> bool:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global _BOT_API_KEY
+
     parser = argparse.ArgumentParser(description="Test MARKET bracket orders")
     parser.add_argument("--api-url", default=DEFAULT_API)
     args = parser.parse_args()
     api = args.api_url
 
     print(f"API: {api}")
-    print(f"Bot: bot-scalper-9926")
+    print(f"User: {TEST_USER}")
+    print(f"Bot: {TEST_BOT_NAME}")
     print(f"Amount: {AMOUNT}")
+
+    _BOT_API_KEY = _resolve_bot_api_key(api)
 
     results = {}
     for name, fn in [

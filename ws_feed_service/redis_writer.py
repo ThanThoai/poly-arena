@@ -21,6 +21,8 @@ from ws_feed_service.config import (
     STREAM_ORDER_FILLS,
     STREAM_MARKET_RESOLVED,
     STREAM_MAXLEN,
+    UI_FUTURE_SESSIONS,
+    UI_PAST_SESSIONS,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,12 @@ class RedisWriter:
         self._r = redis_client
         # token_id → [(symbol, timeframe, direction)]
         self._token_map: dict[str, list[tuple[str, str, str]]] = {}
+        # Session-aware token map: token_id → [(sym, tf, dir, candle_ts)]
+        self._session_token_map: dict[str, list[tuple[str, str, str, int]]] = {}
+        # Current session timestamps: tf → candle_ts
+        self._current_sessions: dict[str, int] = {}
+        # Dedup cache: key → (bids_json, asks_json) to skip redundant writes
+        self._last_ob_json: dict[str, tuple[str, str]] = {}
 
     def register_token_mapping(
         self, mapping: dict[tuple[str, str, str], str]
@@ -54,6 +62,7 @@ class RedisWriter:
         }
 
         self._token_map.clear()
+        self._last_ob_json.clear()
         for (sym, tf, direction), token_id in mapping.items():
             self._token_map.setdefault(token_id, []).append((sym, tf, direction))
 
@@ -73,6 +82,46 @@ class RedisWriter:
             f", {len(rotated_combos)} key(s) rotated" if rotated_combos else "",
         )
         return rotated_combos, list(old_token_ids_set)
+
+    def register_session_tokens(
+        self,
+        all_mapping: dict[str, list[tuple[str, str, str, int]]],
+        current_sessions: dict[str, int],
+        max_future: int = UI_FUTURE_SESSIONS,
+        max_past: int = UI_PAST_SESSIONS,
+    ) -> None:
+        """
+        Build session-aware token map from TokenRegistry.get_all_token_mapping().
+
+        Keeps up to max_past past sessions + current + up to max_future future sessions.
+
+        all_mapping: token_id → [(sym, tf, dir, candle_ts), ...]
+        current_sessions: tf → current candle_ts
+        """
+        from config.timing import TF_SECONDS
+
+        self._current_sessions = dict(current_sessions)
+        self._session_token_map.clear()
+
+        for token_id, combos in all_mapping.items():
+            filtered: list[tuple[str, str, str, int]] = []
+            for sym, tf, direction, candle_ts in combos:
+                current_ts = current_sessions.get(tf, 0)
+                period = TF_SECONDS.get(tf, 300)
+                steps = (candle_ts - current_ts) // period if current_ts else 0
+                if steps < -max_past or steps > max_future:
+                    continue
+                filtered.append((sym, tf, direction, candle_ts))
+            if filtered:
+                self._session_token_map[token_id] = filtered
+
+        total_tokens = len(self._session_token_map)
+        total_combos = sum(len(v) for v in self._session_token_map.values())
+        logger.info(
+            "RedisWriter: session tokens registered — %d token(s) → %d combo(s) "
+            "(%d past + current + %d future)",
+            total_tokens, total_combos, max_past, max_future,
+        )
 
     async def update_price(
         self,
@@ -151,31 +200,88 @@ class RedisWriter:
         """
         Write top-N orderbook depth for all (sym, tf, dir) combos mapped to this token_id.
 
-        Key format: orderbook:{SYM}:{TF}:{DIR}
-        Hash fields: bids, asks, updated_at
+        Dual-write strategy:
+        - Current session tokens: write legacy key ``orderbook:{SYM}:{TF}:{DIR}``
+          (backward compat) AND session key ``orderbook:{SYM}:{TF}:{DIR}:{candle_ts}``
+        - Future session tokens: write ONLY session key
 
         bids/asks are JSON arrays of [price, size] pairs (already sorted by caller).
         """
-        combos = self._token_map.get(token_id)
-        if not combos:
+        # Need at least one map to have combos for this token
+        legacy_combos = self._token_map.get(token_id)
+        session_combos = self._session_token_map.get(token_id)
+        if not legacy_combos and not session_combos:
             return
 
-        now_ts = str(time.time())
         bids_json = json.dumps([[float(p), float(s)] for p, s in bids])
         asks_json = json.dumps([[float(p), float(s)] for p, s in asks])
 
+        # Skip write if orderbook data is unchanged
+        cached = self._last_ob_json.get(token_id)
+        if cached is not None and cached == (bids_json, asks_json):
+            return
+        self._last_ob_json[token_id] = (bids_json, asks_json)
+
+        now_ts = str(time.time())
+        ob_mapping = {
+            "bids": bids_json,
+            "asks": asks_json,
+            "updated_at": now_ts,
+        }
         pipe = self._r.pipeline(transaction=False)
-        for sym, tf, direction in combos:
-            key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
-            pipe.hset(key, mapping={
-                "bids": bids_json,
-                "asks": asks_json,
-                "updated_at": now_ts,
-            })
-            pipe.expire(key, PRICE_CACHE_TTL_S)
+
+        # Track which (sym, tf, dir) already got a session-keyed write
+        # to avoid double-publish for current session
+        written_session_keys: set[str] = set()
+
+        # ── Session-keyed writes (current + future) ──
+        if session_combos:
+            for sym, tf, direction, candle_ts in session_combos:
+                session_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_ts}"
+                pipe.hset(session_key, mapping=ob_mapping)
+                pipe.expire(session_key, PRICE_CACHE_TTL_S)
+                written_session_keys.add(f"{sym}:{tf}:{direction}:{candle_ts}")
+
+        # ── Legacy writes (current session only, backward compat) ──
+        if legacy_combos:
+            for sym, tf, direction in legacy_combos:
+                key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
+                pipe.hset(key, mapping=ob_mapping)
+                pipe.expire(key, PRICE_CACHE_TTL_S)
 
         try:
             await pipe.execute()
+
+            # Publish change notifications for WebSocket subscribers
+            # Legacy combos: publish without session (backward compat)
+            if legacy_combos:
+                for sym, tf, direction in legacy_combos:
+                    payload = json.dumps({
+                        "symbol": sym,
+                        "timeframe": tf,
+                        "direction": direction,
+                        "bids": bids_json,
+                        "asks": asks_json,
+                        "updated_at": now_ts,
+                    })
+                    await self._r.publish("orderbook:updates", payload)
+
+            # Session combos: publish with session field for future sessions
+            if session_combos:
+                for sym, tf, direction, candle_ts in session_combos:
+                    current_ts = self._current_sessions.get(tf, 0)
+                    if candle_ts == current_ts:
+                        continue  # already published via legacy path
+                    payload = json.dumps({
+                        "symbol": sym,
+                        "timeframe": tf,
+                        "direction": direction,
+                        "session": candle_ts,
+                        "bids": bids_json,
+                        "asks": asks_json,
+                        "updated_at": now_ts,
+                    })
+                    await self._r.publish("orderbook:updates", payload)
         except Exception as exc:
             logger.error("RedisWriter.update_orderbook failed: %s", exc)
 

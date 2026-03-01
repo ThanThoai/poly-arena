@@ -58,46 +58,51 @@ REASONS = [
 BOT_PROFILES = [
     {
         "suffix": "aggressive",
-        "amount_range": (50, 500),
+        "amount_range": (10, 80),
         "limit_pct": 0.15,       # ít dùng limit
         "bracket_pct": 0.70,     # hay dùng bracket
         "ttl_pct": 0.10,
+        "next_session_pct": 0.40,  # 40% lệnh đặt cho phiên A+1
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
     {
         "suffix": "conservative",
-        "amount_range": (5, 100),
+        "amount_range": (5, 30),
         "limit_pct": 0.50,       # hay dùng limit
         "bracket_pct": 0.80,     # luôn có bracket
         "ttl_pct": 0.40,         # hay set TTL
+        "next_session_pct": 0.50,  # conservative hay đặt trước
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
     {
         "suffix": "scalper",
-        "amount_range": (10, 150),
+        "amount_range": (5, 25),
         "limit_pct": 0.30,
         "bracket_pct": 0.50,
         "ttl_pct": 0.60,         # scalper hay dùng TTL ngắn
+        "next_session_pct": 0.30,  # scalper đặt A+1 vừa phải
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
     {
         "suffix": "whale",
-        "amount_range": (200, 800),
+        "amount_range": (30, 100),
         "limit_pct": 0.40,
         "bracket_pct": 0.60,
         "ttl_pct": 0.20,
+        "next_session_pct": 0.45,
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
     {
         "suffix": "random-m5",
-        "amount_range": (10, 300),
+        "amount_range": (5, 50),
         "limit_pct": 0.30,
         "bracket_pct": 0.40,
         "ttl_pct": 0.30,
+        "next_session_pct": 0.35,
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
@@ -157,6 +162,10 @@ def build_trade(profile: dict, best_ask: float | None = None) -> dict:
             p["ttl"] = random.choice([15, 30, 60])
         else:
             p["ttl"] = random.choice([30, 60, 120, 180, 300])
+
+    # Next-session order (A+1)
+    if random.random() < profile.get("next_session_pct", 0):
+        p["session_offset"] = 1
 
     # ~50% chance reason
     if random.random() > 0.5:
@@ -264,8 +273,9 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
         elif payload.get("sl_price"):
             condition = f" [SL={payload['sl_price']}]"
         ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
+        session_str = " [A+1]" if payload.get("session_offset") else ""
         log.info(
-            "%s Trade #%d: %s %s %s %s $%.2f → avg=%.4f shares=%.2f%s%s",
+            "%s Trade #%d: %s %s %s %s $%.2f → avg=%.4f shares=%.2f%s%s%s",
             bot_name,
             data["id"],
             otype,
@@ -277,6 +287,7 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
             data.get("num_shares") or 0,
             condition,
             ttl_str,
+            session_str,
         )
     else:
         log.warning("%s Trade failed (%d): %s", bot_name, r.status_code, r.text[:200])
@@ -312,7 +323,8 @@ def run_batch(api_key: str, bot_name: str, profile: dict, count: int) -> None:
         has_tp = "TP" if payload.get("tp_price") else ""
         has_sl = "SL" if payload.get("sl_price") else ""
         has_ttl = f"TTL={payload['ttl']}s" if payload.get("ttl") else ""
-        extras = "+".join(filter(None, [has_tp, has_sl, has_ttl]))
+        has_a1 = "A+1" if payload.get("session_offset") else ""
+        extras = "+".join(filter(None, [has_tp, has_sl, has_ttl, has_a1]))
         if extras:
             extras = f" +{extras}"
         log.info(

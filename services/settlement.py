@@ -60,20 +60,26 @@ _NULL_SETTLE_THRESHOLD = timedelta(hours=NULL_SETTLE_THRESHOLD_HOURS)
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
 
-def calc_settlement_time(timeframe: str, trade_time: datetime) -> datetime | None:
+def calc_settlement_time(timeframe: str, trade_time: datetime, session_offset: int = 0) -> datetime | None:
     """
-    Return the UTC close time of the NEXT full candle after trade_time.
+    Return the UTC close time of the current candle containing trade_time.
 
-    Example (M5, trade at 14:23:15):
-      next candle open  = 14:25:00
-      next candle close = 14:30:00  ← settlement_at
+    session_offset=0 → current candle close (default)
+    session_offset=1 → next candle close (one candle further)
+
+    Example (M5, trade at 14:23:15, offset=0):
+      current candle = 14:20 – 14:25
+      settlement_at  = 14:25:00  ← close of current candle
+
+    Example (M5, trade at 14:23:15, offset=1):
+      settlement_at = 14:30:00  ← close of next candle
     """
     interval_ms = _TF_MS.get(timeframe)
     if interval_ms is None:
         return None
 
     trade_ms  = int(trade_time.timestamp() * 1_000)
-    settle_ms = (trade_ms // interval_ms + 1) * interval_ms
+    settle_ms = (trade_ms // interval_ms + 1 + session_offset) * interval_ms
     return datetime.fromtimestamp(settle_ms / 1_000, tz=timezone.utc)
 
 

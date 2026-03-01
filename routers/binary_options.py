@@ -17,7 +17,7 @@ from services.settlement import calc_settlement_time
 from services.polymarket import PolymarketClient
 from config.timing import (
     HTTP_TIMEOUT, HTTP_TIMEOUT_FAST,
-    API_PRICE_CACHE_TTL_S, API_ORDERBOOK_CACHE_TTL_S,
+    API_PRICE_CACHE_TTL_S,
 )
 from ws_feed_service.config import (
     PRICE_KEY_PREFIX, STALE_THRESHOLD_S, QUEUE_ORDERS_NEW,
@@ -42,6 +42,22 @@ _FORECAST_TO_STATUS = {"GREEN": "UP", "RED": "DOWN"}
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
+
+_TF_PERIOD_S = {"M5": 300, "M15": 900, "H1": 3600}
+
+
+def _resolve_future_token(
+    pm: PolymarketClient, symbol: str, tf: str, direction: str, session_offset: int,
+) -> Optional[str]:
+    """Compute future settlement_ts and resolve token_id via REST for next-session orders."""
+    period = _TF_PERIOD_S.get(tf)
+    if period is None or session_offset == 0:
+        return None
+    now = int(time.time())
+    current_open = now - (now % period)
+    future_ts = current_open + period * session_offset
+    pm_status = _FORECAST_TO_STATUS[direction]
+    return pm.get_token_id_at(symbol, tf, pm_status, future_ts)
 
 def _compute_stats(items: list):
     wins    = sum(1 for b in items if b.result == BOResult.WIN)
@@ -214,6 +230,7 @@ _DEFAULT_SLIPPAGE_TOLERANCE = 0.10  # 10%
 def _try_fill_limit_from_rest(
     symbol: str, timeframe: str, pm_status: str,
     amount: float, limit_price: float,
+    token_id_override: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[Tuple[float, float, list]]]:
     """
     Check Polymarket REST for current asks and try to fill a LIMIT BUY.
@@ -222,13 +239,16 @@ def _try_fill_limit_from_rest(
     Returns (token_id, None) if can't fill now but token_id was resolved.
     Returns (None, None) if Polymarket REST is unavailable.
     """
-    try:
-        with PolymarketClient() as pm:
-            ob = pm.get_orderbook(symbol, timeframe, pm_status)
-            token_id = ob.token_id
-    except Exception as e:
-        logger.warning("LIMIT REST check failed (Polymarket unavailable): %s", e)
-        return None, None
+    if token_id_override:
+        token_id = token_id_override
+    else:
+        try:
+            with PolymarketClient() as pm:
+                ob = pm.get_orderbook(symbol, timeframe, pm_status)
+                token_id = ob.token_id
+        except Exception as e:
+            logger.warning("LIMIT REST check failed (Polymarket unavailable): %s", e)
+            return None, None
 
     try:
         resp = httpx.get(
@@ -307,6 +327,7 @@ def _try_fill_limit_from_rest(
 def _fill_market_from_rest(
     symbol: str, timeframe: str, pm_status: str,
     amount: float, slippage_tolerance: Optional[float],
+    token_id_override: Optional[str] = None,
 ) -> Tuple[float, float, str, list]:
     """
     Fetch full orderbook from Polymarket REST, simulate MARKET BUY fill.
@@ -315,12 +336,15 @@ def _fill_market_from_rest(
     """
     tolerance = slippage_tolerance if slippage_tolerance is not None else _DEFAULT_SLIPPAGE_TOLERANCE
 
-    try:
-        with PolymarketClient() as pm:
-            ob = pm.get_orderbook(symbol, timeframe, pm_status)
-            token_id = ob.token_id
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Polymarket unavailable: {e}")
+    if token_id_override:
+        token_id = token_id_override
+    else:
+        try:
+            with PolymarketClient() as pm:
+                ob = pm.get_orderbook(symbol, timeframe, pm_status)
+                token_id = ob.token_id
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Polymarket unavailable: {e}")
 
     # Fetch full book
     try:
@@ -488,7 +512,30 @@ def create_bo(
     entry_price: float
 
     has_bracket = payload.tp_price is not None or payload.sl_price is not None
-    settlement_at = calc_settlement_time(payload.timeframe, datetime.now(timezone.utc))
+    session_offset = payload.session_offset or 0
+    settlement_at = calc_settlement_time(
+        payload.timeframe, datetime.now(timezone.utc), session_offset=session_offset,
+    )
+
+    # ── Next-session token resolution ──────────────────────────────────────
+    future_token_id: Optional[str] = None
+    if session_offset > 0:
+        try:
+            with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm_future:
+                future_token_id = _resolve_future_token(
+                    pm_future, payload.symbol.value, payload.timeframe.value,
+                    payload.forecast.value, session_offset,
+                )
+        except Exception as exc:
+            logger.warning("Future token resolution failed: %s", exc)
+
+        if not future_token_id:
+            # Refund balance and reject
+            bot.balance = round(bot.balance + payload.amount, 8)
+            raise HTTPException(
+                status_code=503,
+                detail="Future session market not available yet on Polymarket",
+            )
 
     if is_limit:
         # ── LIMIT order: two-phase flow ─────────────────────────────────────
@@ -500,6 +547,7 @@ def create_bo(
         token_id, rest_fill = _try_fill_limit_from_rest(
             payload.symbol.value, payload.timeframe.value, pm_status,
             payload.amount, entry_price,
+            token_id_override=future_token_id,
         )
 
         if rest_fill is not None:
@@ -545,6 +593,7 @@ def create_bo(
                 tp_price          = payload.tp_price,
                 sl_price          = payload.sl_price,
                 ttl               = payload.ttl,
+                session_offset    = session_offset,
                 me_order_status   = "FILLED" if has_bracket else None,
                 walk_prices       = {"entry": walk_levels} if walk_levels else None,
                 traces            = limit_traces if limit_traces else None,
@@ -646,6 +695,7 @@ def create_bo(
                 tp_price          = payload.tp_price,
                 sl_price          = payload.sl_price,
                 ttl               = payload.ttl,
+                session_offset    = session_offset,
                 me_order_status   = "PENDING",
                 traces            = pending_traces if pending_traces else None,
             )
@@ -703,6 +753,7 @@ def create_bo(
         avg_price, num_shares, token_id, walk_levels = _fill_market_from_rest(
             payload.symbol.value, payload.timeframe.value, pm_status,
             payload.amount, payload.slippage_tolerance,
+            token_id_override=future_token_id,
         )
         ask_fetched_at = datetime.now(timezone.utc)
         price_source = "rest"
@@ -743,6 +794,7 @@ def create_bo(
             tp_price          = payload.tp_price,
             sl_price          = payload.sl_price,
             ttl               = payload.ttl,
+            session_offset    = session_offset,
             # MARKET+bracket → "PREFILLED" (ME monitors TP/SL only)
             # MARKET without bracket → None (scheduler settles)
             me_order_status   = "PREFILLED" if has_bracket else None,
@@ -993,64 +1045,6 @@ def engine_status():
 
 _OB_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 _OB_DIRECTIONS = ["UP", "DOWN"]
-_OB_CACHE_TTL = API_ORDERBOOK_CACHE_TTL_S
-_ob_cache: dict = {}  # key: "SYM:TF:DIR" → {"bids": [...], "asks": [...], "fetched_at": float}
-
-
-def _fetch_orderbooks_rest(combos: set[tuple[str, str, str]]) -> dict[tuple[str, str, str], dict]:
-    """Fetch orderbooks from Polymarket REST API for multiple combos, with caching."""
-    import httpx
-
-    now = time.time()
-    results: dict[tuple[str, str, str], dict] = {}
-    to_fetch: list[tuple[str, str, str]] = []
-
-    for combo in combos:
-        cache_key = f"{combo[0]}:{combo[1]}:{combo[2]}"
-        cached = _ob_cache.get(cache_key)
-        if cached and now - cached["fetched_at"] < _OB_CACHE_TTL:
-            results[combo] = cached
-        else:
-            to_fetch.append(combo)
-
-    if not to_fetch:
-        return results
-
-    try:
-        with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm:
-            for sym, tf, dir_ in to_fetch:
-                try:
-                    ob = pm.get_orderbook(sym, tf, dir_)
-                    resp = httpx.get(
-                        "https://clob.polymarket.com/book",
-                        params={"token_id": ob.token_id},
-                        timeout=HTTP_TIMEOUT_FAST,
-                    )
-                    resp.raise_for_status()
-                    book = resp.json()
-                    bids = sorted(
-                        [[float(l["price"]), float(l["size"])] for l in book.get("bids", [])],
-                        key=lambda x: x[0], reverse=True,
-                    )[:20]
-                    asks = sorted(
-                        [[float(l["price"]), float(l["size"])] for l in book.get("asks", [])],
-                        key=lambda x: x[0],
-                    )[:20]
-                    entry = {
-                        "bids": bids,
-                        "asks": asks,
-                        "fetched_at": now,
-                        "updated_at": str(now),
-                    }
-                    cache_key = f"{sym}:{tf}:{dir_}"
-                    _ob_cache[cache_key] = entry
-                    results[(sym, tf, dir_)] = entry
-                except Exception as exc:
-                    logger.debug("REST orderbook fetch failed for %s/%s/%s: %s", sym, tf, dir_, exc)
-    except Exception as exc:
-        logger.warning("PolymarketClient error in orderbook fallback: %s", exc)
-
-    return results
 
 
 @router.get("/engine/orderbook")
@@ -1062,8 +1056,8 @@ def engine_orderbook(
     """
     Return orderbook depth (bid/ask levels).
 
-    Primary source: Redis (written by ws_feed_service on every book update).
-    Fallback: Polymarket REST API for combos missing from Redis.
+    Source: Redis only (written by ws_feed_service from Polymarket WebSocket).
+    No REST API fallback — all data comes from the live WS feed.
     Optional filters: symbol, timeframe, direction.
     """
     from services.redis_client import get_sync_redis
@@ -1072,33 +1066,27 @@ def engine_orderbook(
     target_tfs = [timeframe.upper()] if timeframe else ["M5", "M15", "H1"]
     target_dirs = [direction.upper()] if direction else _OB_DIRECTIONS
 
-    # Track which combos we need
-    needed: set[tuple[str, str, str]] = {
+    # Build deterministic key list from filters
+    combo_list = [
         (s, t, d) for s in target_syms for t in target_tfs for d in target_dirs
-    }
+    ]
 
     orderbooks = []
 
-    # 1. Try Redis first
     try:
         sr = get_sync_redis()
-        keys = sr.keys(f"{ORDERBOOK_KEY_PREFIX}:*")
-        for key in keys:
-            parts = key.split(":")
-            if len(parts) != 4:
-                continue
-            _, sym, tf, dir_ = parts
-            combo = (sym, tf, dir_)
-            if combo not in needed:
-                continue
+        pipe = sr.pipeline(transaction=False)
+        for sym, tf, dir_ in combo_list:
+            pipe.hgetall(f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{dir_}")
+        results = pipe.execute()
 
-            data = sr.hgetall(key)
+        for combo, data in zip(combo_list, results):
             if not data:
                 continue
-
             bids = json.loads(data.get("bids", "[]"))
             asks = json.loads(data.get("asks", "[]"))
             if bids or asks:
+                sym, tf, dir_ = combo
                 orderbooks.append({
                     "symbol": sym,
                     "timeframe": tf,
@@ -1107,23 +1095,8 @@ def engine_orderbook(
                     "asks": asks,
                     "updated_at": data.get("updated_at"),
                 })
-                needed.discard(combo)
     except Exception as exc:
         logger.warning("engine_orderbook Redis read failed: %s", exc)
-
-    # 2. Fallback to REST for missing combos
-    if needed:
-        rest_results = _fetch_orderbooks_rest(needed)
-        for (sym, tf, dir_), entry in rest_results.items():
-            if entry["bids"] or entry["asks"]:
-                orderbooks.append({
-                    "symbol": sym,
-                    "timeframe": tf,
-                    "direction": dir_,
-                    "bids": entry["bids"],
-                    "asks": entry["asks"],
-                    "updated_at": entry["updated_at"],
-                })
 
     return {"orderbooks": orderbooks}
 
