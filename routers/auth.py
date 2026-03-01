@@ -77,13 +77,14 @@ def update_settings(
 
 @router.get("/me", response_model=UserResponse)
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    allocated = (
+    user_bots = (
         db.query(Bot)
         .filter(Bot.user_id == user.id)
-        .with_entities(Bot.initial_balance)
+        .with_entities(Bot.initial_balance, Bot.balance)
         .all()
     )
-    allocated_balance = sum(row[0] or 0 for row in allocated)
+    allocated_balance = sum(row[0] or 0 for row in user_bots)
+    total_balance = sum(row[1] or 0 for row in user_bots)
     available_balance = (user.initial_balance or 0) - allocated_balance
 
     return UserResponse(
@@ -93,4 +94,6 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
         initial_balance=user.initial_balance or 0,
         allocated_balance=allocated_balance,
         available_balance=available_balance,
+        total_balance=round(total_balance, 2),
+        total_pnl=round(total_balance - allocated_balance, 2),
     )

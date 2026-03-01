@@ -1,12 +1,22 @@
 """
-Test bot — chạy đồng thời nhiều bot, mỗi bot tạo random trades mỗi 5 phút.
-Khi khởi động sẽ tạo N bot (mặc định 4), mỗi bot chạy trong 1 thread riêng.
-Mỗi bot có phong cách giao dịch riêng (aggressive, conservative, scalper, mixed).
+Test bot — chạy đồng thời nhiều user, mỗi user có nhiều bot với balance khác nhau.
+Mỗi bot chạy trong 1 thread riêng, tạo random trades mỗi 5 phút.
+Mỗi bot có phong cách giao dịch riêng (aggressive, conservative, scalper, whale, random).
+
+Khi khởi động:
+  1. Tạo/login NUM_USERS user (mặc định 2)
+  2. Mỗi user có BOTS_PER_USER bot (mặc định 5) với balance random
+  3. Nếu user đã tồn tại → login lại, reuse bot cũ
 
 v2 changes:
   - Single Condition Policy: only TP or SL, not both
   - TP/SL must pass pre-validation: TP > best_ask, SL < best_ask
   - Bot creation requires JWT auth (register/login first)
+
+v3 changes:
+  - Multi-user support: NUM_USERS users, each with BOTS_PER_USER bots
+  - Random initial_balance per bot (configurable range)
+  - Reuse existing users and bots on restart
 """
 
 import os
@@ -23,11 +33,25 @@ logging.basicConfig(
 log = logging.getLogger("test-bot")
 
 BASE = os.environ.get("API_URL", "http://localhost:8099/poly-arena")
-NUM_BOTS = int(os.environ.get("NUM_BOTS", "5"))
+NUM_USERS = int(os.environ.get("NUM_USERS", "2"))
+BOTS_PER_USER = int(os.environ.get("BOTS_PER_USER", "5"))
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))  # 5 phút
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
-TEST_USER = os.environ.get("TEST_USER", "test-trader")
-TEST_PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
+PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
+
+# Balance range for new bots (random between these values)
+BOT_BALANCE_MIN = int(os.environ.get("BOT_BALANCE_MIN", "200"))
+BOT_BALANCE_MAX = int(os.environ.get("BOT_BALANCE_MAX", "2000"))
+
+# User names — generate from env or use defaults
+USER_NAMES = os.environ.get("USER_NAMES", "").strip()
+if USER_NAMES:
+    USER_LIST = [n.strip() for n in USER_NAMES.split(",") if n.strip()]
+else:
+    USER_LIST = [f"trader-{i+1}" for i in range(NUM_USERS)]
+# Ensure we have enough names
+while len(USER_LIST) < NUM_USERS:
+    USER_LIST.append(f"trader-{len(USER_LIST)+1}")
 
 SYMBOLS = ["BTC"]
 TIMEFRAMES = ["M5"]
@@ -163,9 +187,19 @@ def build_trade(profile: dict, best_ask: float | None = None) -> dict:
         else:
             p["ttl"] = random.choice([30, 60, 120, 180, 300])
 
-    # Next-session order (A+1)
+    # Next-session order (A+1) — use timestamp to target the next candle boundary
     if random.random() < profile.get("next_session_pct", 0):
-        p["session_offset"] = 1
+        tf = p["timeframe"]
+        period = {"M5": 300, "M15": 900, "H1": 3600}.get(tf, 300)
+        now_ts = int(time.time())
+        current_open = now_ts - (now_ts % period)
+        next_open = current_open + period
+        # Use timestamp (next candle boundary) instead of session_offset
+        # e.g. at 14:29:54, timestamp=14:30:00 → order effective in 14:30 session
+        if random.random() < 0.5:
+            p["timestamp"] = next_open
+        else:
+            p["session_offset"] = 1
 
     # ~50% chance reason
     if random.random() > 0.5:
@@ -239,12 +273,12 @@ def fetch_my_bots(jwt_token: str) -> list[dict]:
     return bots
 
 
-def create_bot(bot_name: str, jwt_token: str) -> str:
+def create_bot(bot_name: str, jwt_token: str, initial_balance: float = 1000.0) -> str:
     """Tạo bot (authenticated via JWT), trả về api_key."""
-    log.info("Creating bot '%s' ...", bot_name)
+    log.info("Creating bot '%s' (balance=$%.0f) ...", bot_name, initial_balance)
     r = requests.post(
         f"{BASE}/bots/",
-        json={"bot_name": bot_name},
+        json={"bot_name": bot_name, "initial_balance": initial_balance},
         headers={"Authorization": f"Bearer {jwt_token}"},
         timeout=10,
     )
@@ -273,7 +307,7 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
         elif payload.get("sl_price"):
             condition = f" [SL={payload['sl_price']}]"
         ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
-        session_str = " [A+1]" if payload.get("session_offset") else ""
+        session_str = " [A+1]" if payload.get("session_offset") else (f" [TS={payload['timestamp']}]" if payload.get("timestamp") else "")
         log.info(
             "%s Trade #%d: %s %s %s %s $%.2f → avg=%.4f shares=%.2f%s%s%s",
             bot_name,
@@ -323,7 +357,7 @@ def run_batch(api_key: str, bot_name: str, profile: dict, count: int) -> None:
         has_tp = "TP" if payload.get("tp_price") else ""
         has_sl = "SL" if payload.get("sl_price") else ""
         has_ttl = f"TTL={payload['ttl']}s" if payload.get("ttl") else ""
-        has_a1 = "A+1" if payload.get("session_offset") else ""
+        has_a1 = "A+1" if payload.get("session_offset") else ("TS=" + str(payload["timestamp"]) if payload.get("timestamp") else "")
         extras = "+".join(filter(None, [has_tp, has_sl, has_ttl, has_a1]))
         if extras:
             extras = f" +{extras}"
@@ -369,7 +403,7 @@ def bot_loop(bot_name: str, api_key: str, profile: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# User setup — tạo/login user và setup bots
 # ---------------------------------------------------------------------------
 
 
@@ -381,30 +415,31 @@ def _match_profile(bot_name: str) -> dict:
     return random.choice(BOT_PROFILES)
 
 
-def main():
-    if not wait_for_api():
-        return
+def setup_user(username: str) -> list[tuple[str, str, dict]]:
+    """
+    Setup 1 user: register/login → fetch existing bots → create new bots if needed.
 
-    # Step 1: Register or login test user
+    Returns list of (bot_name, api_key, profile) tuples ready for bot_loop.
+    """
+    # Step 1: Register or login
     try:
-        jwt_token = register_or_login_user(TEST_USER, TEST_PASSWORD)
+        jwt_token = register_or_login_user(username, PASSWORD)
     except Exception as e:
-        log.error("Failed to register/login user '%s': %s", TEST_USER, e)
-        return
+        log.error("Failed to register/login user '%s': %s", username, e)
+        return []
 
-    # Step 2: Fetch existing bots for this user
+    # Step 2: Fetch existing bots
     existing_bots: list[dict] = []
     try:
         existing_bots = fetch_my_bots(jwt_token)
     except Exception as e:
-        log.warning("Failed to fetch existing bots: %s — will create new ones", e)
+        log.warning("[%s] Failed to fetch existing bots: %s — will create new ones", username, e)
 
-    # Step 3: Reuse existing bots, create new ones only if needed
-    bot_slots: list[tuple[str, str, dict]] = []  # (name, api_key, profile)
+    # Step 3: Reuse existing active bots (up to BOTS_PER_USER)
+    bot_slots: list[tuple[str, str, dict]] = []
 
-    # Reuse active existing bots (up to NUM_BOTS)
     for bot_data in existing_bots:
-        if len(bot_slots) >= NUM_BOTS:
+        if len(bot_slots) >= BOTS_PER_USER:
             break
         if not bot_data.get("is_active", True):
             continue
@@ -412,25 +447,59 @@ def main():
         api_key = bot_data["api_key"]
         profile = _match_profile(name)
         bot_slots.append((name, api_key, profile))
-        log.info("Reusing existing bot: %s (style=%s)", name, profile["suffix"])
+        log.info("[%s] Reusing bot: %s (style=%s, balance=$%.0f)",
+                 username, name, profile["suffix"], bot_data.get("balance", 0))
 
-    # Create additional bots if we need more
-    for i in range(len(bot_slots), NUM_BOTS):
+    # Step 4: Create additional bots with random balances
+    for i in range(len(bot_slots), BOTS_PER_USER):
         profile = BOT_PROFILES[i % len(BOT_PROFILES)]
-        bot_name = f"bot-{profile['suffix']}-{random.randint(1000, 9999)}"
+        bot_name = f"{username}-{profile['suffix']}"
+        balance = random.randint(BOT_BALANCE_MIN, BOT_BALANCE_MAX)
+        # Round to nice numbers (nearest 50)
+        balance = round(balance / 50) * 50
+        balance = max(BOT_BALANCE_MIN, balance)
         try:
-            api_key = create_bot(bot_name, jwt_token)
+            api_key = create_bot(bot_name, jwt_token, initial_balance=balance)
             bot_slots.append((bot_name, api_key, profile))
         except Exception as e:
-            log.error("Failed to create bot '%s': %s", bot_name, e)
+            log.error("[%s] Failed to create bot '%s': %s", username, bot_name, e)
 
-    if not bot_slots:
-        log.error("No bots available, exiting")
+    reused = min(len(existing_bots), BOTS_PER_USER)
+    created = len(bot_slots) - reused
+    log.info(
+        "[%s] Setup complete: %d bot(s) (%d reused, %d new)",
+        username, len(bot_slots), reused, created,
+    )
+
+    return bot_slots
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    if not wait_for_api():
         return
 
-    # Step 4: Launch bot threads
+    # Setup all users and collect bot slots
+    all_bot_slots: list[tuple[str, str, dict]] = []
+
+    for i in range(NUM_USERS):
+        username = USER_LIST[i]
+        log.info("=" * 60)
+        log.info("Setting up user %d/%d: %s", i + 1, NUM_USERS, username)
+        slots = setup_user(username)
+        all_bot_slots.extend(slots)
+
+    if not all_bot_slots:
+        log.error("No bots available across all users, exiting")
+        return
+
+    # Launch bot threads
     threads = []
-    for bot_name, api_key, profile in bot_slots:
+    for bot_name, api_key, profile in all_bot_slots:
         t = threading.Thread(
             target=bot_loop,
             args=(bot_name, api_key, profile),
@@ -442,10 +511,8 @@ def main():
         log.info("Thread started for %s (%s)", bot_name, profile["suffix"])
 
     log.info(
-        "All %d bots running (%d reused, %d new). Press Ctrl+C to stop.",
-        len(threads),
-        min(len(existing_bots), NUM_BOTS),
-        max(0, len(threads) - min(len(existing_bots), NUM_BOTS)),
+        "All %d bots across %d users running. Press Ctrl+C to stop.",
+        len(threads), NUM_USERS,
     )
 
     # Keep main thread alive

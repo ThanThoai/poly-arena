@@ -157,6 +157,16 @@ class BalanceHistoryResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class UserBalanceHistoryResponse(BaseModel):
+    id:          int
+    user_id:     int
+    balance:     float
+    trade_id:    Optional[int] = None
+    recorded_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
 class BotCreate(BaseModel):
     bot_name: str
     initial_balance: float = 1000.0
@@ -188,6 +198,7 @@ class BotPublic(BaseModel):
     balance:         float
     user_id:         Optional[int] = None
     owner_name:      Optional[str] = None
+    user_initial_balance: Optional[float] = None  # user's total pool balance
     created_at:      Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -218,6 +229,8 @@ class UserResponse(BaseModel):
     initial_balance: float
     allocated_balance: float
     available_balance: float
+    total_balance: float = 0.0       # sum of current bot balances
+    total_pnl: float = 0.0           # total_balance - allocated_balance
 
     model_config = {"from_attributes": True}
 

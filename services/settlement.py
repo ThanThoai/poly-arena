@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from models import BalanceHistory, BinaryOption, Bot, BOResult
+from services.user_balance import record_user_balance
 from config.timing import (
     HTTP_TIMEOUT,
     STUCK_ORDER_THRESHOLD_MIN,
@@ -208,18 +209,39 @@ def _settle_single_trade(
     else:
         # Binary settlement formula — no bracket fired, use candle direction
         # num_shares reflects actual filled qty (updated by fill consumer)
+        if bo.avg_price is None or bo.num_shares is None:
+            # Missing fill data — this order was never properly filled.
+            # Cancel with full refund instead of guessing profit.
+            logger.warning(
+                "%sTrade #%d has NULL avg_price/num_shares at settlement — "
+                "cancelling with refund (amount=%.8f)",
+                prefix, bo.id, bo.amount,
+            )
+            bo.result = BOResult.CANCELLED
+            bo.profit = 0.0
+            bo.price_open = open_price
+            bo.price_close = close_price
+            bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
+            if bot:
+                bot.balance = round(bot.balance + bo.amount, 8)
+                db.add(BalanceHistory(
+                    bot_name=bo.bot_name, balance=bot.balance, trade_id=bo.id,
+                ))
+            record_user_balance(db, bo.bot_name, trade_id=bo.id)
+            append_trace(bo, make_trace(
+                "SETTLEMENT", "MISSING_FILL_CANCEL",
+                f"Settlement reached but order has no fill data (avg_price/num_shares NULL). "
+                f"Cancelled with full refund: ${bo.amount:.4f}.",
+                {"refund": bo.amount, "candle_dir": candle_dir},
+            ))
+            return
+
         result = BOResult.WIN if candle_dir == bo.forecast else BOResult.LOSS
         if result == BOResult.WIN:
-            if bo.avg_price is not None and bo.num_shares is not None:
-                profit = round((1 - bo.avg_price) * bo.num_shares, 8)
-            else:
-                profit = round(bo.amount * _PAYOUT_RATE, 8)
+            profit = round((1 - bo.avg_price) * bo.num_shares, 8)
         else:
-            if bo.avg_price is not None and bo.num_shares is not None:
-                # Loss = cost of shares (avg_price × num_shares)
-                profit = round(-bo.avg_price * bo.num_shares, 8)
-            else:
-                profit = -bo.amount
+            # Loss = cost of shares (avg_price × num_shares)
+            profit = round(-bo.avg_price * bo.num_shares, 8)
 
     bo.result      = result
     bo.profit      = profit
@@ -238,6 +260,7 @@ def _settle_single_trade(
             balance     = bot.balance,
             trade_id    = bo.id,
         ))
+    record_user_balance(db, bo.bot_name, trade_id=bo.id)
 
     # SETTLEMENT trace — candle comparison and payout
     if bo.exit_trigger in ("TP", "SL"):
@@ -326,6 +349,7 @@ def settle_pending_trades(db: Session) -> None:
                     balance=bot.balance,
                     trade_id=bo.id,
                 ))
+            record_user_balance(db, bo.bot_name, trade_id=bo.id)
             logger.info(
                 "Cancelled unfilled #%d — refunded %.2f, balance=%.2f",
                 bo.id, bo.amount,
@@ -409,6 +433,7 @@ def sweep_stuck_orders(db: Session) -> int:
                     balance  = bot.balance,
                     trade_id = bo.id,
                 ))
+            record_user_balance(db, bo.bot_name, trade_id=bo.id)
             logger.info(
                 "[STUCK_SWEEP] Cancelled #%d %s %s — refunded %.8f, balance=%.2f",
                 bo.id, bo.symbol, bo.timeframe, bo.amount,
@@ -449,6 +474,7 @@ def sweep_stuck_orders(db: Session) -> int:
                 balance  = bot.balance,
                 trade_id = bo.id,
             ))
+        record_user_balance(db, bo.bot_name, trade_id=bo.id)
         logger.info(
             "[STUCK_SWEEP] Cancelled orphan #%d %s — refunded %.8f, balance=%.2f",
             bo.id, bo.symbol, bo.amount,

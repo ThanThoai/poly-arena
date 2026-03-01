@@ -12,6 +12,7 @@ from models import BalanceHistory, BinaryOption, Bot, BOResult
 from routers import achievements as achievements_router, auth, binary_options, bots, dashboard, ws as ws_router
 from services.redis_client import get_async_redis, close_async_redis
 from services.order_trace import make_trace, append_trace
+from services.user_balance import record_user_balance
 from services.rest_exit import (
     fetch_best_bid_from_rest,
     simulate_bracket_exit_from_rest,
@@ -129,72 +130,34 @@ async def _handle_bracket_exit(r, stream, group, msg_id, data) -> None:
                 num_shares = bo.num_shares or 0.0
                 is_full_exit = exit_filled >= num_shares and num_shares > 0
 
+                # Record exit data only — profit is ALWAYS calculated at
+                # session end by the scheduler using _settle_single_trade().
+                # This ensures consistent settlement timing for all orders.
                 if is_full_exit:
-                    profit = round((exit_price - bo.avg_price) * exit_filled, 8)
-                    result = BOResult.WIN if profit >= 0 else BOResult.LOSS
-
-                    bo.result = result
-                    bo.profit = profit
-
-                    payout = round(bo.amount + profit, 8)
-                    bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
-                    if bot:
-                        bot.balance = round(bot.balance + payout, 8)
-                        db.add(
-                            BalanceHistory(
-                                bot_name=bo.bot_name,
-                                balance=bot.balance,
-                                trade_id=bo.id,
-                            )
-                        )
-
                     append_trace(bo, make_trace(
-                        "SETTLEMENT", "BRACKET_SETTLED",
-                        f"Bracket exit settled. {trigger} triggered. "
+                        "MONITORING", "BRACKET_EXIT_FULL",
+                        f"Full bracket exit: {trigger} triggered. "
                         f"Entry: ${bo.avg_price:.4f} → Exit: ${exit_price:.4f}. "
-                        f"Profit: ${profit:.4f} ({result.value}).",
+                        f"Shares: {exit_filled:.4f}. Pending session-end settlement.",
                         {"trigger": trigger, "entry_price": bo.avg_price,
-                         "exit_price": exit_price, "exit_filled": exit_filled,
-                         "profit": profit, "result": result.value,
-                         "payout": payout},
+                         "exit_price": exit_price, "exit_filled": exit_filled},
                     ))
-
-                    # Step 1: persist to DB
-                    db.commit()
-                    _publish_trace_sync(bo)
-                    _check_achievements(bo, db)
-                    log.info(
-                        "Bracket exit settled immediately: BO #%d trigger=%s "
-                        "exit_price=%.6f exit_filled=%.4f → %s profit=%.8f balance=%.2f",
-                        bo_id,
-                        trigger,
-                        exit_price,
-                        exit_filled,
-                        result.value,
-                        profit,
-                        bot.balance if bot else float("nan"),
-                    )
                 else:
-                    # Partial exit — scheduler settles remainder via candle
                     append_trace(bo, make_trace(
                         "MONITORING", "PARTIAL_EXIT",
                         f"Partial exit: {exit_filled:.4f} / {num_shares:.4f} shares "
-                        f"exited via {trigger}. Remainder pending candle settlement.",
+                        f"exited via {trigger}. Pending session-end settlement.",
                         {"trigger": trigger, "exit_filled": exit_filled,
                          "num_shares": num_shares},
                     ))
 
-                    # Step 1: persist to DB
-                    db.commit()
-                    _publish_trace_sync(bo)
-                    log.info(
-                        "Bracket exit (partial): BO #%d trigger=%s "
-                        "exit_filled=%.4f / num_shares=%.4f — pending candle settlement",
-                        bo_id,
-                        trigger,
-                        exit_filled,
-                        num_shares,
-                    )
+                db.commit()
+                _publish_trace_sync(bo)
+                log.info(
+                    "Bracket exit recorded (deferred settlement): BO #%d trigger=%s "
+                    "exit_price=%.6f exit_filled=%.4f / num_shares=%.4f",
+                    bo_id, trigger, exit_price, exit_filled, num_shares,
+                )
         finally:
             db.close()
 
@@ -289,6 +252,7 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                                 trade_id=bo.id,
                             )
                         )
+                    record_user_balance(db, bo.bot_name, trade_id=bo.id)
 
                     db.commit()
                     _publish_trace_sync(bo)
@@ -442,16 +406,8 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                                     )
                                 )
                                 if exit_filled > 0:
-                                    append_trace(bo, make_trace(
-                                        "MONITORING", "AUTO_EXIT_SWEEP",
-                                        f"Auto-Exit REST Sweep: Selling "
-                                        f"{exit_filled:.4f} @ avg "
-                                        f"${exit_price:.4f}.",
-                                        {"exit_price": exit_price,
-                                         "exit_filled": exit_filled,
-                                         "reason": "Slippage Violation"},
-                                    ))
-                                    # Settle immediately
+                                    # Record exit data only — profit
+                                    # deferred to session-end settlement
                                     bo.exit_trigger = trigger
                                     bo.exit_price = exit_price
                                     bo.exit_filled = exit_filled
@@ -461,60 +417,28 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                                     wp["exit"] = exit_walk
                                     bo.walk_prices = wp
 
-                                    profit = round(
-                                        (exit_price - avg_entry) * exit_filled,
-                                        8,
-                                    )
-                                    result_val = (
-                                        BOResult.WIN
-                                        if profit >= 0
-                                        else BOResult.LOSS
-                                    )
-                                    bo.result = result_val
-                                    bo.profit = profit
-
-                                    payout = round(bo.amount + profit, 8)
-                                    bot = (
-                                        db.query(Bot)
-                                        .filter(Bot.bot_name == bo.bot_name)
-                                        .first()
-                                    )
-                                    if bot:
-                                        bot.balance = round(
-                                            bot.balance + payout, 8,
-                                        )
-                                        db.add(BalanceHistory(
-                                            bot_name=bo.bot_name,
-                                            balance=bot.balance,
-                                            trade_id=bo.id,
-                                        ))
-
                                     append_trace(bo, make_trace(
-                                        "SETTLEMENT",
-                                        "AUTO_EXIT_SETTLED",
-                                        f"Auto-Exit settled. {trigger} "
-                                        f"violated at entry. Entry: "
-                                        f"${avg_entry:.4f} → Exit: "
-                                        f"${exit_price:.4f}. Profit: "
-                                        f"${profit:.4f} ({result_val.value}).",
+                                        "MONITORING",
+                                        "AUTO_EXIT_RECORDED",
+                                        f"Auto-Exit: {trigger} violated at "
+                                        f"entry. Entry: ${avg_entry:.4f} → "
+                                        f"Exit: ${exit_price:.4f}. "
+                                        f"Shares: {exit_filled:.4f}. "
+                                        f"Pending session-end settlement.",
                                         {"trigger": trigger,
                                          "entry_price": avg_entry,
                                          "exit_price": exit_price,
-                                         "profit": profit,
-                                         "result": result_val.value,
-                                         "payout": payout},
+                                         "exit_filled": exit_filled},
                                     ))
                                     db.commit()
                                     _publish_trace_sync(bo)
-                                    _check_achievements(bo, db)
                                     exit_done = True
                                     log.info(
-                                        "Auto-Exit settled: BO #%d %s "
-                                        "entry=%.6f exit=%.6f → %s "
-                                        "profit=%.8f",
+                                        "Auto-Exit recorded (deferred): "
+                                        "BO #%d %s entry=%.6f exit=%.6f "
+                                        "shares=%.4f",
                                         bo_id, trigger, avg_entry,
-                                        exit_price, result_val.value,
-                                        profit,
+                                        exit_price, exit_filled,
                                     )
 
                         if not exit_done:
@@ -575,22 +499,39 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
 
 async def _handle_market_resolved(r, stream, group, msg_id, data) -> None:
     """
-    Process a market resolution event (v2 spec Section 5).
+    Process a market resolution event.
 
-    Oracle payout: winning token = qty × 1.0, losing token = qty × 0.0.
+    The matching engine fires this when Polymarket resolves a market.
+    However, the ME does NOT know the winning outcome (winning_outcome=""),
+    so we CANNOT determine WIN/LOSS here.
+
+    Instead, we record a trace and clear bracket monitoring (TP/SL) so the
+    order proceeds to scheduler settlement using Binance candle data — the
+    canonical source of truth for this platform.
     """
     try:
         asset_id = data.get("asset_id", "")
-        winning_outcome = data.get("winning_outcome", "")
+        bo_ids_str = data.get("bo_ids", "")
+
+        # Parse bo_ids from stream data
+        target_bo_ids: list[int] = []
+        if bo_ids_str:
+            target_bo_ids = [int(x) for x in bo_ids_str.split(",") if x.strip()]
+
+        if not target_bo_ids:
+            log.warning(
+                "Market resolved event has no bo_ids — skipping (asset_id=%s)",
+                asset_id[:16] if asset_id else "?",
+            )
+            await r.xack(stream, group, msg_id)
+            return
 
         db = SessionLocal()
         try:
-            # Find all PENDING orders for this asset
-            # Since we don't store asset_id on BinaryOption, we look for orders
-            # that have position_closed=False and are PENDING
             pending_orders = (
                 db.query(BinaryOption)
                 .filter(
+                    BinaryOption.id.in_(target_bo_ids),
                     BinaryOption.result == BOResult.PENDING,
                     BinaryOption.position_closed.isnot(True),
                 )
@@ -598,67 +539,27 @@ async def _handle_market_resolved(r, stream, group, msg_id, data) -> None:
             )
 
             for bo in pending_orders:
-                # Skip orders without fills
-                if not bo.num_shares or bo.num_shares <= 0:
-                    continue
-                if not bo.avg_price or bo.avg_price <= 0:
-                    continue
-
-                # Determine if this order holds the winning or losing token
-                # GREEN forecast → UP direction, RED forecast → DOWN direction
-                forecast_dir = "UP" if bo.forecast == "GREEN" else "DOWN"
-
-                # If winning_outcome matches the forecast direction, it's a WIN
-                if winning_outcome.upper() in (forecast_dir, bo.forecast):
-                    # Winning token: payout = filled_qty × 1.0
-                    payout_per_share = 1.0
-                    result = BOResult.WIN
-                else:
-                    # Losing token: payout = filled_qty × 0.0
-                    payout_per_share = 0.0
-                    result = BOResult.LOSS
-
-                final_value = round(bo.num_shares * payout_per_share, 8)
-                profit = round(final_value - bo.amount, 8)
-
-                bo.result = result
-                bo.profit = profit
-                bo.position_closed = True
+                # Clear bracket TP/SL so ME stops monitoring — the market
+                # has resolved, no more price updates will arrive.
                 bo.tp_price = None
                 bo.sl_price = None
+                bo.position_closed = True
+                bo.me_order_status = "RESOLVED"
 
-                # Add settlement trace
                 append_trace(bo, make_trace(
-                    "SETTLEMENT", "MARKET_RESOLVED",
-                    f"Polymarket Event: market_resolved received. "
-                    f"Asset resolved as {winning_outcome}. "
-                    f"Payout calculated: {bo.num_shares:.4f} × ${payout_per_share:.2f} = ${final_value:.4f}.",
-                    {"winning_outcome": winning_outcome, "payout_per_share": payout_per_share,
-                     "final_value": final_value, "profit": profit},
+                    "MONITORING", "MARKET_RESOLVED",
+                    f"Polymarket Event: market resolved for asset "
+                    f"{asset_id[:16]}. Bracket monitoring stopped. "
+                    f"Pending session-end settlement via Binance candle.",
+                    {"asset_id": asset_id},
                 ))
 
-                # Update bot balance
-                bot = db.query(Bot).filter(Bot.bot_name == bo.bot_name).first()
-                if bot:
-                    payout = round(bo.amount + profit, 8)
-                    bot.balance = round(bot.balance + payout, 8)
-                    db.add(
-                        BalanceHistory(
-                            bot_name=bo.bot_name,
-                            balance=bot.balance,
-                            trade_id=bo.id,
-                        )
-                    )
-
                 log.info(
-                    "Market resolved: BO #%d winner=%s → %s profit=%.8f",
-                    bo.id, winning_outcome, result.value, profit,
+                    "Market resolved recorded (deferred): BO #%d asset=%s",
+                    bo.id, asset_id[:16],
                 )
 
             db.commit()
-            for bo in pending_orders:
-                if bo.result in (BOResult.WIN, BOResult.LOSS):
-                    _check_achievements(bo, db)
         finally:
             db.close()
 

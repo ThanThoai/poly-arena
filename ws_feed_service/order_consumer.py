@@ -402,6 +402,30 @@ class OrderConsumer:
                             token_id[:16],
                         )
 
+                # BUG FIX: If the order was already CANCELED during
+                # place_virtual_order (e.g. MARKET IOC with no/partial fill),
+                # the state-change callback fired BEFORE _order_to_bo was
+                # registered, so the cancel event was silently dropped.
+                # Publish the cancel explicitly now.
+                if order.status == OrderStatus.CANCELED:
+                    self._publish_async(
+                        self._writer.publish_order_cancel(
+                            bo_id=bo_id,
+                            order_id=order.order_id,
+                            reason="MARKET_IOC_CANCEL",
+                            filled=float(order.filled),
+                            avg_entry_price=float(order.avg_entry_price) if order.avg_entry_price else 0.0,
+                        )
+                    )
+                    logger.info(
+                        "Immediate cancel published (post-registration): "
+                        "bo_id=%s order=%s filled=%s",
+                        bo_id, order.order_id[:12], order.filled,
+                    )
+                    # Cleanup tracking for terminal state
+                    self._order_to_bo.pop(order.order_id, None)
+                    self._order_to_token.pop(order.order_id, None)
+
             # Step 3: Fire bracket exit callbacks AFTER fill is published.
             # This ensures _handle_bracket_exit in API always finds
             # avg_price/num_shares already written by _handle_order_fill.

@@ -245,6 +245,7 @@ async def main():
     # Register session-aware token mapping for future session orderbook writes
     current_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
     writer.register_session_tokens(registry.get_all_token_mapping(), current_sessions)
+    await writer.publish_token_mapping()
     engine.register_valid_tokens(list(registry._mapping.values()))
 
     # Seed Redis with initial orderbook depth from REST discovery
@@ -282,6 +283,7 @@ async def main():
         # Re-register session tokens with fresh data
         fresh_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
         writer.register_session_tokens(registry.get_all_token_mapping(), fresh_sessions)
+        asyncio.ensure_future(writer.publish_token_mapping())
         if rotated:
             # Clear stale Redis price keys immediately so the UI shows
             # "no data" instead of old prices while waiting for first
@@ -325,6 +327,31 @@ async def main():
     # 8. Start OrderConsumer daemon thread
     consumer = OrderConsumer(sync_redis, engine, writer, loop, registry=registry)
     consumer.start()
+
+    # 8b. Wire up market_resolved callback on MatchingEngine
+    # When Polymarket resolves a market early, publish affected bo_ids to Redis
+    # so the FastAPI consumer can process only the correct orders.
+    def _on_market_resolved(asset_id: str, resolved_orders: list) -> None:
+        bo_ids = []
+        for order in resolved_orders:
+            bo_id = consumer._order_to_bo.get(order.order_id)
+            if bo_id is not None:
+                bo_ids.append(bo_id)
+        if bo_ids:
+            asyncio.ensure_future(
+                writer.publish_market_resolved(
+                    asset_id=asset_id,
+                    winning_outcome="",  # ME doesn't know outcome, Polymarket WS provides it
+                    bo_ids=bo_ids,
+                ),
+                loop=loop,
+            )
+            log.info(
+                "Market resolved callback: asset_id=%s bo_ids=%s",
+                asset_id[:16], bo_ids,
+            )
+
+    engine._on_market_resolved = _on_market_resolved
 
     # 9. Recovery: re-push PENDING BOs
     recovered = await _recover_pending_orders(sync_redis, engine, registry)

@@ -226,8 +226,10 @@ def _settle_immediate_bracket_exit(
     exit_walk: list,
 ) -> None:
     """
-    Immediately settle a bracket exit when TP/SL condition is already met at entry.
-    Updates the BO record and bot balance in a single DB commit.
+    Record bracket exit data when TP/SL condition is already met at entry.
+
+    Profit is NOT calculated here — deferred to session-end settlement
+    by the scheduler, which uses _settle_single_trade() with Binance candle.
     """
     now = datetime.now(timezone.utc)
 
@@ -242,39 +244,20 @@ def _settle_immediate_bracket_exit(
     wp["exit"] = exit_walk
     bo.walk_prices = wp
 
-    # Calculate profit and settle
-    profit = round((exit_price - bo.avg_price) * exit_filled, 8)
-    result = BOResult.WIN if profit >= 0 else BOResult.LOSS
-
-    bo.result = result
-    bo.profit = profit
-
-    payout = round(bo.amount + profit, 8)
-    bot.balance = round(bot.balance + payout, 8)
-    db.add(
-        BalanceHistory(
-            bot_name=bo.bot_name,
-            balance=bot.balance,
-            trade_id=bo.id,
-        )
-    )
-
     append_trace(bo, make_trace(
-        "SETTLEMENT", "IMMEDIATE_BRACKET_SETTLED",
-        f"Immediate bracket exit settled. {trigger} triggered at entry. "
+        "MONITORING", "IMMEDIATE_BRACKET_RECORDED",
+        f"Immediate bracket exit: {trigger} triggered at entry. "
         f"Entry: ${bo.avg_price:.4f} → Exit: ${exit_price:.4f}. "
-        f"Profit: ${profit:.4f} ({result.value}). Payout: ${payout:.4f}.",
+        f"Shares: {exit_filled:.4f}. Pending session-end settlement.",
         {"trigger": trigger, "entry_price": bo.avg_price,
-         "exit_price": exit_price, "exit_filled": exit_filled,
-         "profit": profit, "result": result.value, "payout": payout},
+         "exit_price": exit_price, "exit_filled": exit_filled},
     ))
 
     db.commit()
     logger.info(
-        "Immediate bracket exit settled: BO #%d trigger=%s "
-        "entry=%.6f exit=%.6f shares=%.4f → %s profit=%.8f balance=%.2f",
+        "Immediate bracket exit recorded (deferred): BO #%d trigger=%s "
+        "entry=%.6f exit=%.6f shares=%.4f",
         bo.id, trigger, bo.avg_price, exit_price, exit_filled,
-        result.value, profit, bot.balance,
     )
 
 
@@ -1028,6 +1011,37 @@ def list_bo(
     return q.order_by(BinaryOption.created_at.desc()).offset(offset).limit(limit).all()
 
 
+# ─── Token mapping for direct Polymarket WS ──────────────────────────────────
+
+@router.get("/tokens")
+async def get_token_mapping(
+    symbol: str = Query(..., description="Symbol (BTC, ETH, SOL, XRP)"),
+    timeframe: str = Query(..., description="Timeframe (M5, M15, H1)"),
+):
+    """
+    Return Polymarket token_id mapping for a symbol/timeframe pair.
+
+    The UI uses this to connect directly to Polymarket's WebSocket for
+    real-time orderbook data, bypassing the backend WS relay.
+    """
+    from services.redis_client import get_async_redis
+
+    sym = symbol.upper()
+    tf = timeframe.upper()
+    if sym not in ("BTC", "ETH", "SOL", "XRP"):
+        raise HTTPException(400, f"Unsupported symbol: {sym}")
+    if tf not in ("M5", "M15", "H1"):
+        raise HTTPException(400, f"Unsupported timeframe: {tf}")
+
+    r = get_async_redis()
+    redis_key = f"tokens:{sym}:{tf}"
+    raw = await r.get(redis_key)
+    if not raw:
+        raise HTTPException(404, f"No token mapping for {sym} {tf} — ws_feed_service may not be running")
+
+    return json.loads(raw)
+
+
 # ─── Lấy 1 lệnh ───────────────────────────────────────────────────────────────
 
 @router.get("/{bo_id}", response_model=BOResponse)
@@ -1304,3 +1318,5 @@ def engine_prices():
         return {"prices": prices}
 
     return {"prices": prices}
+
+
