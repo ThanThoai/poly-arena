@@ -331,8 +331,20 @@ async def main():
     if recovered:
         log.info("Recovery: re-pushed %d pending order(s) to queue", recovered)
 
-    # 10. Wait for shutdown signal
+    # 10. Periodic TTL expiry tick — ensures expired orders are detected
+    # even when no WebSocket events arrive (idle market).
+    async def _expiry_tick():
+        while not shutdown_event.is_set():
+            try:
+                n = engine.expire_all_pending()
+                if n:
+                    log.info("Expiry tick: expired %d order(s)", n)
+            except Exception as exc:
+                log.error("Expiry tick error: %s", exc)
+            await asyncio.sleep(5)
+
     shutdown_event = asyncio.Event()
+    asyncio.ensure_future(_expiry_tick())
 
     def _signal_handler():
         log.info("Shutdown signal received")

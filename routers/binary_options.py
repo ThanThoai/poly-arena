@@ -46,18 +46,120 @@ _FORECAST_TO_STATUS = {"GREEN": "UP", "RED": "DOWN"}
 _TF_PERIOD_S = {"M5": 300, "M15": 900, "H1": 3600}
 
 
-def _resolve_future_token(
-    pm: PolymarketClient, symbol: str, tf: str, direction: str, session_offset: int,
-) -> Optional[str]:
-    """Compute future settlement_ts and resolve token_id via REST for next-session orders."""
-    period = _TF_PERIOD_S.get(tf)
-    if period is None or session_offset == 0:
-        return None
+# ── Session resolution ────────────────────────────────────────────────────────
+
+from dataclasses import dataclass
+
+@dataclass
+class SessionInfo:
+    """Result of session resolution from timestamp / session_offset."""
+    candle_open: int        # Unix ts (seconds) — candle open boundary
+    settlement_at: "datetime"  # candle close (UTC aware datetime)
+    session_offset: int     # effective offset from *current* candle (0 or 1)
+    is_current: bool        # True if the resolved candle is the current one
+
+
+def resolve_session(
+    timeframe: str,
+    timestamp: Optional[int] = None,
+    session_offset: int = 0,
+) -> SessionInfo:
+    """
+    Determine which candle session an order belongs to.
+
+    Resolution rules (in priority order):
+      1. If ``timestamp`` is provided → use it to find the containing candle.
+      2. Otherwise → use ``now`` + ``session_offset``.
+
+    Constraint: the resolved candle must be the current or the immediately next
+    candle.  Anything further (past or future) is rejected with ValueError.
+
+    Parameters
+    ----------
+    timeframe : str
+        "M5", "M15", or "H1".
+    timestamp : int | None
+        Optional Unix timestamp (seconds).  When set, ``session_offset``
+        is ignored.
+    session_offset : int
+        0 = current candle, 1 = next candle.  Only used when
+        ``timestamp`` is None.
+
+    Returns
+    -------
+    SessionInfo
+
+    Raises
+    ------
+    ValueError
+        If timeframe is unsupported or the resolved candle is out of range.
+
+    Examples
+    --------
+    >>> # M5, now = 14:23:15 UTC → current candle opens at 14:20, closes 14:25
+    >>> info = resolve_session("M5")
+    >>> info.candle_open  # 14:20:00 as unix ts
+    >>> info.settlement_at  # 14:25:00 UTC
+
+    >>> # M5, timestamp = 14:27:00 → candle opens at 14:25, closes 14:30
+    >>> # That is the *next* candle relative to 14:23 → session_offset=1 → OK
+    >>> info = resolve_session("M5", timestamp=...)
+
+    >>> # M5, timestamp = 14:35:00 → candle opens at 14:35, closes 14:40
+    >>> # That is 2 candles ahead → rejected
+    """
+    period = _TF_PERIOD_S.get(timeframe)
+    if period is None:
+        raise ValueError(f"Unsupported timeframe: {timeframe!r}")
+
     now = int(time.time())
-    current_open = now - (now % period)
-    future_ts = current_open + period * session_offset
+    current_open = now - (now % period)          # candle open of the *current* candle
+    next_open    = current_open + period         # candle open of the next candle
+    max_open     = next_open                     # max allowed candle open (1 session ahead)
+
+    if timestamp is not None:
+        # Resolve candle from the provided timestamp
+        target_open = timestamp - (timestamp % period)
+
+        if target_open < current_open:
+            raise ValueError(
+                f"timestamp {timestamp} falls in a past candle "
+                f"(candle_open={target_open}, current_open={current_open}). "
+                f"Only current or next session is accepted."
+            )
+        if target_open > max_open:
+            raise ValueError(
+                f"timestamp {timestamp} falls too far in the future "
+                f"(candle_open={target_open}, max_allowed={max_open}). "
+                f"Only the next session is accepted at most."
+            )
+
+        effective_offset = 0 if target_open == current_open else 1
+        candle_open = target_open
+    else:
+        # Use session_offset from current time
+        effective_offset = min(session_offset, 1)
+        candle_open = current_open + period * effective_offset
+
+    # Settlement = candle close = candle_open + period
+    from datetime import datetime as _dt, timezone as _tz
+    settlement_at = _dt.fromtimestamp(candle_open + period, tz=_tz.utc)
+
+    return SessionInfo(
+        candle_open=candle_open,
+        settlement_at=settlement_at,
+        session_offset=effective_offset,
+        is_current=(effective_offset == 0),
+    )
+
+
+def _resolve_future_token(
+    pm: PolymarketClient, symbol: str, tf: str, direction: str, candle_open: int,
+) -> Optional[str]:
+    """Resolve token_id for a specific candle_open timestamp via REST."""
     pm_status = _FORECAST_TO_STATUS[direction]
-    return pm.get_token_id_at(symbol, tf, pm_status, future_ts)
+    return pm.get_token_id_at(symbol, tf, pm_status, candle_open)
+
 
 def _compute_stats(items: list):
     wins    = sum(1 for b in items if b.result == BOResult.WIN)
@@ -512,29 +614,38 @@ def create_bo(
     entry_price: float
 
     has_bracket = payload.tp_price is not None or payload.sl_price is not None
-    session_offset = payload.session_offset or 0
-    settlement_at = calc_settlement_time(
-        payload.timeframe, datetime.now(timezone.utc), session_offset=session_offset,
-    )
 
-    # ── Next-session token resolution ──────────────────────────────────────
+    # ── Session resolution ────────────────────────────────────────────────
+    try:
+        session = resolve_session(
+            timeframe=payload.timeframe.value,
+            timestamp=payload.timestamp,
+            session_offset=payload.session_offset or 0,
+        )
+    except ValueError as exc:
+        bot.balance = round(bot.balance + payload.amount, 8)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    settlement_at = session.settlement_at
+    session_offset = session.session_offset
+
+    # ── Token resolution for non-current session ─────────────────────────
     future_token_id: Optional[str] = None
-    if session_offset > 0:
+    if not session.is_current:
         try:
             with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm_future:
                 future_token_id = _resolve_future_token(
                     pm_future, payload.symbol.value, payload.timeframe.value,
-                    payload.forecast.value, session_offset,
+                    payload.forecast.value, session.candle_open,
                 )
         except Exception as exc:
             logger.warning("Future token resolution failed: %s", exc)
 
         if not future_token_id:
-            # Refund balance and reject
             bot.balance = round(bot.balance + payload.amount, 8)
             raise HTTPException(
                 status_code=503,
-                detail="Future session market not available yet on Polymarket",
+                detail="Market for the target session is not available yet on Polymarket",
             )
 
     if is_limit:

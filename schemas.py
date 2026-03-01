@@ -18,6 +18,7 @@ class BOCreate(BaseModel):
     ttl:                Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
     slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
     session_offset:     Optional[int]   = Field(default=0, ge=0, le=1)  # 0 = current session, 1 = next session
+    timestamp:          Optional[int]   = None   # Unix timestamp (seconds) to target a specific candle session
 
     @field_validator("amount")
     @classmethod
@@ -45,6 +46,13 @@ class BOCreate(BaseModel):
     def slippage_in_range(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and not (0 < v <= 1):
             raise ValueError("slippage_tolerance must be between 0 (exclusive) and 1 (inclusive)")
+        return v
+
+    @field_validator("timestamp")
+    @classmethod
+    def timestamp_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("timestamp must be a positive Unix timestamp (seconds)")
         return v
 
     @model_validator(mode="after")
