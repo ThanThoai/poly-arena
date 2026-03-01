@@ -17,6 +17,7 @@ class BOCreate(BaseModel):
     sl_price:    Optional[float] = None   # Stop Loss   — triggers shadow profit on LOSS
     ttl:                Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
     slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
+    session_offset:     Optional[int]   = Field(default=0, ge=0, le=1)  # 0 = current session, 1 = next session
 
     @field_validator("amount")
     @classmethod
@@ -88,6 +89,7 @@ class BOResponse(BaseModel):
     walk_prices:     Optional[dict]  = None
     traces:          Optional[list]  = None
     position_closed: Optional[bool]  = None
+    session_offset:  Optional[int]   = None
 
     model_config = {"from_attributes": True}
 
@@ -149,7 +151,7 @@ class BalanceHistoryResponse(BaseModel):
 
 class BotCreate(BaseModel):
     bot_name: str
-    initial_balance: float = 10000.0
+    initial_balance: float = 1000.0
 
 
 class BotRename(BaseModel):

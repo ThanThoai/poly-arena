@@ -82,45 +82,45 @@ class PolymarketFeed:
         """
         Add token IDs to track.
 
-        If the WebSocket connection is currently active, sends a new
-        subscription message immediately so the new tokens are tracked
-        in the current candle without waiting for a reconnect.
-        Otherwise the tokens are queued and will be subscribed on the
-        next connection attempt.
+        If the WebSocket connection is currently active, re-subscribes
+        with the FULL token list (not just new ones) because Polymarket
+        treats each subscription message as a full replacement — sending
+        only new tokens causes "INVALID OPERATION" and breaks the feed.
         """
         new = set(token_ids) - set(self.token_ids)
         if not new:
             return
         self.token_ids.extend(new)
-        logger.info("Registering %d new token(s) to feed", len(new))
+        logger.info("Registering %d new token(s) to feed (total: %d)", len(new), len(self.token_ids))
 
-        # Re-subscribe on the live connection if available
+        # Re-subscribe with FULL token list on the live connection
         if self._ws is not None and self._running:
-            asyncio.create_task(self._resubscribe(list(new)))
+            asyncio.create_task(self._resubscribe(self.token_ids))
 
-    async def _resubscribe(self, new_token_ids: list[str]) -> None:
+    async def _resubscribe(self, token_ids: list[str]) -> None:
         """
-        Send a subscription message for newly added tokens on the live WS
-        connection.  Called as a fire-and-forget task from add_tokens().
+        Send a full subscription message on the live WS connection.
+
+        Polymarket WS treats each subscription as a REPLACEMENT, so we must
+        always send the complete list of token IDs, not just new ones.
         """
         if self._ws is None:
             return
         try:
             payload = {
-                "assets_ids": new_token_ids,
+                "assets_ids": token_ids,
                 "type": "market",
                 "custom_feature_enabled": True,
             }
             await self._ws.send(json.dumps(payload))
             logger.info(
-                "Re-subscribed to %d new token(s): %s",
-                len(new_token_ids),
-                [t[:16] for t in new_token_ids],
+                "Re-subscribed with full token list (%d token(s))",
+                len(token_ids),
             )
         except Exception as exc:
             logger.warning(
                 "Re-subscribe failed (%d token(s)): %s — will retry on reconnect",
-                len(new_token_ids), exc,
+                len(token_ids), exc,
             )
 
     # ── Internal ─────────────────────────────────────────────────────────────

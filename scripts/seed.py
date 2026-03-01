@@ -71,10 +71,11 @@ def seed(reset: bool = False) -> None:
 
     try:
         if reset:
+            db.execute(text("DELETE FROM bot_achievements"))
+            db.execute(text("DELETE FROM balance_history"))
             db.execute(text("DELETE FROM binary_options"))
-            db.execute(text("DELETE FROM bots"))
             db.commit()
-            print("Cleared all existing data.")
+            print("Cleared trade data (bots preserved).")
 
         for (name, timeframe, n_trades, amount_range) in BOTS:
 

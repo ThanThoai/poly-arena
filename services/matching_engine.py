@@ -44,6 +44,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Callable, Optional
 
+from sortedcontainers import SortedDict
+
 from config.timing import (
     ME_DUST_THRESHOLD as _DUST_THRESHOLD,
     ME_DEFAULT_SLIPPAGE as _DEFAULT_SLIPPAGE,
@@ -324,11 +326,21 @@ class ShadowOrderbook:
     DB writes) while holding the lock.
     """
 
+    def __setattr__(self, name: str, value):
+        # Auto-wrap plain dict → SortedDict for bids/asks (test compatibility)
+        if name in ("bids", "asks") and isinstance(value, dict) and not isinstance(value, SortedDict):
+            value = SortedDict(value)
+        super().__setattr__(name, value)
+
     def __init__(self, token_id: str) -> None:
         self.token_id = token_id
         self._lock    = threading.Lock()
-        self.bids:  dict[Decimal, Decimal] = {}  # price → size, highest first
-        self.asks:  dict[Decimal, Decimal] = {}  # price → size, lowest first
+        self.bids:  SortedDict = SortedDict()  # price → size, ascending key order
+        self.asks:  SortedDict = SortedDict()  # price → size, ascending key order
+        self._depth_cache: dict[tuple[str, int], list[tuple[Decimal, Decimal]]] = {}
+        # Raw (pre-matching) orderbook — reflects Polymarket state before shadow deductions
+        self._raw_bids: SortedDict = SortedDict()
+        self._raw_asks: SortedDict = SortedDict()
         self.last_trade:  Optional[LastTrade]        = None
         self.last_update: Optional[datetime]         = None
         self._virtual_orders: list[SimulatedOrder]   = []
@@ -346,6 +358,7 @@ class ShadowOrderbook:
         with self._lock:
             self.bids.clear()
             self.asks.clear()
+            self._depth_cache.clear()
             for entry in bids:
                 price = Decimal(str(entry["price"]))
                 size  = Decimal(str(entry["size"]))
@@ -356,6 +369,9 @@ class ShadowOrderbook:
                 size  = Decimal(str(entry["size"]))
                 if size > 0:
                     self.asks[price] = size
+            # Save raw copy (Polymarket state before shadow matching deductions)
+            self._raw_bids = SortedDict(self.bids)
+            self._raw_asks = SortedDict(self.asks)
             self.last_update = datetime.now(timezone.utc)
         logger.debug(
             "Snapshot %s: %d bids, %d asks",
@@ -365,15 +381,19 @@ class ShadowOrderbook:
     def apply_changes(self, changes: list[dict]) -> None:
         """Handle a `price_change` event — delta updates (spec 3.2)."""
         with self._lock:
+            self._depth_cache.clear()
             for ch in changes:
                 side   = ch.get("side", "").lower()
                 price  = Decimal(str(ch["price"]))
                 size   = Decimal(str(ch["size"]))
                 target = self.bids if side == "bid" else self.asks
+                raw_target = self._raw_bids if side == "bid" else self._raw_asks
                 if size <= 0:
                     target.pop(price, None)
+                    raw_target.pop(price, None)
                 else:
                     target[price] = size
+                    raw_target[price] = size
             self.last_update = datetime.now(timezone.utc)
 
     def record_trade(self, price: str, size: str, side: str) -> None:
@@ -389,11 +409,11 @@ class ShadowOrderbook:
 
     def best_ask(self) -> Optional[Decimal]:
         with self._lock:
-            return min(self.asks.keys()) if self.asks else None
+            return self.asks.peekitem(0)[0] if self.asks else None
 
     def best_bid(self) -> Optional[Decimal]:
         with self._lock:
-            return max(self.bids.keys()) if self.bids else None
+            return self.bids.peekitem(-1)[0] if self.bids else None
 
     def spread(self) -> Optional[Decimal]:
         ba = self.best_ask()
@@ -401,11 +421,29 @@ class ShadowOrderbook:
         return (ba - bb) if ba is not None and bb is not None else None
 
     def depth(self, side: str = "ask", levels: int = 5) -> list[tuple[Decimal, Decimal]]:
-        """Top N [(price, size)] levels."""
+        """Top N [(price, size)] levels. Cached until book mutates."""
         with self._lock:
-            book    = self.asks if side == "ask" else self.bids
-            reverse = side == "bid"
-            return sorted(book.items(), key=lambda x: x[0], reverse=reverse)[:levels]
+            cache_key = (side, levels)
+            cached = self._depth_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            book = self.asks if side == "ask" else self.bids
+            if side == "bid":
+                # SortedDict is ascending; bids need descending (highest first)
+                result = list(book.items())[-levels:][::-1]
+            else:
+                result = list(book.items())[:levels]
+            self._depth_cache[cache_key] = result
+            return result
+
+    def raw_depth(self, side: str = "ask", levels: int = 5) -> list[tuple[Decimal, Decimal]]:
+        """Top N [(price, size)] from raw Polymarket data (pre-matching)."""
+        with self._lock:
+            book = self._raw_asks if side == "ask" else self._raw_bids
+            if side == "bid":
+                return list(book.items())[-levels:][::-1]
+            else:
+                return list(book.items())[:levels]
 
     def total_liquidity(self, side: str = "ask", within_pct: float = 0.05) -> Decimal:
         """Total size within `within_pct` of best price."""
@@ -444,6 +482,9 @@ class ShadowOrderbook:
                     cancelled += 1
             self.bids.clear()
             self.asks.clear()
+            self._raw_bids.clear()
+            self._raw_asks.clear()
+            self._depth_cache.clear()
             state_events = self.collect_state_changes()
         # Fire callbacks outside lock
         self._fire_state_change_callbacks(state_events)
@@ -559,7 +600,7 @@ class ShadowOrderbook:
             # fired here so the caller can publish fill events FIRST.
             # Single condition: check whichever is set (TP or SL, never both)
             if order.is_eligible_for_bracket and self.bids:
-                current_best_bid = max(self.bids.keys())
+                current_best_bid = self.bids.peekitem(-1)[0]
                 if order.tp_price is not None and current_best_bid >= order.tp_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "TP")
                     self._bracket_log.append(result)
@@ -616,7 +657,7 @@ class ShadowOrderbook:
 
             # Single condition: check whichever is set (TP or SL, never both)
             if order.is_eligible_for_bracket and self.bids:
-                current_best_bid = max(self.bids.keys())
+                current_best_bid = self.bids.peekitem(-1)[0]
                 if order.tp_price is not None and current_best_bid >= order.tp_price:
                     result = self._execute_bracket_exit(order, current_best_bid, "TP")
                     self._bracket_log.append(result)
@@ -734,6 +775,7 @@ class ShadowOrderbook:
         """
         state_events: list[OrderStateChangeEvent] = []
         with self._lock:
+            self._depth_cache.clear()
             self._expire_pending_orders()
 
             # Guard: do not match against expired or stale books.
@@ -875,6 +917,7 @@ class ShadowOrderbook:
         MARKET orders: sweep all available levels (no price check).
         LIMIT orders: match only at limit price or better.
         """
+        self._depth_cache.clear()
         is_market = order.order_type == "MARKET"
         filled_before = order.filled
 
@@ -888,16 +931,16 @@ class ShadowOrderbook:
             slippage = order.max_slippage if order.max_slippage is not None else _DEFAULT_SLIPPAGE
             if order.side == OrderSide.BUY and self.asks:
                 if order._slippage_ref_price is None:
-                    order._slippage_ref_price = min(self.asks.keys())
+                    order._slippage_ref_price = self.asks.peekitem(0)[0]
                 slippage_limit_buy = order._slippage_ref_price * (1 + slippage)
             elif order.side == OrderSide.SELL and self.bids:
                 if order._slippage_ref_price is None:
-                    order._slippage_ref_price = max(self.bids.keys())
+                    order._slippage_ref_price = self.bids.peekitem(-1)[0]
                 slippage_limit_sell = order._slippage_ref_price * (1 - slippage)
 
         # ── Pre-match book snapshot for debug ─────────────────────────────
         if order.side == OrderSide.BUY:
-            top_asks = sorted(self.asks.items())[:5]
+            top_asks = list(self.asks.items())[:5]
             logger.info(
                 "MATCH_START %s BUY %s: id=%s price=%s qty=%s "
                 "remaining=%s slippage_limit=%s "
@@ -909,7 +952,7 @@ class ShadowOrderbook:
                 [(str(p), str(s)) for p, s in top_asks],
             )
         else:
-            top_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:5]
+            top_bids = list(self.bids.items())[-5:][::-1]
             logger.info(
                 "MATCH_START %s SELL %s: id=%s price=%s qty=%s "
                 "remaining=%s slippage_limit=%s "
@@ -922,8 +965,8 @@ class ShadowOrderbook:
             )
 
         if order.side == OrderSide.BUY:
-            # Iterate sorted asks ascending — stop when no more price matches
-            for ask_price in sorted(self.asks.keys()):
+            # Iterate asks ascending (SortedDict) — stop when no more price matches
+            for ask_price in list(self.asks.keys()):
                 ask_size = self.asks.get(ask_price, Decimal("0"))
                 if ask_size <= 0:
                     continue
@@ -990,8 +1033,8 @@ class ShadowOrderbook:
                     )
                     break
         else:
-            # Iterate sorted bids descending
-            for bid_price in sorted(self.bids.keys(), reverse=True):
+            # Iterate bids descending (SortedDict reversed)
+            for bid_price in list(reversed(self.bids.keys())):
                 bid_size = self.bids.get(bid_price, Decimal("0"))
                 if bid_size <= 0:
                     continue
@@ -1059,7 +1102,7 @@ class ShadowOrderbook:
         with self._lock:
             if not self.bids:
                 return results
-            current_best_bid = max(self.bids.keys())
+            current_best_bid = self.bids.peekitem(-1)[0]
 
             for order in self._virtual_orders:
                 if not order.is_eligible_for_bracket:
@@ -1120,6 +1163,7 @@ class ShadowOrderbook:
 
         Must be called while holding self._lock.
         """
+        self._depth_cache.clear()
         # If a previous partial exit occurred, only close the remaining portion
         already_exited = order.exit_filled or Decimal("0")
         qty_to_close = order.filled - already_exited
@@ -1128,8 +1172,8 @@ class ShadowOrderbook:
         levels_hit   = 0
         exit_levels: list = []
 
-        # Walk bids descending — consume as much as needed (with slippage)
-        for bid_price in sorted(self.bids.keys(), reverse=True):
+        # Walk bids descending (SortedDict reversed) — consume as much as needed
+        for bid_price in list(reversed(self.bids.keys())):
             bid_size = self.bids.get(bid_price, Decimal("0"))
             if bid_size <= 0:
                 continue
@@ -1215,7 +1259,7 @@ class ShadowOrderbook:
                 return None
             if not self.bids:
                 return None
-            result = self._execute_bracket_exit(order, max(self.bids.keys()), "FORCE_CLOSE")
+            result = self._execute_bracket_exit(order, self.bids.peekitem(-1)[0], "FORCE_CLOSE")
             self._bracket_log.append(result)
             logger.info(
                 "Force-close order %s: qty=%s avg_exit=%s profit=%s",

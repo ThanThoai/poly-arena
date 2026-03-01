@@ -26,7 +26,7 @@ async def get_market_data():
     # Bạn cần thay thế dãy số này bằng Token ID (Asset ID) thực tế của thị trường bạn muốn theo dõi.
     # ID dưới đây chỉ là ví dụ (một token YES/NO mẫu trên Polymarket)
     target_asset_ids = [
-        "44393573210115296341470955016430250998889405366631259622228214543868557796578"
+        "35881796829857164781110438942460103244092752420895875768964203175989990102958"
     ]
 
     # Kết nối tới WebSocket

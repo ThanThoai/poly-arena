@@ -90,8 +90,7 @@ _db_mod.get_db = _get_test_db
 
 @pytest.fixture(autouse=True, scope="session")
 def _create_test_schema():
-    """Drop and recreate all tables once per test session to pick up schema changes."""
-    Base.metadata.drop_all(bind=_test_engine)
+    """Create tables if missing (additive only — never drops existing data)."""
     Base.metadata.create_all(bind=_test_engine)
     yield
 

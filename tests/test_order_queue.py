@@ -15,7 +15,7 @@ import pytest
 from ws_feed_service.config import QUEUE_ORDERS_NEW
 
 
-def _mock_fill_market_from_rest(symbol, timeframe, pm_status, amount, slippage_tolerance):
+def _mock_fill_market_from_rest(symbol, timeframe, pm_status, amount, slippage_tolerance, token_id_override=None):
     """Mock REST fill returning predictable values."""
     walk_levels = [{"price": 0.52, "qty": round(amount / 0.52, 8), "cost": amount}]
     return (0.52, round(amount / 0.52, 8), "fake-token-btc-m5-up", walk_levels)
@@ -60,7 +60,7 @@ def test_create_bo_limit_order_pushes_to_queue(mock_rest, client, test_bot, fake
     assert order["token_id"] == "fake-token-btc-m5-up"
 
 
-def _mock_try_fill_limit(symbol, timeframe, pm_status, amount, limit_price):
+def _mock_try_fill_limit(symbol, timeframe, pm_status, amount, limit_price, token_id_override=None):
     """Mock REST fill for LIMIT order that CAN fill now."""
     walk_levels = [{"price": 0.42, "qty": round(amount / 0.42, 8), "cost": amount}]
     return ("fake-token-btc-m5-up", (0.42, round(amount / 0.42, 8), walk_levels))

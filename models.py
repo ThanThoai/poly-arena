@@ -10,8 +10,8 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-USER_INITIAL_BALANCE = 50_000.0
-INITIAL_BALANCE = 10_000.0
+USER_INITIAL_BALANCE = 5_000.0
+INITIAL_BALANCE = 1_000.0
 
 
 class User(Base):
@@ -126,6 +126,7 @@ class BinaryOption(Base):
     # ── Order Trace & Market Resolution ──────────────────────────────────────
     traces          = Column(JSON, nullable=True)        # [{timestamp, stage, action, details, data}]
     position_closed = Column(Boolean, default=False)     # True when market resolved or bracket fully exited
+    session_offset  = Column(Integer, default=0)          # 0 = current session, 1 = next session
 
 
 # ── Achievement System ─────────────────────────────────────────────────────

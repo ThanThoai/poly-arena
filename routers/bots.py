@@ -118,7 +118,7 @@ def rename_bot(
 @router.get("/balance-history", response_model=List[BalanceHistoryResponse])
 def get_balance_history(
     bot_name: Optional[str] = Query(None),
-    limit: int = Query(10000, ge=1, le=50000),
+    limit: int = Query(500, ge=1, le=50000),
     db: Session = Depends(get_db),
 ):
     bots_q = db.query(Bot)

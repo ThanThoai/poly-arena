@@ -46,6 +46,22 @@ def bot_achievements(bot_id: int, db: Session = Depends(get_db)):
     return [_enrich(ba, bot, defn) for ba, bot, defn in rows]
 
 
+@router.get("/all-bots")
+def all_bot_achievements(db: Session = Depends(get_db)):
+    """Return all bot achievements grouped by bot_id — single query instead of N+1."""
+    rows = (
+        db.query(BotAchievement, Bot, AchievementDefinition)
+        .join(Bot, Bot.id == BotAchievement.bot_id)
+        .join(AchievementDefinition, AchievementDefinition.id == BotAchievement.achievement_id)
+        .order_by(BotAchievement.earned_at.desc())
+        .all()
+    )
+    grouped: dict[int, list] = {}
+    for ba, bot, defn in rows:
+        grouped.setdefault(ba.bot_id, []).append(_enrich(ba, bot, defn))
+    return grouped
+
+
 @router.get("/my", response_model=list[BotAchievementResponse])
 def my_achievements(
     user: User = Depends(get_current_user),
