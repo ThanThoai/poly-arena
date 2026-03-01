@@ -91,17 +91,16 @@ async def test_auto_exit_tp_violated_at_fill(db, bot_and_bo, fake_async_redis):
     db.refresh(bo)
     db.refresh(bot)
 
-    # Should be settled with auto-exit
+    # Exit data should be recorded, but profit deferred to session-end
     assert bo.exit_trigger == "TP"
     assert bo.exit_price == pytest.approx(0.58, abs=0.01)
-    assert bo.result in (BOResult.WIN, BOResult.LOSS)
-    assert bo.profit is not None
+    assert bo.result == BOResult.PENDING  # deferred to scheduler
     assert bo.avg_price == pytest.approx(0.60)
     assert bo.traces is not None
     # Look for SLIPPAGE_VIOLATION trace
     stages = [t["action"] for t in bo.traces]
     assert "SLIPPAGE_VIOLATION" in stages
-    assert "AUTO_EXIT_SETTLED" in stages
+    assert "AUTO_EXIT_RECORDED" in stages
 
 
 @pytest.mark.asyncio
@@ -137,7 +136,7 @@ async def test_auto_exit_sl_violated_at_fill(db, bot_and_bo, fake_async_redis):
     db.refresh(bo)
 
     assert bo.exit_trigger == "SL"
-    assert bo.result in (BOResult.WIN, BOResult.LOSS)
+    assert bo.result == BOResult.PENDING  # deferred to scheduler
     stages = [t["action"] for t in bo.traces]
     assert "SLIPPAGE_VIOLATION" in stages
 

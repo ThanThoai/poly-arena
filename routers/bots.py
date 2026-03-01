@@ -6,8 +6,8 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
-from models import BalanceHistory, BinaryOption, Bot, User
-from schemas import BalanceHistoryResponse, BotCreate, BotPublic, BotRename, BotResponse
+from models import BalanceHistory, BinaryOption, Bot, User, UserBalanceHistory
+from schemas import BalanceHistoryResponse, BotCreate, BotPublic, BotRename, BotResponse, UserBalanceHistoryResponse
 
 router = APIRouter()
 
@@ -55,11 +55,14 @@ def list_bots(db: Session = Depends(get_db)):
     bots = db.query(Bot).order_by(Bot.created_at.desc()).all()
     user_ids = {b.user_id for b in bots if b.user_id}
     user_map = {}
+    user_balance_map = {}
     if user_ids:
         users = db.query(User).filter(User.id.in_(user_ids)).all()
         user_map = {u.id: u.username for u in users}
+        user_balance_map = {u.id: u.initial_balance or 0 for u in users}
     for b in bots:
         b.owner_name = user_map.get(b.user_id)  # type: ignore[attr-defined]
+        b.user_initial_balance = user_balance_map.get(b.user_id)  # type: ignore[attr-defined]
     return bots
 
 
@@ -143,3 +146,30 @@ def get_balance_history(
     history = q.order_by(BalanceHistory.recorded_at.asc()).limit(limit).all()
 
     return sorted(seed_records + history, key=lambda r: (r.recorded_at or ""))
+
+
+@router.get("/user-balance-history", response_model=List[UserBalanceHistoryResponse])
+def get_user_balance_history(
+    user: User = Depends(get_current_user),
+    limit: int = Query(500, ge=1, le=50000),
+    db: Session = Depends(get_db),
+):
+    """Get balance history for the authenticated user based on Realized P&L."""
+    # Seed record: user's initial balance at account creation
+    seed = UserBalanceHistory(
+        id=0,
+        user_id=user.id,
+        balance=user.initial_balance or 0,
+        trade_id=None,
+        recorded_at=user.created_at,
+    )
+
+    history = (
+        db.query(UserBalanceHistory)
+        .filter(UserBalanceHistory.user_id == user.id)
+        .order_by(UserBalanceHistory.recorded_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+    return sorted([seed] + history, key=lambda r: (r.recorded_at or ""))

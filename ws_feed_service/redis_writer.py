@@ -25,6 +25,9 @@ from ws_feed_service.config import (
     UI_PAST_SESSIONS,
 )
 
+TOKEN_MAPPING_KEY_PREFIX = "tokens"  # tokens:{SYM}:{TF}
+TOKEN_MAPPING_TTL_S = 600            # 10 min TTL (refreshed on every rotation)
+
 logger = logging.getLogger(__name__)
 
 
@@ -122,6 +125,86 @@ class RedisWriter:
             "(%d past + current + %d future)",
             total_tokens, total_combos, max_past, max_future,
         )
+
+    async def publish_token_mapping(self) -> None:
+        """
+        Publish token mapping to Redis so the UI can look up token_ids
+        for direct Polymarket WebSocket connections.
+
+        Writes a ``tokens:{SYM}:{TF}`` key (JSON) for each symbol/timeframe
+        combination, containing current and future token_ids per direction.
+        """
+        from config.timing import TF_SECONDS
+
+        # Build per-(sym, tf) structure from internal maps
+        # Key: (sym, tf) → {direction: {"current": {...}, "future": [...]}}
+        out: dict[tuple[str, str], dict] = {}
+
+        # Current tokens from _token_map
+        for token_id, combos in self._token_map.items():
+            for sym, tf, direction in combos:
+                key = (sym, tf)
+                if key not in out:
+                    period = TF_SECONDS.get(tf, 300)
+                    current_ts = self._current_sessions.get(tf, 0)
+                    out[key] = {
+                        "UP": {"current": None, "future": []},
+                        "DOWN": {"current": None, "future": []},
+                        "candle_period_s": period,
+                        "current_candle_ts": current_ts,
+                    }
+                # Find session timestamp for this token
+                session_ts = 0
+                session_combos = self._session_token_map.get(token_id, [])
+                for s_sym, s_tf, s_dir, s_ts in session_combos:
+                    if s_sym == sym and s_tf == tf and s_dir == direction:
+                        session_ts = s_ts
+                        break
+                if not session_ts:
+                    session_ts = self._current_sessions.get(tf, 0)
+                out[key][direction]["current"] = {
+                    "token_id": token_id,
+                    "session": session_ts,
+                }
+
+        # Future tokens from _session_token_map
+        for token_id, combos in self._session_token_map.items():
+            for sym, tf, direction, candle_ts in combos:
+                current_ts = self._current_sessions.get(tf, 0)
+                if candle_ts <= current_ts:
+                    continue  # current or past — skip
+                key = (sym, tf)
+                if key not in out:
+                    period = TF_SECONDS.get(tf, 300)
+                    out[key] = {
+                        "UP": {"current": None, "future": []},
+                        "DOWN": {"current": None, "future": []},
+                        "candle_period_s": period,
+                        "current_candle_ts": current_ts,
+                    }
+                out[key][direction]["future"].append({
+                    "token_id": token_id,
+                    "session": candle_ts,
+                })
+
+        # Sort future lists by session timestamp
+        for data in out.values():
+            for dir_key in ("UP", "DOWN"):
+                data[dir_key]["future"].sort(key=lambda x: x["session"])
+
+        # Write to Redis
+        pipe = self._r.pipeline(transaction=False)
+        for (sym, tf), data in out.items():
+            redis_key = f"{TOKEN_MAPPING_KEY_PREFIX}:{sym}:{tf}"
+            pipe.set(redis_key, json.dumps(data), ex=TOKEN_MAPPING_TTL_S)
+
+        try:
+            await pipe.execute()
+            logger.info(
+                "Token mapping published: %d key(s)", len(out),
+            )
+        except Exception as exc:
+            logger.error("RedisWriter.publish_token_mapping failed: %s", exc)
 
     async def update_price(
         self,
@@ -396,6 +479,7 @@ class RedisWriter:
         asset_id: str,
         winning_outcome: str = "",
         timestamp: str = "",
+        bo_ids: list[int] | None = None,
     ) -> None:
         """Publish a market resolution event to the Redis stream."""
         try:
@@ -406,6 +490,8 @@ class RedisWriter:
                 fields["winning_outcome"] = winning_outcome
             if timestamp:
                 fields["timestamp"] = timestamp
+            if bo_ids:
+                fields["bo_ids"] = ",".join(str(i) for i in bo_ids)
             await self._r.xadd(
                 STREAM_MARKET_RESOLVED,
                 fields,
@@ -413,8 +499,8 @@ class RedisWriter:
                 approximate=True,
             )
             logger.info(
-                "Market resolved published: asset_id=%s winning=%s",
-                asset_id[:16], winning_outcome,
+                "Market resolved published: asset_id=%s winning=%s bo_ids=%s",
+                asset_id[:16], winning_outcome, bo_ids,
             )
         except Exception as exc:
             logger.error("RedisWriter.publish_market_resolved failed: %s", exc)

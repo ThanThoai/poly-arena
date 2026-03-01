@@ -84,6 +84,16 @@ class BalanceHistory(Base):
     recorded_at = Column(DateTime(timezone=True), default=_now)
 
 
+class UserBalanceHistory(Base):
+    __tablename__ = "user_balance_history"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    balance     = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+    trade_id    = Column(Integer, nullable=True)   # trade that triggered the change
+    recorded_at = Column(DateTime(timezone=True), default=_now)
+
+
 class BinaryOption(Base):
     __tablename__ = "binary_options"
 

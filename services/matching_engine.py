@@ -1759,11 +1759,22 @@ class MatchingEngine:
         return total
 
     def shutdown(self) -> None:
-        """Stop accepting events and cancel all virtual orders."""
+        """Stop accepting events and cancel all virtual orders.
+
+        Fires state-change callbacks so OrderConsumer can publish cancel
+        events to Redis, allowing the API to process balance refunds.
+        """
         self._running = False
         with self._lock:
             for book in self._books.values():
-                book.cancel_all_virtual()
+                with book._lock:
+                    # Cancel all orders and collect state changes in one lock
+                    for order in book._virtual_orders:
+                        if order.status in (OrderStatus.PENDING, OrderStatus.PARTIAL):
+                            order.status = OrderStatus.CANCELED
+                    state_events = book.collect_state_changes()
+                # Fire callbacks outside book lock
+                book._fire_state_change_callbacks(state_events)
         logger.info("Matching engine shut down (%d books)", len(self._books))
 
 
