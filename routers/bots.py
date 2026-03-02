@@ -6,8 +6,11 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
-from models import BalanceHistory, BinaryOption, Bot, User, UserBalanceHistory
-from schemas import BalanceHistoryResponse, BotCreate, BotPublic, BotRename, BotResponse, UserBalanceHistoryResponse
+from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory
+from schemas import (
+    BalanceHistoryResponse, BotCreate, BotPnlResponse, BotPublic, BotRename,
+    BotResponse, UserBalanceHistoryResponse, UserPnlResponse,
+)
 
 router = APIRouter()
 
@@ -173,3 +176,108 @@ def get_user_balance_history(
     )
 
     return sorted([seed] + history, key=lambda r: (r.recorded_at or ""))
+
+
+# ── P&L helpers ──────────────────────────────────────────────────────────────
+
+def _bot_pnl(bot: Bot, trades: list) -> BotPnlResponse:
+    """Build a BotPnlResponse from a Bot and its trades."""
+    wins = sum(1 for t in trades if t.result == BOResult.WIN)
+    losses = sum(1 for t in trades if t.result == BOResult.LOSS)
+    pending = sum(1 for t in trades if t.result == BOResult.PENDING)
+    decided = wins + losses
+    realized_pnl = round(sum(t.profit or 0 for t in trades if t.result in (BOResult.WIN, BOResult.LOSS)), 8)
+    initial = bot.initial_balance or 0
+    return BotPnlResponse(
+        bot_name=bot.bot_name,
+        initial_balance=initial,
+        current_balance=bot.balance or 0,
+        realized_pnl=realized_pnl,
+        realized_pnl_pct=round(realized_pnl / initial * 100, 2) if initial else 0.0,
+        wins=wins,
+        losses=losses,
+        pending=pending,
+        total_trades=len(trades),
+        win_rate=round(wins / decided * 100, 2) if decided else 0.0,
+        avg_profit_per_trade=round(realized_pnl / decided, 8) if decided else 0.0,
+    )
+
+
+# ── P&L endpoints ───────────────────────────────────────────────────────────
+
+@router.get("/pnl", response_model=List[BotPnlResponse])
+def bots_pnl(
+    bot_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """P&L for all bots (public). Optional bot_name filter."""
+    bot_q = db.query(Bot)
+    if bot_name:
+        bot_q = bot_q.filter(Bot.bot_name == bot_name)
+    bots = bot_q.all()
+
+    bot_names = [b.bot_name for b in bots]
+    if not bot_names:
+        return []
+
+    trades = db.query(BinaryOption).filter(BinaryOption.bot_name.in_(bot_names)).all()
+    trades_by_bot: dict[str, list] = {name: [] for name in bot_names}
+    for t in trades:
+        trades_by_bot.setdefault(t.bot_name, []).append(t)
+
+    return sorted(
+        [_bot_pnl(b, trades_by_bot.get(b.bot_name, [])) for b in bots],
+        key=lambda x: x.realized_pnl,
+        reverse=True,
+    )
+
+
+@router.get("/user-pnl", response_model=UserPnlResponse)
+def user_pnl(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """P&L for the authenticated user, aggregated across all bots."""
+    bots = db.query(Bot).filter(Bot.user_id == user.id).all()
+    bot_names = [b.bot_name for b in bots]
+
+    trades = (
+        db.query(BinaryOption).filter(BinaryOption.bot_name.in_(bot_names)).all()
+        if bot_names else []
+    )
+    trades_by_bot: dict[str, list] = {name: [] for name in bot_names}
+    for t in trades:
+        trades_by_bot.setdefault(t.bot_name, []).append(t)
+
+    bot_pnls = [_bot_pnl(b, trades_by_bot.get(b.bot_name, [])) for b in bots]
+
+    # Aggregate
+    wins = sum(bp.wins for bp in bot_pnls)
+    losses = sum(bp.losses for bp in bot_pnls)
+    pending = sum(bp.pending for bp in bot_pnls)
+    total_trades = sum(bp.total_trades for bp in bot_pnls)
+    realized_pnl = round(sum(bp.realized_pnl for bp in bot_pnls), 8)
+    decided = wins + losses
+
+    allocated = sum(b.initial_balance or 0 for b in bots)
+    available = (user.initial_balance or 0) - allocated
+    current_balance = round(sum(b.balance or 0 for b in bots) + available, 8)
+    initial = user.initial_balance or 0
+
+    return UserPnlResponse(
+        user_id=user.id,
+        username=user.username,
+        initial_balance=initial,
+        allocated_balance=allocated,
+        available_balance=available,
+        current_balance=current_balance,
+        realized_pnl=realized_pnl,
+        realized_pnl_pct=round(realized_pnl / initial * 100, 2) if initial else 0.0,
+        wins=wins,
+        losses=losses,
+        pending=pending,
+        total_trades=total_trades,
+        win_rate=round(wins / decided * 100, 2) if decided else 0.0,
+        avg_profit_per_trade=round(realized_pnl / decided, 8) if decided else 0.0,
+        bots=bot_pnls,
+    )

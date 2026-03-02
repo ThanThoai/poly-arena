@@ -288,11 +288,21 @@ class OrderConsumer:
         timeframe = data.get("timeframe")
         ttl = data.get("ttl")
         slippage_tolerance = data.get("slippage_tolerance")
+        session_offset = data.get("session_offset", 0)
+        settlement_at_str = data.get("settlement_at")
 
         is_market = limit_price is None
 
         # TTL: pass as ttl_seconds so matching engine uses raw offset
-        ttl_seconds = float(ttl) if ttl is not None else None
+        # For session_offset=1, compute TTL from settlement_at so the order
+        # doesn't expire at the current candle close.
+        if ttl is not None:
+            ttl_seconds = float(ttl)
+        elif session_offset == 1 and settlement_at_str:
+            settlement_dt = datetime.fromisoformat(settlement_at_str)
+            ttl_seconds = max((settlement_dt - datetime.now(timezone.utc)).total_seconds(), 1.0)
+        else:
+            ttl_seconds = None
 
         # MARKET order: recalculate quantity from ME's fresh best_ask so
         # cost ≈ amount.  Price is irrelevant for MARKET (engine skips

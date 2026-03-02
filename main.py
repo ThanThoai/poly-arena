@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from database import SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
-from routers import achievements as achievements_router, auth, binary_options, bots, dashboard, ws as ws_router
+from routers import achievements as achievements_router, auth, binary_options, bots, dashboard, ws as ws_router, ws_polymarket
 from services.redis_client import get_async_redis, close_async_redis
 from services.order_trace import make_trace, append_trace
 from services.user_balance import record_user_balance
@@ -883,6 +883,7 @@ app.include_router(bots.router, prefix="/poly-arena/bots", tags=["Bots"])
 app.include_router(dashboard.router, prefix="/poly-arena/dashboard", tags=["Dashboard"])
 app.include_router(achievements_router.router, prefix="/poly-arena/achievements", tags=["Achievements"])
 app.include_router(ws_router.router, prefix="/poly-arena")
+app.include_router(ws_polymarket.router, prefix="/poly-arena")
 
 
 @app.get("/health", tags=["Health"])

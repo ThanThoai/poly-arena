@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -58,8 +58,13 @@ class BOCreate(BaseModel):
     @model_validator(mode="after")
     def validate_single_condition(self) -> "BOCreate":
         """Single Condition Policy: an order can have at most one condition (TP or SL, not both)."""
-        if self.tp_price is not None and self.sl_price is not None:
-            raise ValueError("Only one condition allowed: set tp_price OR sl_price, not both")
+        # ── TP/SL temporarily disabled ──────────────────────────────────
+        # Silently ignore any TP/SL values sent by clients.
+        # To re-enable, remove these two lines and uncomment the check below.
+        self.tp_price = None
+        self.sl_price = None
+        # if self.tp_price is not None and self.sl_price is not None:
+        #     raise ValueError("Only one condition allowed: set tp_price OR sl_price, not both")
         return self
 
 
@@ -143,6 +148,40 @@ class BOForecastStats(BaseModel):
     pending:      int
     win_rate:     float
     total_profit: float
+
+
+# ── P&L schemas ──────────────────────────────────────────────────────────────
+
+class BotPnlResponse(BaseModel):
+    bot_name: str
+    initial_balance: float
+    current_balance: float
+    realized_pnl: float
+    realized_pnl_pct: float
+    wins: int
+    losses: int
+    pending: int
+    total_trades: int
+    win_rate: float
+    avg_profit_per_trade: float
+
+
+class UserPnlResponse(BaseModel):
+    user_id: int
+    username: str
+    initial_balance: float
+    allocated_balance: float
+    available_balance: float
+    current_balance: float
+    realized_pnl: float
+    realized_pnl_pct: float
+    wins: int
+    losses: int
+    pending: int
+    total_trades: int
+    win_rate: float
+    avg_profit_per_trade: float
+    bots: List[BotPnlResponse]
 
 
 # ── Bot schemas ───────────────────────────────────────────────────────────────

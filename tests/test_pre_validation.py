@@ -9,6 +9,10 @@ Verifies:
 """
 
 import pytest
+
+pytestmark = pytest.mark.skip(reason="TP/SL feature temporarily disabled")
+
+import pytest
 from unittest.mock import patch, MagicMock
 from decimal import Decimal
 

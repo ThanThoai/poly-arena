@@ -1,22 +1,19 @@
 """
 Test bot — chạy đồng thời nhiều user, mỗi user có nhiều bot với balance khác nhau.
-Mỗi bot chạy trong 1 thread riêng, tạo random trades mỗi 5 phút.
+Mỗi bot chạy trong 1 thread riêng, snipe lệnh ngay trước candle boundary.
 Mỗi bot có phong cách giao dịch riêng (aggressive, conservative, scalper, whale, random).
+
+Snipe mode:
+  - Bot đợi đến sát ranh giới nến (vd 14:24:59 cho M5)
+  - Gửi batch lệnh với timestamp = candle boundary tiếp theo (14:25:00)
+  - SNIPE_OFFSET_S (default 1s) điều chỉnh gửi trước boundary bao lâu
 
 Khi khởi động:
   1. Tạo/login NUM_USERS user (mặc định 2)
   2. Mỗi user có BOTS_PER_USER bot (mặc định 5) với balance random
   3. Nếu user đã tồn tại → login lại, reuse bot cũ
 
-v2 changes:
-  - Single Condition Policy: only TP or SL, not both
-  - TP/SL must pass pre-validation: TP > best_ask, SL < best_ask
-  - Bot creation requires JWT auth (register/login first)
-
-v3 changes:
-  - Multi-user support: NUM_USERS users, each with BOTS_PER_USER bots
-  - Random initial_balance per bot (configurable range)
-  - Reuse existing users and bots on restart
+Note: TP/SL temporarily disabled.
 """
 
 import os
@@ -38,6 +35,7 @@ BOTS_PER_USER = int(os.environ.get("BOTS_PER_USER", "5"))
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))  # 5 phút
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
 PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
+SNIPE_OFFSET_S = int(os.environ.get("SNIPE_OFFSET_S", "1"))  # gửi lệnh trước boundary bao nhiêu giây
 
 # Balance range for new bots (random between these values)
 BOT_BALANCE_MIN = int(os.environ.get("BOT_BALANCE_MIN", "200"))
@@ -84,9 +82,7 @@ BOT_PROFILES = [
         "suffix": "aggressive",
         "amount_range": (10, 80),
         "limit_pct": 0.15,       # ít dùng limit
-        "bracket_pct": 0.70,     # hay dùng bracket
         "ttl_pct": 0.10,
-        "next_session_pct": 0.40,  # 40% lệnh đặt cho phiên A+1
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
@@ -94,9 +90,7 @@ BOT_PROFILES = [
         "suffix": "conservative",
         "amount_range": (5, 30),
         "limit_pct": 0.50,       # hay dùng limit
-        "bracket_pct": 0.80,     # luôn có bracket
         "ttl_pct": 0.40,         # hay set TTL
-        "next_session_pct": 0.50,  # conservative hay đặt trước
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
@@ -104,9 +98,7 @@ BOT_PROFILES = [
         "suffix": "scalper",
         "amount_range": (5, 25),
         "limit_pct": 0.30,
-        "bracket_pct": 0.50,
         "ttl_pct": 0.60,         # scalper hay dùng TTL ngắn
-        "next_session_pct": 0.30,  # scalper đặt A+1 vừa phải
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
@@ -114,9 +106,7 @@ BOT_PROFILES = [
         "suffix": "whale",
         "amount_range": (30, 100),
         "limit_pct": 0.40,
-        "bracket_pct": 0.60,
         "ttl_pct": 0.20,
-        "next_session_pct": 0.45,
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
@@ -124,13 +114,28 @@ BOT_PROFILES = [
         "suffix": "random-m5",
         "amount_range": (5, 50),
         "limit_pct": 0.30,
-        "bracket_pct": 0.40,
         "ttl_pct": 0.30,
-        "next_session_pct": 0.35,
         "preferred_symbols": ["BTC"],
         "preferred_tf": ["M5"],
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Edge-case profile — dedicated bot that cycles through tricky scenarios
+# ---------------------------------------------------------------------------
+
+EDGE_CASE_PROFILE = {
+    "suffix": "edge-case",
+    "amount_range": (5, 50),
+    "limit_pct": 0,       # not used — build_edge_case_trade handles everything
+    "ttl_pct": 0,
+    "preferred_symbols": ["BTC"],
+    "preferred_tf": ["M5"],
+}
+
+# Counter for cycling through edge cases deterministically
+_edge_case_counter = 0
+_edge_case_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -149,37 +154,23 @@ def _base_payload(profile: dict) -> dict:
     }
 
 
-def build_trade(profile: dict, best_ask: float | None = None) -> dict:
+def build_trade(profile: dict, target_ts: int | None = None, best_ask: float | None = None) -> dict:
     """Tạo 1 trade ngẫu nhiên theo phong cách của bot.
 
-    v2: Single Condition Policy — only TP or SL, never both.
-    TP/SL prices are generated relative to best_ask to pass pre-validation:
-      - TP must be > best_ask (take profit above current price)
-      - SL must be < best_ask (stop loss below current price)
+    Args:
+        target_ts: candle-open timestamp to target (e.g. next boundary).
+                   If provided, always set as order timestamp.
     """
     p = _base_payload(profile)
 
     is_limit = random.random() < profile["limit_pct"]
-    has_bracket = random.random() < profile["bracket_pct"]
     has_ttl = random.random() < profile["ttl_pct"]
 
     if is_limit:
         p["limit_price"] = round(random.uniform(0.20, 0.80), 2)
 
-    if has_bracket:
-        # Use best_ask as reference for realistic pricing.
-        # Fallback to estimated entry if best_ask unavailable.
-        ref_price = best_ask or p.get("limit_price") or 0.50
-
-        # Single Condition Policy: choose ONE of TP or SL
-        if random.random() < 0.6:
-            # TP: must be > best_ask (pre-validation requirement)
-            tp = ref_price + random.uniform(0.05, 0.30)
-            p["tp_price"] = round(min(0.95, tp), 2)
-        else:
-            # SL: must be < best_ask (pre-validation requirement)
-            sl = ref_price - random.uniform(0.05, 0.25)
-            p["sl_price"] = round(max(0.05, sl), 2)
+    # TP/SL temporarily disabled
+    # if has_bracket: ...
 
     if has_ttl and is_limit:
         if profile["suffix"] == "scalper":
@@ -187,25 +178,102 @@ def build_trade(profile: dict, best_ask: float | None = None) -> dict:
         else:
             p["ttl"] = random.choice([30, 60, 120, 180, 300])
 
-    # Next-session order (A+1) — use timestamp to target the next candle boundary
-    if random.random() < profile.get("next_session_pct", 0):
-        tf = p["timeframe"]
-        period = {"M5": 300, "M15": 900, "H1": 3600}.get(tf, 300)
-        now_ts = int(time.time())
-        current_open = now_ts - (now_ts % period)
-        next_open = current_open + period
-        # Use timestamp (next candle boundary) instead of session_offset
-        # e.g. at 14:29:54, timestamp=14:30:00 → order effective in 14:30 session
-        if random.random() < 0.5:
-            p["timestamp"] = next_open
-        else:
-            p["session_offset"] = 1
+    # Always target the specified candle session
+    if target_ts is not None:
+        p["timestamp"] = target_ts
 
     # ~50% chance reason
     if random.random() > 0.5:
         p["reason"] = random.choice(REASONS)
 
     return p
+
+
+def build_edge_case_trade(target_ts: int | None = None, best_ask: float | None = None) -> dict:
+    """Cycle through edge case scenarios deterministically.
+
+    Each call returns the next edge case in the list, wrapping around.
+    Covers: extreme amounts, short TTLs, boundary prices, etc.
+    TP/SL temporarily disabled.
+    """
+    global _edge_case_counter
+    ref = best_ask or 0.50
+
+    cases = [
+        # 1. MARKET bare — simplest case
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 10.0,
+            "reason": "EDGE: market bare",
+        },
+        # 2. MARKET RED — opposite direction
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "RED",
+            "amount": 12.0,
+            "reason": "EDGE: market RED",
+        },
+        # 3. LIMIT — deferred to ME
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 20.0,
+            "limit_price": round(max(0.05, ref - 0.03), 2),
+            "reason": "EDGE: limit deferred",
+        },
+        # 4. LIMIT + short TTL
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 15.0,
+            "limit_price": round(max(0.05, ref - 0.02), 2),
+            "ttl": 60,
+            "reason": "EDGE: limit+TTL",
+        },
+        # 5. Minimum amount ($5)
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 5.0,
+            "reason": "EDGE: min amount market",
+        },
+        # 6. Large amount ($100) — slippage test
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 100.0,
+            "reason": "EDGE: large amount market",
+        },
+        # 7. LIMIT at best_ask (should fill immediately via REST)
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 10.0,
+            "limit_price": round(ref, 2),
+            "reason": "EDGE: limit at best_ask",
+        },
+        # 8. LIMIT well below best_ask + very short TTL
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+            "amount": 8.0,
+            "limit_price": round(max(0.05, ref - 0.15), 2),
+            "ttl": 10,
+            "reason": "EDGE: deep limit + 10s TTL",
+        },
+        # 9. LIMIT RED
+        {
+            "symbol": "BTC", "timeframe": "M5", "forecast": "RED",
+            "amount": 15.0,
+            "limit_price": round(max(0.10, ref - 0.05), 2),
+            "reason": "EDGE: limit RED",
+        },
+    ]
+
+    with _edge_case_lock:
+        idx = _edge_case_counter % len(cases)
+        _edge_case_counter += 1
+
+    trade = cases[idx]
+
+    # Always target the specified candle session
+    if target_ts is not None:
+        trade["timestamp"] = target_ts
+
+    return trade
 
 
 # ---------------------------------------------------------------------------
@@ -301,15 +369,10 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
     if r.ok:
         data = r.json()
         otype = "LIMIT" if payload.get("limit_price") else "MKT"
-        condition = ""
-        if payload.get("tp_price"):
-            condition = f" [TP={payload['tp_price']}]"
-        elif payload.get("sl_price"):
-            condition = f" [SL={payload['sl_price']}]"
         ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
-        session_str = " [A+1]" if payload.get("session_offset") else (f" [TS={payload['timestamp']}]" if payload.get("timestamp") else "")
+        ts_str = f" [TS={payload['timestamp']}]" if payload.get("timestamp") else ""
         log.info(
-            "%s Trade #%d: %s %s %s %s $%.2f → avg=%.4f shares=%.2f%s%s%s",
+            "%s Trade #%d: %s %s %s %s $%.2f → avg=%.4f shares=%.2f%s%s",
             bot_name,
             data["id"],
             otype,
@@ -319,9 +382,8 @@ def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
             payload["amount"],
             data.get("avg_price") or 0,
             data.get("num_shares") or 0,
-            condition,
             ttl_str,
-            session_str,
+            ts_str,
         )
     else:
         log.warning("%s Trade failed (%d): %s", bot_name, r.status_code, r.text[:200])
@@ -343,22 +405,28 @@ def fetch_best_ask(symbol: str = "BTC", timeframe: str = "M5") -> float | None:
     return None
 
 
-def run_batch(api_key: str, bot_name: str, profile: dict, count: int) -> None:
-    """Tạo 1 batch trades cho 1 bot."""
-    # Fetch best_ask once per batch for realistic TP/SL pricing
+def run_batch(api_key: str, bot_name: str, profile: dict, count: int, target_ts: int | None = None) -> None:
+    """Tạo 1 batch trades cho 1 bot.
+
+    Args:
+        target_ts: candle-open timestamp to target on all orders.
+    """
     best_ask = fetch_best_ask()
     if best_ask:
         log.info("%s Best ask reference: %.4f", bot_name, best_ask)
 
-    trades = [build_trade(profile, best_ask=best_ask) for _ in range(count)]
+    is_edge = profile["suffix"] == "edge-case"
+    trades = (
+        [build_edge_case_trade(target_ts=target_ts, best_ask=best_ask) for _ in range(count)]
+        if is_edge
+        else [build_trade(profile, target_ts=target_ts, best_ask=best_ask) for _ in range(count)]
+    )
 
     for idx, payload in enumerate(trades, 1):
         otype = "LIMIT" if payload.get("limit_price") else "MKT"
-        has_tp = "TP" if payload.get("tp_price") else ""
-        has_sl = "SL" if payload.get("sl_price") else ""
         has_ttl = f"TTL={payload['ttl']}s" if payload.get("ttl") else ""
-        has_a1 = "A+1" if payload.get("session_offset") else ("TS=" + str(payload["timestamp"]) if payload.get("timestamp") else "")
-        extras = "+".join(filter(None, [has_tp, has_sl, has_ttl, has_a1]))
+        has_ts = f"TS={payload['timestamp']}" if payload.get("timestamp") else ""
+        extras = "+".join(filter(None, [has_ttl, has_ts]))
         if extras:
             extras = f" +{extras}"
         log.info(
@@ -380,26 +448,50 @@ def run_batch(api_key: str, bot_name: str, profile: dict, count: int) -> None:
 
 
 def bot_loop(bot_name: str, api_key: str, profile: dict) -> None:
-    """Main loop cho 1 bot — chạy trong thread riêng."""
+    """Main loop cho 1 bot — snipe ngay trước candle boundary.
+
+    Mỗi chu kỳ:
+      1. Tính next candle boundary (vd 14:25:00)
+      2. Sleep đến boundary - SNIPE_OFFSET_S (vd 14:24:59)
+      3. Gửi batch lệnh với timestamp = next boundary
+      → Lệnh được gửi sát giờ nhưng target phiên tiếp theo
+    """
+    tf = profile["preferred_tf"][0]  # primary timeframe
+    period = {"M5": 300, "M15": 900, "H1": 3600}.get(tf, 300)
+
     log.info(
-        "%s started: style=%s trades=%d interval=%ds symbols=%s tf=%s",
-        bot_name, profile["suffix"], TRADES_PER_TICK, INTERVAL,
+        "%s started: style=%s trades=%d period=%ds snipe_offset=%ds symbols=%s tf=%s",
+        bot_name, profile["suffix"], TRADES_PER_TICK, period, SNIPE_OFFSET_S,
         profile["preferred_symbols"], profile["preferred_tf"],
     )
 
-    # Stagger start: mỗi bot bắt đầu lệch nhau vài giây
-    jitter = random.uniform(0, 10)
-    log.info("%s sleeping %.1fs before first batch (stagger)...", bot_name, jitter)
+    # Stagger start: mỗi bot lệch nhau vài giây (chỉ lần đầu)
+    jitter = random.uniform(0, 5)
+    log.info("%s sleeping %.1fs before first cycle (stagger)...", bot_name, jitter)
     time.sleep(jitter)
 
     while True:
+        now_ts = int(time.time())
+        current_open = now_ts - (now_ts % period)
+        next_boundary = current_open + period  # e.g. 14:25:00
+
+        # Sleep until SNIPE_OFFSET_S seconds before next boundary
+        fire_at = next_boundary - SNIPE_OFFSET_S
+        wait_s = fire_at - int(time.time())
+
+        if wait_s > 0:
+            log.info(
+                "%s Next boundary=%d, fire at T-%ds, sleeping %ds...",
+                bot_name, next_boundary, SNIPE_OFFSET_S, wait_s,
+            )
+            time.sleep(wait_s)
+
         log.info("=" * 60)
-        log.info("%s Starting batch of %d trades...", bot_name, TRADES_PER_TICK)
-        run_batch(api_key, bot_name, profile, TRADES_PER_TICK)
-        # Mỗi bot có interval hơi khác nhau để tránh burst cùng lúc
-        sleep_time = INTERVAL + random.randint(-30, 30)
-        log.info("%s Batch complete. Sleeping %ds...", bot_name, sleep_time)
-        time.sleep(sleep_time)
+        log.info(
+            "%s SNIPE: sending %d trades at T-%ds, timestamp=%d",
+            bot_name, TRADES_PER_TICK, SNIPE_OFFSET_S, next_boundary,
+        )
+        run_batch(api_key, bot_name, profile, TRADES_PER_TICK, target_ts=next_boundary)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +501,8 @@ def bot_loop(bot_name: str, api_key: str, profile: dict) -> None:
 
 def _match_profile(bot_name: str) -> dict:
     """Guess bot profile from its name suffix, fallback to random profile."""
+    if EDGE_CASE_PROFILE["suffix"] in bot_name:
+        return EDGE_CASE_PROFILE
     for profile in BOT_PROFILES:
         if profile["suffix"] in bot_name:
             return profile
@@ -479,6 +573,36 @@ def setup_user(username: str) -> list[tuple[str, str, dict]]:
 # ---------------------------------------------------------------------------
 
 
+def setup_edge_case_user() -> list[tuple[str, str, dict]]:
+    """Setup dedicated edge-case user with a single bot that cycles through edge cases."""
+    username = "edge-tester"
+    try:
+        jwt_token = register_or_login_user(username, PASSWORD)
+    except Exception as e:
+        log.error("Failed to register/login edge-case user: %s", e)
+        return []
+
+    # Reuse existing bot if found
+    try:
+        existing = fetch_my_bots(jwt_token)
+        for bot_data in existing:
+            if "edge-case" in bot_data["bot_name"] and bot_data.get("is_active", True):
+                log.info("[%s] Reusing edge-case bot: %s (balance=$%.0f)",
+                         username, bot_data["bot_name"], bot_data.get("balance", 0))
+                return [(bot_data["bot_name"], bot_data["api_key"], EDGE_CASE_PROFILE)]
+    except Exception:
+        pass
+
+    # Create new edge-case bot
+    bot_name = f"{username}-edge-case"
+    try:
+        api_key = create_bot(bot_name, jwt_token, initial_balance=500)
+        return [(bot_name, api_key, EDGE_CASE_PROFILE)]
+    except Exception as e:
+        log.error("Failed to create edge-case bot: %s", e)
+        return []
+
+
 def main():
     if not wait_for_api():
         return
@@ -492,6 +616,12 @@ def main():
         log.info("Setting up user %d/%d: %s", i + 1, NUM_USERS, username)
         slots = setup_user(username)
         all_bot_slots.extend(slots)
+
+    # Always add dedicated edge-case user
+    log.info("=" * 60)
+    log.info("Setting up edge-case user...")
+    edge_slots = setup_edge_case_user()
+    all_bot_slots.extend(edge_slots)
 
     if not all_bot_slots:
         log.error("No bots available across all users, exiting")
