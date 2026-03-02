@@ -172,7 +172,7 @@ def _compute_stats(items: list):
         losses       = losses,
         pending      = pending,
         win_rate     = round(wins / decided * 100, 2) if decided else 0.0,
-        total_profit = round(sum(b.profit or 0 for b in items), 8),
+        total_profit = round(sum(b.profit or 0 for b in items if b.result in (BOResult.WIN, BOResult.LOSS)), 8),
         total_amount = round(sum(b.amount for b in items), 8),
     )
 
@@ -266,6 +266,8 @@ def _queue_prefilled_to_me(
     avg_price: float, num_shares: float,
     payload: "BOCreate",
     token_id: Optional[str] = None,
+    session_offset: int = 0,
+    settlement_at: Optional[datetime] = None,
 ) -> None:
     """Queue a pre-filled MARKET bracket order to the matching engine via Redis."""
     try:
@@ -283,6 +285,8 @@ def _queue_prefilled_to_me(
             "tp_price": payload.tp_price,
             "sl_price": payload.sl_price,
             "timeframe": payload.timeframe.value,
+            "session_offset": session_offset,
+            "settlement_at": settlement_at.isoformat() if settlement_at else None,
         })
         sr.lpush(QUEUE_ORDERS_NEW, order_payload)
 
@@ -743,6 +747,8 @@ def create_bo(
                             _queue_prefilled_to_me(
                                 bo, avg_price, num_shares, payload,
                                 token_id=token_id,
+                                session_offset=session_offset,
+                                settlement_at=settlement_at,
                             )
                     else:
                         _queue_prefilled_to_me(
@@ -754,6 +760,8 @@ def create_bo(
                     _queue_prefilled_to_me(
                         bo, avg_price, num_shares, payload,
                         token_id=token_id,
+                        session_offset=session_offset,
+                        settlement_at=settlement_at,
                     )
 
         else:
@@ -817,6 +825,8 @@ def create_bo(
                     "timeframe": payload.timeframe.value,
                     "ttl": payload.ttl,
                     "slippage_tolerance": payload.slippage_tolerance,
+                    "session_offset": session_offset,
+                    "settlement_at": settlement_at.isoformat() if settlement_at else None,
                 })
                 sr.lpush(QUEUE_ORDERS_NEW, order_payload)
 
@@ -959,6 +969,8 @@ def create_bo(
                     _queue_prefilled_to_me(
                         bo, avg_price, num_shares, payload,
                         token_id=token_id,
+                        session_offset=session_offset,
+                        settlement_at=settlement_at,
                     )
             else:
                 # Normal case: TP > entry and SL < entry → queue to ME

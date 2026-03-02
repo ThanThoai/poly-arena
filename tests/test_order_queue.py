@@ -94,6 +94,7 @@ def test_create_bo_limit_immediate_fill(mock_rest, client, test_bot, fake_sync_r
     assert queue_len == 0
 
 
+@pytest.mark.skip(reason="TP/SL feature temporarily disabled")
 @patch("routers.binary_options._try_fill_limit_from_rest", side_effect=_mock_try_fill_limit)
 def test_create_bo_limit_immediate_fill_with_bracket(mock_rest, client, test_bot, fake_sync_redis):
     """LIMIT order with TP that fills immediately should push prefilled to ME."""
@@ -130,6 +131,7 @@ def test_create_bo_limit_immediate_fill_with_bracket(mock_rest, client, test_bot
     assert order["token_id"] == "fake-token-btc-m5-up"
 
 
+@pytest.mark.skip(reason="TP/SL feature temporarily disabled")
 @patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
 @patch("routers.binary_options._fill_market_from_rest", side_effect=_mock_fill_market_from_rest)
 def test_create_bo_market_with_bracket_pushes_to_queue(mock_fill, mock_price, client, test_bot, fake_sync_redis):

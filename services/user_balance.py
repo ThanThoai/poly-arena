@@ -44,7 +44,7 @@ def record_user_balance(db: Session, bot_name: str, trade_id: int | None = None)
         db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
         .filter(
             BinaryOption.bot_name.in_(user_bot_names),
-            BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS, BOResult.CANCELLED]),
+            BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
             BinaryOption.profit.isnot(None),
         )
         .scalar()

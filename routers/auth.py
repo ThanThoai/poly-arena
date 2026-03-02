@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from auth import create_access_token, get_current_user, hash_password, verify_password
 from database import get_db
-from models import Bot, User, UserSettings
+from models import BinaryOption, BOResult, Bot, User, UserSettings
 from schemas import TokenResponse, UserLogin, UserRegister, UserResponse, UserSettingsUpdate, UserSettingsResponse
 
 router = APIRouter()
@@ -80,12 +80,26 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     user_bots = (
         db.query(Bot)
         .filter(Bot.user_id == user.id)
-        .with_entities(Bot.initial_balance, Bot.balance)
+        .with_entities(Bot.bot_name, Bot.initial_balance, Bot.balance)
         .all()
     )
-    allocated_balance = sum(row[0] or 0 for row in user_bots)
-    total_balance = sum(row[1] or 0 for row in user_bots)
+    allocated_balance = sum(row[1] or 0 for row in user_bots)
+    total_balance = sum(row[2] or 0 for row in user_bots)
     available_balance = (user.initial_balance or 0) - allocated_balance
+
+    # P&L from WIN/LOSS trades only
+    bot_names = [row[0] for row in user_bots]
+    total_pnl = 0.0
+    if bot_names:
+        total_pnl = (
+            db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
+            .filter(
+                BinaryOption.bot_name.in_(bot_names),
+                BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
+                BinaryOption.profit.isnot(None),
+            )
+            .scalar()
+        ) or 0.0
 
     return UserResponse(
         id=user.id,
@@ -95,5 +109,5 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
         allocated_balance=allocated_balance,
         available_balance=available_balance,
         total_balance=round(total_balance, 2),
-        total_pnl=round(total_balance - allocated_balance, 2),
+        total_pnl=round(total_pnl, 2),
     )

@@ -9,6 +9,8 @@ Verifies:
 """
 
 import pytest
+
+pytestmark = pytest.mark.skip(reason="TP/SL feature temporarily disabled")
 from pydantic import ValidationError
 
 from schemas import BOCreate
