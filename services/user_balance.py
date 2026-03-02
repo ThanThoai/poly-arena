@@ -15,7 +15,12 @@ from models import BinaryOption, Bot, BOResult, User, UserBalanceHistory
 logger = logging.getLogger(__name__)
 
 
-def record_user_balance(db: Session, bot_name: str, trade_id: int | None = None) -> None:
+def record_user_balance(
+    db: Session,
+    bot_name: str,
+    trade_id: int | None = None,
+    pnl_amount: float | None = None,
+) -> None:
     """
     Compute and record the user's realized balance after a trade settles.
 
@@ -56,6 +61,8 @@ def record_user_balance(db: Session, bot_name: str, trade_id: int | None = None)
         user_id=user.id,
         balance=realized_balance,
         trade_id=trade_id,
+        bot_id=bot.id,
+        pnl_amount=pnl_amount,
     ))
 
     logger.info(

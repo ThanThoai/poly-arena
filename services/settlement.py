@@ -260,7 +260,11 @@ def _settle_single_trade(
             balance     = bot.balance,
             trade_id    = bo.id,
         ))
-    record_user_balance(db, bo.bot_name, trade_id=bo.id)
+        # Auto-pause on bankruptcy
+        if bot.balance <= 0:
+            bot.status = "PAUSED"
+            logger.warning("Bot '%s' auto-paused: balance=%.8f", bot.bot_name, bot.balance)
+    record_user_balance(db, bo.bot_name, trade_id=bo.id, pnl_amount=profit)
 
     # SETTLEMENT trace — candle comparison and payout
     if bo.exit_trigger in ("TP", "SL"):

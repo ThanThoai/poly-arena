@@ -79,7 +79,7 @@ def update_settings(
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     user_bots = (
         db.query(Bot)
-        .filter(Bot.user_id == user.id)
+        .filter(Bot.user_id == user.id, Bot.is_active == True)
         .with_entities(Bot.bot_name, Bot.initial_balance, Bot.balance)
         .all()
     )
@@ -110,4 +110,5 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
         available_balance=available_balance,
         total_balance=round(total_balance, 2),
         total_pnl=round(total_pnl, 2),
+        is_admin=user.is_admin or False,
     )

@@ -1477,8 +1477,50 @@ class MatchingEngine:
             # level from the shadow book, causing stale-data fills.
             if raw_bid and event.get("bid_size"):
                 changes.append({"side": "bid", "price": raw_bid, "size": event["bid_size"]})
+            elif raw_bid:
+                # bid_size missing — infer from current best bid (mirror of ask logic)
+                with book._lock:
+                    if book.bids:
+                        best_bid_price, best_bid_size = book.bids.peekitem(-1)
+                        new_bid = Decimal(str(raw_bid))
+                        if new_bid > best_bid_price and best_bid_size > 0:
+                            changes.append({
+                                "side": "bid",
+                                "price": raw_bid,
+                                "size": str(best_bid_size),
+                            })
+                            logger.info(
+                                "best_bid_ask: inferred bid_size=%s for bid=%s "
+                                "(from current best_bid=%s:%s) on %s",
+                                best_bid_size, raw_bid,
+                                best_bid_price, best_bid_size,
+                                asset_id[:16],
+                            )
             if raw_ask and event.get("ask_size"):
                 changes.append({"side": "ask", "price": raw_ask, "size": event["ask_size"]})
+            elif raw_ask:
+                # ask_size missing — infer size from the book's current best
+                # ask so LIMIT orders can fill when the price drops.
+                # Polymarket confirms liquidity exists at this price; we use
+                # the current best ask's size as a conservative estimate.
+                # The next full book/price_change event will correct it.
+                with book._lock:
+                    if book.asks:
+                        best_ask_price, best_ask_size = book.asks.peekitem(0)
+                        new_ask = Decimal(str(raw_ask))
+                        if new_ask < best_ask_price and best_ask_size > 0:
+                            changes.append({
+                                "side": "ask",
+                                "price": raw_ask,
+                                "size": str(best_ask_size),
+                            })
+                            logger.info(
+                                "best_bid_ask: inferred ask_size=%s for ask=%s "
+                                "(from current best_ask=%s:%s) on %s",
+                                best_ask_size, raw_ask,
+                                best_ask_price, best_ask_size,
+                                asset_id[:16],
+                            )
             if changes:
                 book.apply_changes(changes)
                 # Run matching so pending LIMIT orders can fill when

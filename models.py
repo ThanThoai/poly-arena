@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, ForeignKey, Integer, JSON, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, Enum as SAEnum, ForeignKey, Integer, JSON, Numeric, String, UniqueConstraint, text
 
 from database import Base
 
@@ -14,6 +14,12 @@ USER_INITIAL_BALANCE = 5_000.0
 INITIAL_BALANCE = 1_000.0
 
 
+class BotStatus(str, enum.Enum):
+    ACTIVE  = "ACTIVE"
+    PAUSED  = "PAUSED"
+    DELETED = "DELETED"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -23,6 +29,7 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     initial_balance = Column(Numeric(18, 8, asdecimal=False), default=USER_INITIAL_BALANCE)
     is_active       = Column(Boolean, default=True)
+    is_admin        = Column(Boolean, default=False, server_default=text("false"))
     created_at      = Column(DateTime(timezone=True), default=_now)
 
 
@@ -44,6 +51,7 @@ class Bot(Base):
     is_active       = Column(Boolean, default=True)
     initial_balance = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)
     balance         = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)   # current equity
+    status          = Column(String(10), default="ACTIVE", nullable=False, server_default=text("'ACTIVE'"))
     user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at      = Column(DateTime(timezone=True), default=_now)
 
@@ -91,6 +99,8 @@ class UserBalanceHistory(Base):
     user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     balance     = Column(Numeric(18, 8, asdecimal=False), nullable=False)
     trade_id    = Column(Integer, nullable=True)   # trade that triggered the change
+    bot_id      = Column(Integer, nullable=True)   # which bot's trade triggered this
+    pnl_amount  = Column(Numeric(18, 8, asdecimal=False), nullable=True)  # profit/loss of that trade
     recorded_at = Column(DateTime(timezone=True), default=_now)
 
 
@@ -118,6 +128,7 @@ class BinaryOption(Base):
 
     # ── Order type ───────────────────────────────────────────────────────────
     limit_price  = Column(Numeric(18, 8, asdecimal=False), nullable=True)    # None = MARKET, set = LIMIT order
+    entry_fee    = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)  # fee charged at fill (taker=30bps, maker=0)
 
     # ── Bracket Order (TP/SL) tracking ──────────────────────────────────────
     tp_price     = Column(Numeric(18, 8, asdecimal=False), nullable=True)    # Take Profit price (optional)
@@ -170,3 +181,19 @@ class BotAchievement(Base):
     achievement_id = Column(Integer, ForeignKey("achievement_definitions.id"), nullable=False)
     earned_at      = Column(DateTime(timezone=True), default=_now)
     metadata_      = Column("metadata", JSON, nullable=True)
+
+
+# ── Price History ─────────────────────────────────────────────────────────────
+
+class PriceHistory(Base):
+    __tablename__ = "price_history"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    symbol      = Column(String(10), nullable=False, index=True)
+    timeframe   = Column(String(10), nullable=False, index=True)
+    direction   = Column(String(10), nullable=False, index=True)
+    best_ask    = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+    best_bid    = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+    bids        = Column(JSON, nullable=True)   # [[price, size], ...]
+    asks        = Column(JSON, nullable=True)   # [[price, size], ...]
+    recorded_at = Column(DateTime(timezone=True), default=_now, index=True)

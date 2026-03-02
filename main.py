@@ -9,8 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from database import SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
-from routers import achievements as achievements_router, auth, binary_options, bots, dashboard, ws as ws_router, ws_polymarket
+from routers import achievements as achievements_router, admin as admin_router, auth, binary_options, bots, dashboard, ws as ws_router, ws_polymarket
+from services.orderbook_broadcaster import broadcaster
 from services.redis_client import get_async_redis, close_async_redis
+from config.fees import maker_rebate_from_levels
 from services.order_trace import make_trace, append_trace
 from services.user_balance import record_user_balance
 from services.rest_exit import (
@@ -252,7 +254,7 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                                 trade_id=bo.id,
                             )
                         )
-                    record_user_balance(db, bo.bot_name, trade_id=bo.id)
+                    record_user_balance(db, bo.bot_name, trade_id=bo.id, pnl_amount=0.0)
 
                     db.commit()
                     _publish_trace_sync(bo)
@@ -315,21 +317,48 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
+                # Maker rebate: resting limit orders earn rebate on fill
+                rebate = 0.0
+                if wp_str:
+                    try:
+                        fill_levels = json.loads(wp_str)
+                        rebate = maker_rebate_from_levels(fill_levels)
+                        if rebate > 0:
+                            bot = db.query(Bot).filter(
+                                Bot.bot_name == bo.bot_name,
+                            ).first()
+                            if bot:
+                                bot.balance = round(bot.balance + rebate, 8)
+                            # Store rebate as negative entry_fee
+                            bo.entry_fee = round(
+                                (bo.entry_fee or 0) - rebate, 8,
+                            )
+                    except (json.JSONDecodeError, TypeError, KeyError):
+                        pass
+
                 # MATCHING trace
                 if status == "FILLED":
+                    nominal = round(rebate / 0.20, 8) if rebate > 0 else 0.0
                     append_trace(bo, make_trace(
                         "MATCHING", "ORDER_FILLED",
                         f"Order fully filled. Avg Entry Price: ${avg_entry:.4f}. "
-                        f"Shares: {filled:.4f}.",
+                        f"Shares: {filled:.4f}. "
+                        f"Rebate: ${rebate:.4f} (MAKER).",
                         {"avg_entry_price": avg_entry, "filled": filled,
-                         "status": status},
+                         "status": status, "nominal_fee": nominal,
+                         "role": "MAKER", "actual_fee_deducted": 0.0,
+                         "rebate_earned": rebate},
                     ))
                 elif status == "PARTIAL":
+                    nominal = round(rebate / 0.20, 8) if rebate > 0 else 0.0
                     append_trace(bo, make_trace(
                         "MATCHING", "PARTIAL_FILL",
-                        f"Partial fill: {filled:.4f} shares @ ${avg_entry:.4f}.",
+                        f"Partial fill: {filled:.4f} shares @ ${avg_entry:.4f}. "
+                        f"Rebate: ${rebate:.4f} (MAKER).",
                         {"avg_entry_price": avg_entry, "filled": filled,
-                         "status": status},
+                         "status": status, "nominal_fee": nominal,
+                         "role": "MAKER", "actual_fee_deducted": 0.0,
+                         "rebate_earned": rebate},
                     ))
 
                 db.commit()
@@ -823,6 +852,9 @@ async def lifespan(app: FastAPI):
         name="market-resolved-consumer",
     )
 
+    # Start orderbook broadcaster (single Redis pub/sub for all WS clients)
+    await broadcaster.start()
+
     # Seed achievement definitions
     try:
         from services.achievement_seeder import seed_achievements
@@ -834,9 +866,32 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("Failed to seed achievements: %s", exc)
 
+    # Seed default admin user if none exists
+    try:
+        from auth import hash_password as _hash_pw
+        from models import User as _User
+        _db = SessionLocal()
+        try:
+            if not _db.query(_User).filter(_User.is_admin == True).first():
+                _admin_pw = os.getenv("ADMIN_PASSWORD", "admin123")
+                _admin = _User(
+                    username="admin",
+                    email="admin@polyarena.local",
+                    hashed_password=_hash_pw(_admin_pw),
+                    is_admin=True,
+                )
+                _db.add(_admin)
+                _db.commit()
+                log.info("Seeded default admin user (username=admin)")
+        finally:
+            _db.close()
+    except Exception as exc:
+        log.warning("Failed to seed admin user: %s", exc)
+
     yield
 
     # ── Shutdown ────────────────────────────────────────────────────────────
+    await broadcaster.stop()
     consumer_task.cancel()
     cancel_task.cancel()
     fill_task.cancel()
@@ -881,6 +936,7 @@ app.include_router(
 )
 app.include_router(bots.router, prefix="/poly-arena/bots", tags=["Bots"])
 app.include_router(dashboard.router, prefix="/poly-arena/dashboard", tags=["Dashboard"])
+app.include_router(admin_router.router, prefix="/poly-arena/admin", tags=["Admin"])
 app.include_router(achievements_router.router, prefix="/poly-arena/achievements", tags=["Achievements"])
 app.include_router(ws_router.router, prefix="/poly-arena")
 app.include_router(ws_polymarket.router, prefix="/poly-arena")

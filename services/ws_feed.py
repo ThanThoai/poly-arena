@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 
 _WS_URI = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 _PING_INTERVAL = WS_PING_INTERVAL_S
-_RECONNECT_BASE = 2  # seconds
-_RECONNECT_MAX = 60  # seconds
+_RECONNECT_BASE = 1  # seconds
+_RECONNECT_MAX = 10  # seconds (was 60 — faster recovery reduces data gaps)
 
 
 class PolymarketFeed:
@@ -126,14 +126,16 @@ class PolymarketFeed:
     # ── Internal ─────────────────────────────────────────────────────────────
 
     async def _run_forever(self) -> None:
-        """Reconnect loop with exponential back-off."""
+        """Reconnect loop with exponential back-off (max 10s)."""
         while self._running:
             try:
                 await self._connect_and_listen()
                 # Clean disconnect — reset delay
                 self._reconnect_delay = _RECONNECT_BASE
             except ConnectionClosed as e:
-                logger.warning("WebSocket closed: %s", e)
+                logger.warning("WebSocket closed: %s — reconnecting quickly", e)
+                # Reset delay on clean close for faster recovery
+                self._reconnect_delay = _RECONNECT_BASE
             except Exception as e:
                 logger.error("WebSocket error: %s", e, exc_info=True)
 

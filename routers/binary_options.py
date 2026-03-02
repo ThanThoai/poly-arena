@@ -12,12 +12,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import BinaryOption, BalanceHistory, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast
+from models import BinaryOption, BalanceHistory, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast, PriceHistory
 from services.settlement import calc_settlement_time
 from services.polymarket import PolymarketClient
 from config.timing import (
     HTTP_TIMEOUT, HTTP_TIMEOUT_FAST,
     API_PRICE_CACHE_TTL_S,
+)
+from config.fees import (
+    taker_fee_from_levels, maker_rebate_from_levels,
+    estimate_max_taker_fee, nominal_fee_per_level,
 )
 from ws_feed_service.config import (
     PRICE_KEY_PREFIX, STALE_THRESHOLD_S, QUEUE_ORDERS_NEW,
@@ -26,6 +30,7 @@ from ws_feed_service.config import (
 from schemas import (
     BOBotStats, BOCreate, BOForecastStats, BOResponse,
     BOStats, BOTimeframeStats,
+    SessionInfo as SessionInfoSchema, TimelineEvent, TradeInspectResponse,
 )
 from services.order_trace import make_trace, append_trace
 from services.rest_exit import (
@@ -57,6 +62,7 @@ class SessionInfo:
     settlement_at: "datetime"  # candle close (UTC aware datetime)
     session_offset: int     # effective offset from *current* candle (0 or 1)
     is_current: bool        # True if the resolved candle is the current one
+    bumped: bool = False    # True if boundary guard auto-bumped to next session
 
 
 def resolve_session(
@@ -93,20 +99,6 @@ def resolve_session(
     ------
     ValueError
         If timeframe is unsupported or the resolved candle is out of range.
-
-    Examples
-    --------
-    >>> # M5, now = 14:23:15 UTC → current candle opens at 14:20, closes 14:25
-    >>> info = resolve_session("M5")
-    >>> info.candle_open  # 14:20:00 as unix ts
-    >>> info.settlement_at  # 14:25:00 UTC
-
-    >>> # M5, timestamp = 14:27:00 → candle opens at 14:25, closes 14:30
-    >>> # That is the *next* candle relative to 14:23 → session_offset=1 → OK
-    >>> info = resolve_session("M5", timestamp=...)
-
-    >>> # M5, timestamp = 14:35:00 → candle opens at 14:35, closes 14:40
-    >>> # That is 2 candles ahead → rejected
     """
     period = _TF_PERIOD_S.get(timeframe)
     if period is None:
@@ -116,6 +108,8 @@ def resolve_session(
     current_open = now - (now % period)          # candle open of the *current* candle
     next_open    = current_open + period         # candle open of the next candle
     max_open     = next_open                     # max allowed candle open (1 session ahead)
+
+    bumped = False
 
     if timestamp is not None:
         # Resolve candle from the provided timestamp
@@ -141,6 +135,10 @@ def resolve_session(
         effective_offset = min(session_offset, 1)
         candle_open = current_open + period * effective_offset
 
+        # Boundary guard disabled — orders near candle boundary stay in
+        # the current session.  The prefetch infrastructure ensures WS
+        # data is available for the next session if needed.
+
     # Settlement = candle close = candle_open + period
     from datetime import datetime as _dt, timezone as _tz
     settlement_at = _dt.fromtimestamp(candle_open + period, tz=_tz.utc)
@@ -150,6 +148,7 @@ def resolve_session(
         settlement_at=settlement_at,
         session_offset=effective_offset,
         is_current=(effective_offset == 0),
+        bumped=bumped,
     )
 
 
@@ -527,6 +526,9 @@ def create_bo(
     if not bot:
         raise HTTPException(status_code=401, detail="Invalid or inactive API key")
 
+    if getattr(bot, "status", "ACTIVE") != "ACTIVE":
+        raise HTTPException(status_code=400, detail=f"Bot is {bot.status}. Only ACTIVE bots can trade.")
+
     if bot.balance < payload.amount:
         raise HTTPException(
             status_code=400,
@@ -593,10 +595,13 @@ def create_bo(
             ))
 
     # Deduct amount from balance upfront — refunded on cancel, settled on WIN/LOSS
+    is_limit   = payload.limit_price is not None
+    max_fee = estimate_max_taker_fee(payload.amount) if not is_limit else 0
+    if bot.balance < payload.amount + max_fee:
+        raise HTTPException(status_code=400, detail="Insufficient balance (including estimated fee)")
     bot.balance = round(bot.balance - payload.amount, 8)
 
     pm_status  = _FORECAST_TO_STATUS[payload.forecast.value]
-    is_limit   = payload.limit_price is not None
     token_id:  Optional[str]   = None
     entry_price: float
 
@@ -664,14 +669,21 @@ def create_bo(
                 payload.tp_price, payload.sl_price,
             )
 
+            # Taker fee: marketable limit fills immediately (dynamic fee curve)
+            entry_fee = taker_fee_from_levels(walk_levels)
+            bot.balance = round(bot.balance - entry_fee, 8)
+
             limit_traces = list(pending_traces)
             limit_traces.append(make_trace(
                 "MATCHING", "LIMIT_REST_FILL",
                 f"Limit Order filled immediately via REST. "
                 f"Best Ask <= Limit ${entry_price:.4f}. "
-                f"Avg Entry: ${avg_price:.4f}, Shares: {num_shares:.4f}.",
+                f"Avg Entry: ${avg_price:.4f}, Shares: {num_shares:.4f}. "
+                f"Fee: ${entry_fee:.4f} (TAKER).",
                 {"limit_price": entry_price, "avg_entry_price": avg_price,
-                 "num_shares": num_shares, "levels": len(walk_levels)},
+                 "num_shares": num_shares, "levels": len(walk_levels),
+                 "nominal_fee": entry_fee, "role": "TAKER",
+                 "actual_fee_deducted": entry_fee, "rebate_earned": 0.0},
             ))
 
             bo = BinaryOption(
@@ -692,6 +704,7 @@ def create_bo(
                 sl_price          = payload.sl_price,
                 ttl               = payload.ttl,
                 session_offset    = session_offset,
+                entry_fee         = entry_fee,
                 me_order_status   = "FILLED" if has_bracket else None,
                 walk_prices       = {"entry": walk_levels} if walk_levels else None,
                 traces            = limit_traces if limit_traces else None,
@@ -780,6 +793,9 @@ def create_bo(
                 payload.tp_price, payload.sl_price,
             )
 
+            # Maker — fee set to 0 at creation; rebate applied when ME fills
+            entry_fee = 0.0
+
             bo = BinaryOption(
                 bot_name          = bot.bot_name,
                 symbol            = payload.symbol,
@@ -798,6 +814,7 @@ def create_bo(
                 sl_price          = payload.sl_price,
                 ttl               = payload.ttl,
                 session_offset    = session_offset,
+                entry_fee         = entry_fee,
                 me_order_status   = "PENDING",
                 traces            = pending_traces if pending_traces else None,
             )
@@ -871,14 +888,21 @@ def create_bo(
             payload.tp_price, payload.sl_price,
         )
 
+        # Taker fee for MARKET order (dynamic fee curve, per-level)
+        entry_fee = taker_fee_from_levels(walk_levels)
+        bot.balance = round(bot.balance - entry_fee, 8)
+
         # Add MATCHING traces for REST sweep
         market_traces = list(pending_traces)
         market_traces.append(make_trace(
             "MATCHING", "REST_SWEEP",
             f"Market Order filled. Avg Entry Price: ${avg_price:.4f}. "
-            f"Total Slippage: {((avg_price - walk_levels[0]['price']) / walk_levels[0]['price'] * 100) if walk_levels else 0:.2f}%.",
+            f"Total Slippage: {((avg_price - walk_levels[0]['price']) / walk_levels[0]['price'] * 100) if walk_levels else 0:.2f}%. "
+            f"Fee: ${entry_fee:.4f} (TAKER).",
             {"avg_entry_price": avg_price, "num_shares": num_shares,
-             "levels": len(walk_levels)},
+             "levels": len(walk_levels),
+             "nominal_fee": entry_fee, "role": "TAKER",
+             "actual_fee_deducted": entry_fee, "rebate_earned": 0.0},
         ))
 
         bo = BinaryOption(
@@ -899,6 +923,7 @@ def create_bo(
             sl_price          = payload.sl_price,
             ttl               = payload.ttl,
             session_offset    = session_offset,
+            entry_fee         = entry_fee,
             # MARKET+bracket → "PREFILLED" (ME monitors TP/SL only)
             # MARKET without bracket → None (scheduler settles)
             me_order_status   = "PREFILLED" if has_bracket else None,
@@ -1332,3 +1357,117 @@ def engine_prices():
     return {"prices": prices}
 
 
+# ── Public Trade Inspector ──────────────────────────────────────────────────
+
+_TF_SECONDS = {"M5": 300, "M15": 900, "H1": 3600}
+
+
+@router.get("/inspect/{trade_id}", response_model=TradeInspectResponse)
+def inspect_trade_public(
+    trade_id: int,
+    db: Session = Depends(get_db),
+):
+    """Public trade inspector — no auth required."""
+    trade = db.get(BinaryOption, trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    tf_secs = _TF_SECONDS.get(
+        trade.timeframe.value if hasattr(trade.timeframe, "value") else trade.timeframe, 300
+    )
+
+    # Derive the target session window from settlement_at (= candle_open + period).
+    # This correctly handles A+1 orders where created_at is in candle A
+    # but the order targets candle A+1.
+    settle_ts = trade.settlement_at
+    if settle_ts and settle_ts.tzinfo is None:
+        settle_ts = settle_ts.replace(tzinfo=timezone.utc)
+
+    created_ts = trade.created_at
+    if created_ts and created_ts.tzinfo is None:
+        created_ts = created_ts.replace(tzinfo=timezone.utc)
+
+    if settle_ts:
+        session_end_unix = int(settle_ts.timestamp())
+        session_start_unix = session_end_unix - tf_secs
+    elif created_ts:
+        session_start_unix = int(created_ts.timestamp()) // tf_secs * tf_secs
+        session_end_unix = session_start_unix + tf_secs
+    else:
+        session_start_unix = 0
+        session_end_unix = tf_secs
+
+    session_start_dt = datetime.fromtimestamp(session_start_unix, tz=timezone.utc)
+    session_end_dt = datetime.fromtimestamp(session_end_unix, tz=timezone.utc)
+
+    direction = "UP" if (trade.forecast.value if hasattr(trade.forecast, "value") else trade.forecast) == "GREEN" else "DOWN"
+    symbol_val = trade.symbol.value if hasattr(trade.symbol, "value") else trade.symbol
+    tf_val = trade.timeframe.value if hasattr(trade.timeframe, "value") else trade.timeframe
+
+    price_rows = (
+        db.query(PriceHistory)
+        .filter(
+            PriceHistory.symbol == symbol_val,
+            PriceHistory.timeframe == tf_val,
+            PriceHistory.direction == direction,
+            PriceHistory.recorded_at >= session_start_dt,
+            PriceHistory.recorded_at <= session_end_dt,
+        )
+        .order_by(PriceHistory.recorded_at)
+        .all()
+    )
+
+    timeline: list[dict] = []
+
+    for t in trade.traces or []:
+        timeline.append({
+            "timestamp": t.get("timestamp", ""),
+            "category": "trace",
+            "action": t.get("action", t.get("stage", "")),
+            "details": t.get("details", ""),
+            "data": t.get("data"),
+        })
+
+    wp = trade.walk_prices or {}
+    if wp.get("entry"):
+        timeline.append({
+            "timestamp": created_ts.isoformat() if created_ts else "",
+            "category": "fill_entry",
+            "action": "entry_fill",
+            "details": f"{len(wp['entry'])} level(s), avg={trade.avg_price}",
+            "data": wp["entry"],
+        })
+    if wp.get("exit"):
+        exit_ts = trade.exit_at or trade.settlement_at or trade.updated_at
+        if exit_ts and exit_ts.tzinfo is None:
+            exit_ts = exit_ts.replace(tzinfo=timezone.utc)
+        timeline.append({
+            "timestamp": exit_ts.isoformat() if exit_ts else "",
+            "category": "fill_exit",
+            "action": f"exit_fill ({trade.exit_trigger or 'settlement'})",
+            "details": f"{len(wp['exit'])} level(s), exit_price={trade.exit_price}",
+            "data": wp["exit"],
+        })
+
+    for ph in price_rows:
+        timeline.append({
+            "timestamp": ph.recorded_at.isoformat() if ph.recorded_at else "",
+            "category": "price",
+            "action": "price_snapshot",
+            "details": f"bid={ph.best_bid} ask={ph.best_ask}",
+            "data": {"bids": ph.bids, "asks": ph.asks},
+        })
+
+    timeline.sort(key=lambda x: x["timestamp"])
+
+    return TradeInspectResponse(
+        trade=BOResponse.model_validate(trade),
+        timeline=[TimelineEvent(**e) for e in timeline],
+        session=SessionInfoSchema(
+            symbol=symbol_val,
+            timeframe=tf_val,
+            direction=direction,
+            session_start=session_start_unix,
+            session_end=session_end_unix,
+        ),
+    )

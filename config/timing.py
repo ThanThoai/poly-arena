@@ -36,6 +36,10 @@ ME_CLEANUP_INTERVAL = 50        # run cleanup every N calls to run_matching
 ME_DEFAULT_SLIPPAGE = Decimal("0.10")    # 10% max slippage for MARKET orders
 ME_DUST_THRESHOLD = Decimal("0.000001")  # residual size below this → zero
 
+# ── Boundary Guard ───────────────────────────────────────────────────────────
+
+BOUNDARY_GUARD_S = 15           # auto-bump to next session if < N seconds remain
+
 # ── Token Registry ───────────────────────────────────────────────────────────
 
 TOKEN_PREFETCH_CANDLES = 5      # future candles to prefetch token_ids for

@@ -39,3 +39,7 @@ UI_PAST_SESSIONS = 1                # Number of past sessions to keep for UI
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 TIMEFRAMES = ["M5", "M15", "H1"]
 DIRECTIONS = ["UP", "DOWN"]
+
+# ── Price history recording ─────────────────────────────────────────────────
+
+PRICE_HISTORY_INTERVAL_S = 10  # one snapshot per combo every 10s
