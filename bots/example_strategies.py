@@ -198,7 +198,7 @@ STRATEGIES = {
     "bollinger": BollingerBot,
 }
 
-TF_CHOICES = ["M5", "M15", "H1"]
+TF_CHOICES = ["M5", "M15"]
 
 
 def main() -> None:
@@ -212,7 +212,7 @@ def main() -> None:
     parser.add_argument("--api",  default="https://aiavatar.torilab.ai/poly-arena", help="API base URL")
     parser.add_argument("--amount", type=float, default=100.0, help="Trade amount USD")
     parser.add_argument("--symbols", nargs="+",
-                        default=["BTC", "ETH", "SOL", "XRP"],
+                        default=["BTC", "ETH"],
                         help="Symbols to trade")
     args = parser.parse_args()
 

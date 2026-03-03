@@ -26,14 +26,13 @@ import httpx
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 API_BASE = "https://aiavatar.torilab.ai/poly-arena"
-SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+SYMBOLS = ["BTC", "ETH"]
 FORECASTS = ["GREEN", "RED"]
 AMOUNT = 100.0  # fixed amount per trade (USD)
 
 BOTS = [
     {"name": "Baseline-M5", "timeframe": "M5", "interval_s": 5 * 60},
     {"name": "Baseline-M15", "timeframe": "M15", "interval_s": 15 * 60},
-    {"name": "Baseline-H1", "timeframe": "H1", "interval_s": 60 * 60},
 ]
 
 CONFIG_FILE = Path(__file__).parent / "bots_config.json"

@@ -1847,7 +1847,13 @@ _engine: Optional[MatchingEngine] = None
 
 
 def get_engine() -> MatchingEngine:
-    """Return the global MatchingEngine singleton (create on first call)."""
+    """Return the global MatchingEngine singleton (create on first call).
+
+    .. deprecated::
+        Production code should use SessionManager/SessionEngine for WS event
+        dispatch and order matching. This singleton is retained for tests that
+        instantiate MatchingEngine directly (test_slippage, test_market_resolved, etc.).
+    """
     global _engine
     if _engine is None:
         _engine = MatchingEngine()

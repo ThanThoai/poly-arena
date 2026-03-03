@@ -55,15 +55,22 @@ STUCK_ORDER_THRESHOLD_MIN = 10  # settlement_at + N min → stuck
 NULL_SETTLE_THRESHOLD_HOURS = 2  # created_at + N hours (no settlement_at) → stuck
 HEARTBEAT_INTERVAL_S = 30       # publish heartbeat every N seconds
 HEARTBEAT_TTL_S = 60            # Redis TTL for heartbeat key
+BALANCE_SNAPSHOT_CRON_SECOND = 10  # balance snapshot at :10s (after settlement at :05s)
 
 # ── Queue & Stream ───────────────────────────────────────────────────────────
 
 BRPOP_TIMEOUT_S = 1             # OrderConsumer BRPOP blocking timeout
+
+# ── Session Lifecycle ──────────────────────────────────────────────────────
+
+REQUIRED_FUTURE_SESSIONS = 3       # current + 3 future = 4 total per (sym, tf)
+SESSION_PRE_CREATE_BUFFER_S = 20   # create next session 20s before candle boundary
+SESSION_CLEANUP_DELAY_S = 10       # cleanup 10s after session period ends
+SESSION_LIFECYCLE_TICK_S = 5       # lifecycle check interval
 
 # ── Timeframe Durations ─────────────────────────────────────────────────────
 
 TF_SECONDS: dict[str, int] = {
     "M5":  300,
     "M15": 900,
-    "H1":  3600,
 }

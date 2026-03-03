@@ -52,8 +52,8 @@ def ws_health():
         pass
 
     # Price staleness check
-    _SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
-    _TFS = ["M5", "M15", "H1"]
+    _SYMBOLS = ["BTC", "ETH"]
+    _TFS = ["M5", "M15"]
     _DIRS = ["UP", "DOWN"]
     stale_count = 0
     for sym in _SYMBOLS:

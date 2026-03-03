@@ -389,10 +389,10 @@ def make_bot(
         provider:       "gemini" or "anthropic"
         llm_key:        API key for the LLM provider
         bot_name:       Display name registered in PolyArena
-        timeframe:      "M5" | "M15" | "H1"
+        timeframe:      "M5" | "M15"
         api_key:        PolyArena x-api-key for this bot
         model:          LLM model name (uses provider default if omitted)
-        symbols:        List of symbols to trade (default: BTC/ETH/SOL/XRP)
+        symbols:        List of symbols to trade (default: BTC/ETH)
         amount:         Maximum trade size in USD (used at 100% confidence)
         api_base:       PolyArena server URL
         min_confidence: Skip trade if confidence is below this (default 0.60)
@@ -410,7 +410,7 @@ def make_bot(
         api_key=api_key,
         llm_key=llm_key,
         model=model or cls.DEFAULT_MODEL,
-        symbols=symbols or ["BTC", "ETH", "SOL", "XRP"],
+        symbols=symbols or ["BTC", "ETH"],
         amount=amount,
         api_base=api_base,
         min_confidence=min_confidence,

@@ -79,6 +79,6 @@ All routes prefixed with `/poly-arena/`:
 
 ## Supported Symbols & Timeframes
 
-- Symbols: BTC, ETH, SOL, XRP
-- Timeframes: M5, M15, H1
+- Symbols: BTC, ETH
+- Timeframes: M5, M15
 - Forecasts: GREEN (price up), RED (price down)

@@ -113,6 +113,11 @@ class SessionManager:
                     if not sids:
                         self._token_index.pop(token_id, None)
 
+    def list_sessions(self) -> list[SessionEngine]:
+        """Return all non-ARCHIVED sessions."""
+        with self._lock:
+            return [e for e in self._engines.values() if e.state != SessionState.ARCHIVED]
+
     # ── WS Event dispatch ─────────────────────────────────────────────────────
 
     def dispatch_event(self, event: dict) -> None:
@@ -131,6 +136,11 @@ class SessionManager:
 
         # Fan-out to all sessions owning this token
         sessions = self.get_sessions_for_token(asset_id)
+        if not sessions and asset_id:
+            logger.warning(
+                "No sessions for token %s (event_type=%s) — event dropped",
+                asset_id[:16], etype,
+            )
         for session in sessions:
             try:
                 session.dispatch_ws_event(event)

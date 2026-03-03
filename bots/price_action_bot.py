@@ -961,7 +961,7 @@ def main() -> None:
         timeframe="M5",
         api_key="Ab1qAT3O2QDx1PFOCL2LhHMgRAi-NLTdMbN51f-Em6M",
         amount=300,
-        symbols=["BTC", "ETH", "SOL", "XRP"],
+        symbols=["BTC", "ETH"],
         min_confidence=0.55,
         api_base="https://aiavatar.torilab.ai/poly-arena",
     )

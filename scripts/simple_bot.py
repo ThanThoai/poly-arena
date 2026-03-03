@@ -15,7 +15,7 @@ Usage:
     run(cron="*/5 * * * *", cron_second=10)
 
     # Cron-style: trade at the top of every hour
-    run(symbol="ETH", timeframe="H1", cron="0 * * * *")
+    run(symbol="ETH", timeframe="M15", cron="*/15 * * * *")
 
     # One-shot (no schedule)
     run(count=1)
@@ -274,7 +274,7 @@ def run(
                     continue
                 last_trigger_min = current_min
                 print(f"[cron] Triggered at {now.strftime('%H:%M:%S')} UTC")
-            for s in ["BTC", "ETH", "SOL", "XRP"]:
+            for s in ["BTC", "ETH"]:
                 run_once(api_key, s, timeframe)
             i += 1
 

@@ -22,8 +22,9 @@ from typing import Optional
 
 import redis
 
+from services.order_trace import make_trace
 from services.matching_engine import (
-    MatchingEngine, OrderSide, OrderStatus, OrderStateChangeEvent,
+    OrderSide, OrderStatus, OrderStateChangeEvent,
     BracketFillResult,
 )
 from services.session_manager import SessionManager
@@ -165,6 +166,9 @@ class OrderConsumer:
                 if self._running:
                     logger.error("OrderConsumer BRPOP error: %s", exc)
 
+    # Map forecast to direction for token resolution from session
+    _FORECAST_TO_DIR = {"GREEN": "UP", "RED": "DOWN"}
+
     def _process_order(self, raw: str, session_id: Optional[str] = None) -> None:
         """Parse JSON and place virtual order in the matching engine."""
         try:
@@ -174,23 +178,7 @@ class OrderConsumer:
             return
 
         bo_id = data.get("bo_id")
-        token_id = data.get("token_id")
         is_prefilled = data.get("prefilled", False)
-
-        if token_id is None:
-            logger.warning(
-                "OrderConsumer: no token_id in payload (bo_id=%s) — rejecting",
-                bo_id,
-            )
-            if bo_id is not None:
-                self._publish_async(
-                    self._writer.publish_order_cancel(
-                        bo_id=bo_id, order_id="",
-                        reason="NO_TOKEN_ID",
-                        filled=0.0, avg_entry_price=0.0,
-                    )
-                )
-            return
 
         # Resolve session from queue key or payload
         if session_id is None:
@@ -204,6 +192,10 @@ class OrderConsumer:
                 session_id, bo_id,
             )
             if bo_id is not None:
+                self._publish_trace(bo_id, make_trace(
+                    "MATCHING", "ME_REJECTED",
+                    f"Order rejected by ME: session {session_id} not found.",
+                ))
                 self._publish_async(
                     self._writer.publish_order_cancel(
                         bo_id=bo_id, order_id="",
@@ -212,6 +204,47 @@ class OrderConsumer:
                     )
                 )
             return
+
+        # Resolve token_id from session using direction.
+        # Supports both new payloads (direction field) and legacy (token_id field).
+        token_id = data.get("token_id")
+        if token_id is None:
+            direction = data.get("direction")
+            if direction is None:
+                # Fallback: derive direction from forecast
+                forecast = data.get("forecast")
+                direction = self._FORECAST_TO_DIR.get(forecast) if forecast else None
+
+            if direction and hasattr(session, "tokens"):
+                token_id = session.tokens.get(direction)
+
+        if token_id is None:
+            logger.warning(
+                "OrderConsumer: cannot resolve token_id for bo_id=%s "
+                "session=%s — rejecting",
+                bo_id, session_id,
+            )
+            if bo_id is not None:
+                self._publish_trace(bo_id, make_trace(
+                    "MATCHING", "ME_REJECTED",
+                    f"Order rejected by ME: cannot resolve token_id for session {session_id}.",
+                ))
+                self._publish_async(
+                    self._writer.publish_order_cancel(
+                        bo_id=bo_id, order_id="",
+                        reason="NO_TOKEN_RESOLVED",
+                        filled=0.0, avg_entry_price=0.0,
+                    )
+                )
+            return
+
+        # Trace: order received by ME
+        if bo_id is not None:
+            self._publish_trace(bo_id, make_trace(
+                "MATCHING", "ME_ORDER_RECEIVED",
+                f"Order received by Matching Engine from queue {session_id}. "
+                f"Token: {token_id[:24]}.",
+            ))
 
         # Ensure session owns this token
         self._session_manager.add_valid_token(token_id)
@@ -266,6 +299,14 @@ class OrderConsumer:
                 order.filled, order.avg_entry_price,
                 tp_price, sl_price, session.session_id,
             )
+
+            # Trace: bracket registered
+            if bo_id is not None:
+                self._publish_trace(bo_id, make_trace(
+                    "MONITORING", "ME_BRACKET_REGISTERED",
+                    f"Bracket order registered in ME. Monitoring TP={tp_price} SL={sl_price}. "
+                    f"Session: {session.session_id}.",
+                ))
 
             # Register for centralized monitoring (bracket exits)
             if bo_id is not None:
@@ -432,6 +473,21 @@ class OrderConsumer:
                     bo_id, order.filled, order.avg_entry_price, order.status.value,
                 )
 
+                # Trace: ME fill
+                self._publish_trace(bo_id, make_trace(
+                    "MATCHING", "ME_FILL",
+                    f"ME filled {float(order.filled):.4f} shares @ "
+                    f"${float(order.avg_entry_price) if order.avg_entry_price else 0:.4f}. "
+                    f"Status: {order.status.value}.",
+                    data={
+                        "filled": float(order.filled),
+                        "avg_entry": float(order.avg_entry_price) if order.avg_entry_price else 0,
+                        "status": order.status.value,
+                        "fill_levels": [{"price": float(p), "qty": float(q)} for p, q in fill_levels_snapshot],
+                        "token_id": token_id,
+                    },
+                ))
+
                 # Log limit order fill to file with orderbook snapshot
                 if not is_market:
                     book = self._session_manager.get_book(token_id)
@@ -486,6 +542,13 @@ class OrderConsumer:
                         "bo_id=%s order=%s filled=%s",
                         bo_id, order.order_id[:12], order.filled,
                     )
+
+                    # Trace: ME cancel
+                    self._publish_trace(bo_id, make_trace(
+                        "MATCHING", "ME_CANCEL",
+                        f"ME cancelled order. Reason: MARKET_IOC_CANCEL. "
+                        f"Filled: {float(order.filled):.4f}.",
+                    ))
                     # Cleanup tracking for terminal state
                     self._order_to_bo.pop(order.order_id, None)
                     self._order_to_token.pop(order.order_id, None)
@@ -593,6 +656,14 @@ class OrderConsumer:
             logger.error("Failed to schedule async publish: %s", exc)
 
     # ── Bracket exit callback ─────────────────────────────────────────────
+
+    def _publish_trace(self, bo_id: int, trace: dict) -> None:
+        """Publish a trace to Redis from the consumer thread (sync)."""
+        from services.order_trace import publish_trace_to_redis
+        try:
+            publish_trace_to_redis(self._r, bo_id, trace)
+        except Exception:
+            pass
 
     def _make_bracket_callback(self, bo_id: int):
         """

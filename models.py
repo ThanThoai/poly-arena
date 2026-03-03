@@ -59,14 +59,11 @@ class Bot(Base):
 class BOSymbol(str, enum.Enum):
     BTC = "BTC"
     ETH = "ETH"
-    SOL = "SOL"
-    XRP = "XRP"
 
 
 class BOTimeframe(str, enum.Enum):
     M5  = "M5"
     M15 = "M15"
-    H1  = "H1"
 
 
 class BOForecast(str, enum.Enum):
@@ -101,6 +98,18 @@ class UserBalanceHistory(Base):
     trade_id    = Column(Integer, nullable=True)   # trade that triggered the change
     bot_id      = Column(Integer, nullable=True)   # which bot's trade triggered this
     pnl_amount  = Column(Numeric(18, 8, asdecimal=False), nullable=True)  # profit/loss of that trade
+    recorded_at = Column(DateTime(timezone=True), default=_now)
+
+
+class UserBalanceSnapshot(Base):
+    __tablename__ = "user_balance_snapshots"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    balance     = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+    bot_balance = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+    available   = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+    session_id  = Column(String(50), nullable=True)
     recorded_at = Column(DateTime(timezone=True), default=_now)
 
 
@@ -148,6 +157,8 @@ class BinaryOption(Base):
     traces          = Column(JSON, nullable=True)        # [{timestamp, stage, action, details, data}]
     position_closed = Column(Boolean, default=False)     # True when market resolved or bracket fully exited
     session_offset  = Column(Integer, default=0)          # 0 = current session, 1 = next session
+    session_id      = Column(String(64), nullable=True, index=True)   # e.g. "BTC:M5:1709313000"
+    candle_open     = Column(Integer, nullable=True)                  # Unix ts of candle open boundary
 
 
 # ── Achievement System ─────────────────────────────────────────────────────

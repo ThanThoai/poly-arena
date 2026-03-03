@@ -26,7 +26,8 @@ from ws_feed_service.config import ORDERBOOK_DEPTH_LEVELS
 from ws_feed_service.redis_writer import RedisWriter
 from ws_feed_service.order_consumer import OrderConsumer
 
-from config.timing import TF_SECONDS as _TF_SECONDS
+from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S
+from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions
 from database import SessionLocal
 from models import BinaryOption, BOResult
 
@@ -91,12 +92,12 @@ def _update_sessions_from_registry(sm: SessionManager, registry: TokenRegistry) 
     import time
 
     # Detect candle boundaries for each timeframe
-    for tf in ["M5", "M15", "H1"]:
+    for tf in ["M5", "M15"]:
         period_s = _TF_SECONDS[tf]
         now_ts = int(time.time())
         new_candle_ts = now_ts - (now_ts % period_s)
 
-        for sym in ["BTC", "ETH", "SOL", "XRP"]:
+        for sym in ["BTC", "ETH"]:
             # Check if we have a new current session for this (sym, tf)
             up_token = registry.get_token_id(sym, tf, "UP")
             down_token = registry.get_token_id(sym, tf, "DOWN")
@@ -296,27 +297,29 @@ async def _recover_pending_orders(sync_redis, session_manager: SessionManager, r
     return count
 
 
-# ── Dispatch event patching ───────────────────────────────────────────────────
+# ── Event dispatcher ──────────────────────────────────────────────────────────
 
 
-def _patch_dispatch_event(session_manager: SessionManager, writer: RedisWriter, loop: asyncio.AbstractEventLoop):
+def _make_event_dispatcher(
+    session_manager: SessionManager,
+    writer: RedisWriter,
+    loop: asyncio.AbstractEventLoop,
+):
     """
-    Monkey-patch both MatchingEngine.dispatch_event and session_manager.dispatch_event
-    to bridge WS events from the feed (which calls MatchingEngine) to the SessionManager
-    (which manages per-session books and writes prices/orderbooks to Redis).
+    Build a single callback for PolymarketFeed's ``on_event`` parameter.
 
-    Without this bridge, PolymarketFeed._on_message → get_engine().dispatch_event()
-    would only update the MatchingEngine's internal books, leaving the SessionManager
-    books stale and skipping all Redis price writes + PriceHistory recording.
+    The callback:
+      1. Dispatches every WS event to ``session_manager.dispatch_event()``
+         (fan-out to per-session books, bracket monitoring, matching).
+      2. After dispatch, writes best prices + orderbook depth to Redis
+         for price-change events.
     """
-    from services.matching_engine import get_engine
 
-    # 1. Patch session_manager.dispatch_event to also write prices to Redis
-    original_sm_dispatch = session_manager.dispatch_event
+    def event_dispatcher(event: dict) -> None:
+        # 1. Fan-out to sessions (the sole matching path)
+        session_manager.dispatch_event(event)
 
-    def patched_sm_dispatch(event: dict) -> None:
-        original_sm_dispatch(event)
-
+        # 2. Write prices + depth to Redis for price-affecting events
         etype = event.get("event_type", "")
         asset_id = event.get("asset_id", "")
 
@@ -347,23 +350,7 @@ def _patch_dispatch_event(session_manager: SessionManager, writer: RedisWriter, 
                 except Exception:
                     pass
 
-    session_manager.dispatch_event = patched_sm_dispatch
-
-    # 2. Patch MatchingEngine.dispatch_event to also call session_manager.dispatch_event.
-    #    PolymarketFeed._on_message calls get_engine().dispatch_event(event) — this bridge
-    #    ensures WS events also flow through the SessionManager (multi-session books + Redis).
-    engine = get_engine()
-    original_me_dispatch = engine.dispatch_event
-
-    def patched_me_dispatch(event: dict) -> None:
-        original_me_dispatch(event)
-        try:
-            session_manager.dispatch_event(event)
-        except Exception as exc:
-            log.error("SessionManager dispatch failed: %s", exc)
-
-    engine.dispatch_event = patched_me_dispatch
-    log.info("Patched MatchingEngine + SessionManager dispatch_event to write prices to Redis")
+    return event_dispatcher
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -398,7 +385,7 @@ async def main():
     # 4. Register token mapping in RedisWriter + create sessions
     writer.register_token_mapping(registry._mapping)
     # Register session-aware token mapping for future session orderbook writes
-    current_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
+    current_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15"]}
     writer.register_session_tokens(registry.get_all_token_mapping(), current_sessions)
     await writer.publish_token_mapping()
 
@@ -419,14 +406,13 @@ async def main():
                 await writer.update_price(token_id, best_ask, best_bid)
         log.info("Seeded Redis with %d initial orderbook(s) from REST", len(initial_books))
 
-    # 5. Patch session_manager.dispatch_event to write Redis
+    # 5. Build event dispatcher + start PolymarketFeed
     loop = asyncio.get_event_loop()
-    _patch_dispatch_event(session_manager, writer, loop)
+    event_dispatcher = _make_event_dispatcher(session_manager, writer, loop)
 
-    # 6. Start PolymarketFeed
     feed = None
     if token_ids:
-        feed = PolymarketFeed(token_ids)
+        feed = PolymarketFeed(token_ids, on_event=event_dispatcher)
         await feed.start()
         log.info("PolymarketFeed started with %d token(s)", len(token_ids))
 
@@ -438,7 +424,7 @@ async def main():
         # Returns combos whose token_id rotated + the old token_ids.
         rotated, old_token_ids = writer.register_token_mapping(registry._mapping)
         # Re-register session tokens with fresh data
-        fresh_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
+        fresh_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15"]}
         writer.register_session_tokens(registry.get_all_token_mapping(), fresh_sessions)
         asyncio.ensure_future(writer.publish_token_mapping())
         if rotated:
@@ -519,16 +505,34 @@ async def main():
                 n = session_manager.expire_all_pending()
                 if n:
                     log.info("Expiry tick: expired %d order(s)", n)
-                # Archive sessions that have been SETTLING > 30s
-                archived = session_manager.archive_settling_sessions(grace_seconds=30)
-                if archived:
-                    log.info("Expiry tick: archived %d settling session(s)", len(archived))
             except Exception as exc:
                 log.error("Expiry tick error: %s", exc)
             await asyncio.sleep(5)
 
+    # 10b. Session lifecycle tick — ensure 4 sessions per (sym, tf) + cleanup expired
+    # ensure_future_sessions uses Polymarket REST (blocking) for token resolution.
+    # Run in executor to avoid blocking the event loop (prevents WS PING timeout).
+    # feed.add_tokens() needs asyncio context → called on main thread after executor.
+    async def _session_lifecycle_tick():
+        while not shutdown_event.is_set():
+            try:
+                _loop = asyncio.get_event_loop()
+                created, new_token_ids = await _loop.run_in_executor(
+                    None,
+                    ensure_future_sessions,
+                    session_manager, None, writer, registry,  # feed=None inside executor
+                )
+                # Subscribe new tokens on main thread (needs asyncio for WS resubscribe)
+                if feed is not None and new_token_ids:
+                    feed.add_tokens(new_token_ids)
+                cleanup_expired_sessions(session_manager, sync_redis)
+            except Exception as exc:
+                log.error("Session lifecycle tick error: %s", exc)
+            await asyncio.sleep(SESSION_LIFECYCLE_TICK_S)
+
     shutdown_event = asyncio.Event()
     asyncio.ensure_future(_expiry_tick())
+    asyncio.ensure_future(_session_lifecycle_tick())
 
     def _signal_handler():
         log.info("Shutdown signal received")

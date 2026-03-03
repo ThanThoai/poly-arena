@@ -42,14 +42,12 @@ def _utc(dt: datetime | None) -> datetime | None:
 _TF_MS: dict[str, int] = {
     "M5":  5  * 60 * 1_000,
     "M15": 15 * 60 * 1_000,
-    "H1":  60 * 60 * 1_000,
 }
 
 # Timeframe → Binance kline interval string
 _TF_BINANCE: dict[str, str] = {
     "M5":  "5m",
     "M15": "15m",
-    "H1":  "1h",
 }
 
 _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"

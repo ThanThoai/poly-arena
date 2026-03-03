@@ -56,10 +56,10 @@ def test_next_refresh_times_are_after_boundary():
 
 
 def test_next_refresh_times_all_timeframes():
-    result = next_refresh_times(["M5", "M15", "H1"])
-    assert set(result.keys()) == {"M5", "M15", "H1"}
-    # H1 refresh must be further away than M5
-    assert result["H1"] >= result["M5"]
+    result = next_refresh_times(["M5", "M15"])
+    assert set(result.keys()) == {"M5", "M15"}
+    # M15 refresh must be further away than M5
+    assert result["M15"] >= result["M5"]
 
 
 # ── discover_all ──────────────────────────────────────────────────────────────

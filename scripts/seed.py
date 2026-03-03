@@ -26,7 +26,7 @@ from services.settlement import calc_settlement_time
 SEED        = 42
 PAYOUT_RATE = 1.00          # WIN → +100% amount
 
-SYMBOLS     = ["BTC", "ETH", "SOL", "XRP"]
+SYMBOLS     = ["BTC", "ETH"]
 DIRECTIONS  = ["GREEN", "RED"]
 
 # name, timeframe, n_trades (multiple of 4 for even symbol spread), amount_range

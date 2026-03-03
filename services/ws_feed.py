@@ -1,21 +1,22 @@
 """
 Polymarket WebSocket feed — connects to the CLOB Market Channel and streams
-orderbook events into the MatchingEngine.
+orderbook events to a caller-supplied callback.
 
 Usage (standalone test):
     python -m services.ws_feed
 
-Integration (FastAPI lifespan):
-    from services.ws_feed import start_feed, stop_feed
-    await start_feed(token_ids=["abc...", "def..."])
+Integration (WS Feed Service):
+    from services.ws_feed import PolymarketFeed
+    feed = PolymarketFeed(token_ids, on_event=my_callback)
+    await feed.start()
     ...
-    await stop_feed()
+    await feed.stop()
 
 The feed automatically:
   - Subscribes to the given asset (token) IDs
   - Sends PING heartbeats every 10s to keep the connection alive
   - Reconnects on disconnect with exponential back-off (2s → 4s → 8s → max 60s)
-  - Routes all events through MatchingEngine.dispatch_event()
+  - Routes all events through the ``on_event`` callback
 """
 
 from __future__ import annotations
@@ -23,13 +24,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 from config.timing import WS_PING_INTERVAL_S, WS_CLOSE_TIMEOUT_S
-from services.matching_engine import get_engine
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,13 @@ _RECONNECT_MAX = 10  # seconds (was 60 — faster recovery reduces data gaps)
 class PolymarketFeed:
     """Async WebSocket client that streams Polymarket CLOB events."""
 
-    def __init__(self, token_ids: list[str]) -> None:
+    def __init__(
+        self,
+        token_ids: list[str],
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> None:
         self.token_ids = token_ids
+        self._on_event = on_event
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
@@ -198,14 +203,15 @@ class PolymarketFeed:
             pass
 
     def _handle_message(self, raw: str) -> None:
-        """Parse and dispatch a WebSocket message to the matching engine."""
+        """Parse and dispatch a WebSocket message via the on_event callback."""
+        if self._on_event is None:
+            return
+
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             logger.warning("Non-JSON message: %s", raw[:100])
             return
-
-        engine = get_engine()
 
         # Polymarket can send a single event or an array of events
         events = data if isinstance(data, list) else [data]
@@ -213,7 +219,7 @@ class PolymarketFeed:
             if not isinstance(event, dict):
                 continue
             try:
-                engine.dispatch_event(event)
+                self._on_event(event)
             except Exception as e:
                 logger.error(
                     "Error dispatching event %s: %s",
@@ -227,13 +233,16 @@ class PolymarketFeed:
 _feed: Optional[PolymarketFeed] = None
 
 
-async def start_feed(token_ids: list[str]) -> PolymarketFeed:
+async def start_feed(
+    token_ids: list[str],
+    on_event: Optional[Callable[[dict], None]] = None,
+) -> PolymarketFeed:
     """Start the global feed singleton. Safe to call multiple times."""
     global _feed
     if _feed is not None and _feed._running:
         _feed.add_tokens(token_ids)
         return _feed
-    _feed = PolymarketFeed(token_ids)
+    _feed = PolymarketFeed(token_ids, on_event=on_event)
     await _feed.start()
     return _feed
 

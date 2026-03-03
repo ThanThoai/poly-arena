@@ -41,12 +41,10 @@ BINANCE_URL = "https://api.binance.com/api/v3/klines"
 _TF_INTERVAL: dict[str, int] = {
     "M5": 5 * 60,
     "M15": 15 * 60,
-    "H1": 60 * 60,
 }
 _TF_BINANCE: dict[str, str] = {
     "M5": "5m",
     "M15": "15m",
-    "H1": "1h",
 }
 
 # Number of closed candles fetched before each decision
@@ -122,7 +120,7 @@ class BaseBot(ABC):
         self,
         *,
         name: str,
-        timeframe: str,  # "M5" | "M15" | "H1"
+        timeframe: str,  # "M5" | "M15"
         api_key: str,
         symbols: list[str] | None = None,
         amount: float = 100.0,
@@ -135,7 +133,7 @@ class BaseBot(ABC):
         self.name = name
         self.timeframe = timeframe
         self.api_key = api_key
-        self.symbols = symbols or ["BTC", "ETH", "SOL", "XRP"]
+        self.symbols = symbols or ["BTC", "ETH"]
         self.amount = amount
         self.api_base = api_base.rstrip("/")
         self.candle_limit = candle_limit

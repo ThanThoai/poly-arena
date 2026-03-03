@@ -52,9 +52,9 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_SYMBOLS: list[str]    = ["BTC", "ETH", "SOL", "XRP"]
+_SYMBOLS: list[str]    = ["BTC", "ETH"]
 _DIRECTIONS: list[str] = ["UP", "DOWN"]
-_TIMEFRAMES: list[str] = ["M5", "M15", "H1"]
+_TIMEFRAMES: list[str] = ["M5", "M15"]
 
 _PREFETCH_CANDLES: int = TOKEN_PREFETCH_CANDLES
 
@@ -133,6 +133,17 @@ class TokenRegistry:
                 ts = self._token_sessions.get(token_id, 0)
                 result.setdefault(token_id, []).append((sym, tf, direction, ts))
         return result
+
+    def _cleanup_stale_sessions(self) -> None:
+        """Remove _token_sessions entries older than 3× max period to prevent unbounded growth."""
+        now_ts = int(time.time())
+        max_period = max(_TF_SECONDS.values())  # 900s for M15
+        cutoff = now_ts - max_period * 3
+        to_delete = [tid for tid, ts in self._token_sessions.items() if ts < cutoff]
+        if to_delete:
+            for tid in to_delete:
+                del self._token_sessions[tid]
+            logger.debug("TokenRegistry: cleaned up %d stale _token_sessions entries", len(to_delete))
 
     def pop_initial_books(self) -> dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]]:
         """Return and clear initial book data collected during discovery/refresh.
@@ -215,7 +226,7 @@ class TokenRegistry:
         discovered: list[str],
     ) -> None:
         """Prefetch token_ids for the next N future candles."""
-        tf_norm = {"M5": "5m", "M15": "15m", "H1": "1h"}.get(tf, tf.lower())
+        tf_norm = {"M5": "5m", "M15": "15m"}.get(tf, tf.lower())
         future_timestamps = pm._future_settlements(tf_norm, _PREFETCH_CANDLES)
         key = (sym, tf, direction)
         future_ids: list[str] = []
@@ -419,6 +430,9 @@ class TokenRegistry:
                         _scratch: list[str] = []
                         self._prefetch_future(pm, sym, tf, direction, _scratch)
 
+            # Clean up stale _token_sessions entries to prevent unbounded growth
+            self._cleanup_stale_sessions()
+
             return local_new, local_ok
 
         loop = asyncio.get_event_loop()
@@ -447,7 +461,7 @@ def next_refresh_times(timeframes: Optional[list[str]] = None) -> dict[str, date
         {
           "M5":  datetime(2024, 1, 1, 12, 15, 5, tzinfo=utc),
           "M15": datetime(2024, 1, 1, 12, 15, 5, tzinfo=utc),
-          "H1":  datetime(2024, 1, 1, 13,  0, 5, tzinfo=utc),
+          "M15": datetime(2024, 1, 1, 12, 15, 5, tzinfo=utc),
         }
     """
     tfs = timeframes or _TIMEFRAMES

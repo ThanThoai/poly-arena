@@ -6,11 +6,11 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
-from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory
+from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory, UserBalanceSnapshot
 from schemas import (
     BalanceHistoryResponse, BOResponse, BotBalanceAdjust, BotCreate, BotPerformanceResponse,
     BotPnlResponse, BotPublic, BotRename, BotResponse,
-    UserBalanceHistoryResponse, UserPnlResponse,
+    UserBalanceHistoryResponse, UserBalanceSnapshotResponse, UserPnlResponse,
 )
 
 router = APIRouter()
@@ -276,6 +276,44 @@ def get_user_balance_history(
     )
 
     return sorted([seed] + history, key=lambda r: (r.recorded_at or ""))
+
+
+@router.get("/user-balance-snapshots", response_model=List[UserBalanceSnapshotResponse])
+def get_user_balance_snapshots(
+    user_id: Optional[int] = Query(None),
+    limit: int = Query(500, ge=1, le=50000),
+    db: Session = Depends(get_db),
+):
+    """Get periodic balance snapshots for all users (public). Optional user_id filter.
+
+    Includes seed records (initial balance at account creation) for each user.
+    """
+    # Determine which users to include
+    if user_id is not None:
+        target_users = db.query(User).filter(User.id == user_id).all()
+    else:
+        target_users = db.query(User).filter(User.is_active == True).all()
+
+    # Build seed records: initial balance at account creation
+    seeds = []
+    for u in target_users:
+        init_bal = u.initial_balance or 0
+        seeds.append(UserBalanceSnapshot(
+            id=0,
+            user_id=u.id,
+            balance=init_bal,
+            bot_balance=0,
+            available=init_bal,
+            session_id=None,
+            recorded_at=u.created_at,
+        ))
+
+    q = db.query(UserBalanceSnapshot)
+    if user_id is not None:
+        q = q.filter(UserBalanceSnapshot.user_id == user_id)
+    history = q.order_by(UserBalanceSnapshot.recorded_at.asc()).limit(limit).all()
+
+    return sorted(seeds + history, key=lambda r: (r.recorded_at or ""))
 
 
 # ── Pause / Resume ───────────────────────────────────────────────────────────
