@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import text
 from database import SessionLocal, engine, Base
-from models import Bot, User
+from datetime import datetime, timezone
+from models import Bot, User, UserBalanceSnapshot
 
 BOT_BALANCE = 1000.0
 USER_TOTAL = 5000.0
@@ -59,11 +60,11 @@ def reset(apply: bool = False) -> None:
         # ── User details ──
         for user in users:
             user_bots = [b for b in bots if b.user_id == user.id]
-            total_allocated = sum(BOT_BALANCE for _ in user_bots)
-            new_initial = round(USER_TOTAL - total_allocated, 8)
+            total_allocated = len(user_bots) * BOT_BALANCE
+            available = USER_TOTAL - total_allocated
             print(
-                f"  User '{user.username}': initial_balance {user.initial_balance:.2f} → {new_initial:.2f} "
-                f"({USER_TOTAL:.0f} - {len(user_bots)} bots × {BOT_BALANCE:.0f})"
+                f"  User '{user.username}': initial_balance {user.initial_balance:.2f} → {USER_TOTAL:.2f} "
+                f"(available: {available:.0f} = {USER_TOTAL:.0f} - {len(user_bots)} bots × {BOT_BALANCE:.0f})"
             )
 
         if not apply:
@@ -93,12 +94,22 @@ def reset(apply: bool = False) -> None:
             bot.status = "ACTIVE"
         print(f"  Reset {len(bots)} bots → balance={BOT_BALANCE:.0f}")
 
-        # ── 5. Reset users ──
+        # ── 5. Reset users & tạo bản ghi snapshot ban đầu ──
         for user in users:
+            user.initial_balance = USER_TOTAL
             user_bots = [b for b in bots if b.user_id == user.id]
-            total_allocated = sum(BOT_BALANCE for _ in user_bots)
-            user.initial_balance = round(USER_TOTAL - total_allocated, 8)
-        print(f"  Reset {len(users)} users → initial_balance = {USER_TOTAL:.0f} - allocated")
+            total_allocated = len(user_bots) * BOT_BALANCE
+            available = USER_TOTAL - total_allocated
+            db.add(UserBalanceSnapshot(
+                user_id=user.id,
+                balance=USER_TOTAL,
+                bot_balance=total_allocated,
+                available=available,
+                session_id=None,
+                recorded_at=datetime.now(timezone.utc),
+            ))
+            print(f"  User '{user.username}': initial={USER_TOTAL:.0f}, bot_balance={total_allocated:.0f}, available={available:.0f}")
+        print(f"  Reset {len(users)} users → initial_balance={USER_TOTAL:.0f} + snapshot saved")
 
         db.commit()
         print("\nDone.")
