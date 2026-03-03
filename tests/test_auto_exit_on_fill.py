@@ -1,10 +1,11 @@
 """
-Tests for Auto-Exit on fill when TP < entry or SL > entry.
+Tests for _handle_order_fill behavior.
 
-Verifies:
-  - LIMIT order FILLED with avg_entry >= tp_price → auto-exit TP
-  - LIMIT order FILLED with avg_entry <= sl_price → auto-exit SL
-  - LIMIT order FILLED with normal TP/SL → no auto-exit
+Since MARKET orders are now filled at API level (snapshot fill), only LIMIT
+fills arrive through _handle_order_fill. This file tests:
+  - Fill updates avg_price/num_shares/me_order_status
+  - No auto-exit on TP-violated fill (ME handles it)
+  - Maker rebate applied for LIMIT fills
 """
 
 import pytest
@@ -18,7 +19,7 @@ from main import _handle_order_fill
 
 @pytest.fixture
 def bot_and_bo(db):
-    """Create a bot + pending LIMIT BO with TP for testing."""
+    """Create a bot for testing."""
     bot = Bot(
         bot_name="auto-exit-bot",
         api_key="key-auto-exit-test",
@@ -32,8 +33,8 @@ def bot_and_bo(db):
     return bot
 
 
-def _make_bo(db, bot, tp_price=None, sl_price=None, amount=100.0):
-    """Create a pending LIMIT BO."""
+def _make_bo(db, bot, tp_price=None, sl_price=None, amount=100.0, limit_price=0.50):
+    """Create a pending BO."""
     bo = BinaryOption(
         bot_name=bot.bot_name,
         symbol=BOSymbol.BTC,
@@ -43,7 +44,7 @@ def _make_bo(db, bot, tp_price=None, sl_price=None, amount=100.0):
         result=BOResult.PENDING,
         avg_price=None,
         num_shares=None,
-        limit_price=0.50,
+        limit_price=limit_price,
         tp_price=tp_price,
         sl_price=sl_price,
         me_order_status="PENDING",
@@ -55,125 +56,100 @@ def _make_bo(db, bot, tp_price=None, sl_price=None, amount=100.0):
 
 
 @pytest.mark.asyncio
-async def test_auto_exit_tp_violated_at_fill(db, bot_and_bo, fake_async_redis):
-    """When LIMIT order fills at avg_entry >= tp_price, should auto-exit."""
+async def test_fill_updates_price_and_status(db, bot_and_bo, fake_async_redis):
+    """Fill should update avg_price, num_shares, me_order_status."""
     bot = bot_and_bo
-    # TP = 0.55, but order fills at 0.60 (above TP) → should auto-exit
-    bo = _make_bo(db, bot, tp_price=0.55, amount=100.0)
-    initial_balance = bot.balance
+    bo = _make_bo(db, bot, limit_price=0.50, amount=100.0)
 
-    # Deduct balance like the router would
     bot.balance = round(bot.balance - bo.amount, 8)
     db.commit()
 
     mock_r = fake_async_redis
 
-    # Mock REST bid fetch: bids at 0.58
-    with patch("main.fetch_best_bid_from_rest") as mock_bid, \
-         patch("main._get_token_id", return_value="tok-123"):
-        mock_bid.return_value = (
-            0.58,
-            [(Decimal("0.58"), Decimal("500"))],
-        )
+    walk_prices = '[{"price": 0.50, "qty": 200.0, "cost": 100.0}]'
+    await _handle_order_fill(
+        mock_r, "stream:order:fills", "test-group", "msg-1",
+        {
+            "bo_id": str(bo.id),
+            "filled": "200.0",
+            "avg_entry_price": "0.50",
+            "status": "FILLED",
+            "order_id": "ord-123",
+            "walk_prices": walk_prices,
+        },
+    )
 
-        await _handle_order_fill(
-            mock_r, "stream:order:fills", "test-group", "msg-1",
-            {
-                "bo_id": str(bo.id),
-                "filled": "200.0",
-                "avg_entry_price": "0.60",
-                "status": "FILLED",
-                "order_id": "ord-123",
-            },
-        )
+    db.refresh(bo)
 
-    # Refresh from DB
+    assert bo.avg_price == pytest.approx(0.50)
+    assert bo.num_shares == pytest.approx(200.0)
+    assert bo.me_order_status == "FILLED"
+
+
+@pytest.mark.asyncio
+async def test_no_auto_exit_on_tp_violated_fill(db, bot_and_bo, fake_async_redis):
+    """When fill avg_entry >= tp_price, should NOT auto-exit (ME handles it)."""
+    bot = bot_and_bo
+    # TP = 0.55, but order fills at 0.60 (above TP)
+    bo = _make_bo(db, bot, tp_price=0.55, limit_price=0.50, amount=100.0)
+
+    bot.balance = round(bot.balance - bo.amount, 8)
+    db.commit()
+
+    mock_r = fake_async_redis
+
+    walk_prices = '[{"price": 0.60, "qty": 166.67, "cost": 100.0}]'
+    await _handle_order_fill(
+        mock_r, "stream:order:fills", "test-group", "msg-2",
+        {
+            "bo_id": str(bo.id),
+            "filled": "166.67",
+            "avg_entry_price": "0.60",
+            "status": "FILLED",
+            "order_id": "ord-456",
+            "walk_prices": walk_prices,
+        },
+    )
+
+    db.refresh(bo)
+
+    # Fill data updated
+    assert bo.avg_price == pytest.approx(0.60)
+    assert bo.num_shares == pytest.approx(166.67)
+    assert bo.me_order_status == "FILLED"
+    # No auto-exit — ME bracket monitoring will handle this
+    assert bo.exit_trigger is None
+    assert bo.result == BOResult.PENDING
+
+
+@pytest.mark.asyncio
+async def test_limit_fill_applies_maker_rebate(db, bot_and_bo, fake_async_redis):
+    """LIMIT order fill (limit_price set) should add maker rebate to balance."""
+    bot = bot_and_bo
+    bo = _make_bo(db, bot, limit_price=0.50, amount=100.0)
+
+    bot.balance = round(bot.balance - bo.amount, 8)
+    initial_balance = bot.balance
+    db.commit()
+
+    mock_r = fake_async_redis
+
+    walk_prices = '[{"price": 0.50, "qty": 200.0, "cost": 100.0}]'
+    await _handle_order_fill(
+        mock_r, "stream:order:fills", "test-group", "msg-4",
+        {
+            "bo_id": str(bo.id),
+            "filled": "200.0",
+            "avg_entry_price": "0.50",
+            "status": "FILLED",
+            "order_id": "ord-101",
+            "walk_prices": walk_prices,
+        },
+    )
+
     db.refresh(bo)
     db.refresh(bot)
 
-    # Exit data should be recorded, but profit deferred to session-end
-    assert bo.exit_trigger == "TP"
-    assert bo.exit_price == pytest.approx(0.58, abs=0.01)
-    assert bo.result == BOResult.PENDING  # deferred to scheduler
-    assert bo.avg_price == pytest.approx(0.60)
-    assert bo.traces is not None
-    # Look for SLIPPAGE_VIOLATION trace
-    stages = [t["action"] for t in bo.traces]
-    assert "SLIPPAGE_VIOLATION" in stages
-    assert "AUTO_EXIT_RECORDED" in stages
-
-
-@pytest.mark.asyncio
-async def test_auto_exit_sl_violated_at_fill(db, bot_and_bo, fake_async_redis):
-    """When LIMIT order fills at avg_entry <= sl_price, should auto-exit."""
-    bot = bot_and_bo
-    # SL = 0.45, but order fills at 0.40 (below SL) → should auto-exit
-    bo = _make_bo(db, bot, sl_price=0.45, amount=100.0)
-
-    bot.balance = round(bot.balance - bo.amount, 8)
-    db.commit()
-
-    mock_r = fake_async_redis
-
-    with patch("main.fetch_best_bid_from_rest") as mock_bid, \
-         patch("main._get_token_id", return_value="tok-456"):
-        mock_bid.return_value = (
-            0.38,
-            [(Decimal("0.38"), Decimal("500"))],
-        )
-
-        await _handle_order_fill(
-            mock_r, "stream:order:fills", "test-group", "msg-2",
-            {
-                "bo_id": str(bo.id),
-                "filled": "250.0",
-                "avg_entry_price": "0.40",
-                "status": "FILLED",
-                "order_id": "ord-456",
-            },
-        )
-
-    db.refresh(bo)
-
-    assert bo.exit_trigger == "SL"
-    assert bo.result == BOResult.PENDING  # deferred to scheduler
-    stages = [t["action"] for t in bo.traces]
-    assert "SLIPPAGE_VIOLATION" in stages
-
-
-@pytest.mark.asyncio
-async def test_no_auto_exit_when_condition_not_violated(db, bot_and_bo, fake_async_redis):
-    """When LIMIT order fills normally (TP > entry), no auto-exit should happen."""
-    bot = bot_and_bo
-    # TP = 0.70, order fills at 0.50 → normal, no violation
-    bo = _make_bo(db, bot, tp_price=0.70, amount=100.0)
-
-    bot.balance = round(bot.balance - bo.amount, 8)
-    db.commit()
-
-    mock_r = fake_async_redis
-
-    # Should NOT call fetch_best_bid_from_rest at all
-    with patch("main.fetch_best_bid_from_rest") as mock_bid, \
-         patch("main._get_token_id", return_value="tok-789"):
-
-        await _handle_order_fill(
-            mock_r, "stream:order:fills", "test-group", "msg-3",
-            {
-                "bo_id": str(bo.id),
-                "filled": "200.0",
-                "avg_entry_price": "0.50",
-                "status": "FILLED",
-                "order_id": "ord-789",
-            },
-        )
-
-    db.refresh(bo)
-
-    # Should still be PENDING (no auto-exit)
-    assert bo.result == BOResult.PENDING
-    assert bo.exit_trigger is None
-    assert bo.avg_price == pytest.approx(0.50)
-    assert bo.num_shares == pytest.approx(200.0)
-    # fetch_best_bid should not have been called
-    mock_bid.assert_not_called()
+    # Maker rebate should have been added (entry_fee goes negative)
+    assert bo.entry_fee < 0
+    assert bot.balance > initial_balance

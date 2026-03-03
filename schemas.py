@@ -13,11 +13,11 @@ class BOCreate(BaseModel):
     amount:      float
     reason:      Optional[str]   = None
     limit_price: Optional[float] = None   # None = MARKET order; set = LIMIT order
-    tp_price:    Optional[float] = None   # Deprecated — silently ignored
-    sl_price:    Optional[float] = None   # Deprecated — silently ignored
+    tp_price:    Optional[float] = None   # Take-profit price for bracket monitoring
+    sl_price:    Optional[float] = None   # Stop-loss price for bracket monitoring
     ttl:                Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
     slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
-    session_offset:     Optional[int]   = Field(default=0, ge=0, le=1)  # 0 = current session, 1 = next session
+    session_offset:     Optional[int]   = Field(default=0, ge=0, le=3)  # 0 = current, 1-3 = future sessions
     timestamp:          Optional[int]   = None   # Unix timestamp (seconds) to target a specific candle session
 
     @field_validator("amount")
@@ -55,12 +55,6 @@ class BOCreate(BaseModel):
             raise ValueError("timestamp must be a positive Unix timestamp (seconds)")
         return v
 
-    @model_validator(mode="after")
-    def strip_deprecated_tp_sl(self) -> "BOCreate":
-        """TP/SL is deprecated — silently ignore any values sent by clients."""
-        self.tp_price = None
-        self.sl_price = None
-        return self
 
 
 class BOResponse(BaseModel):
@@ -328,6 +322,7 @@ class PriceHistoryResponse(BaseModel):
     best_bid: Optional[float] = None
     bids: Optional[list] = None   # [[price, size], ...]
     asks: Optional[list] = None   # [[price, size], ...]
+    candle_ts: Optional[int] = None
     recorded_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -360,6 +355,7 @@ class SessionInfo(BaseModel):
     direction: str
     session_start: int
     session_end: int
+    session_offset: int = 0   # 0 = current candle, 1-3 = future
 
 class TradeInspectResponse(BaseModel):
     trade: BOResponse

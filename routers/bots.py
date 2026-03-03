@@ -349,7 +349,9 @@ def equity_curve(
         .order_by(UserBalanceHistory.recorded_at.asc())
         .all()
     )
-    return [{"t": r.recorded_at.isoformat() if r.recorded_at else None, "v": r.balance} for r in rows]
+    # Seed record: initial balance at account creation (consistent with user-balance-history)
+    seed = {"t": user.created_at.isoformat() if user.created_at else None, "v": user.initial_balance or 0}
+    return [seed] + [{"t": r.recorded_at.isoformat() if r.recorded_at else None, "v": r.balance} for r in rows]
 
 
 @router.get("/{bot_id}/performance", response_model=BotPerformanceResponse)
@@ -460,18 +462,23 @@ def bots_pnl(
 
 
 def _user_pnl(user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> UserPnlResponse:
-    """Build UserPnlResponse for a single user."""
-    bot_pnls = [_bot_pnl(b, trades_by_bot.get(b.bot_name, [])) for b in bots]
+    """Build UserPnlResponse for a single user.
 
-    wins = sum(bp.wins for bp in bot_pnls)
-    losses = sum(bp.losses for bp in bot_pnls)
-    pending = sum(bp.pending for bp in bot_pnls)
-    total_trades = sum(bp.total_trades for bp in bot_pnls)
-    realized_pnl = round(sum(bp.realized_pnl for bp in bot_pnls), 8)
-    total_fees = round(sum(bp.total_fees for bp in bot_pnls), 8)
+    Only ACTIVE bots contribute to realized_pnl — deleted bots' P&L has already
+    been absorbed into user.initial_balance (see delete_bot), so including their
+    trades here would double-count.
+    """
+    active_bots = [b for b in bots if getattr(b, 'is_active', True)]
+    active_pnls = [_bot_pnl(b, trades_by_bot.get(b.bot_name, [])) for b in active_bots]
+
+    wins = sum(bp.wins for bp in active_pnls)
+    losses = sum(bp.losses for bp in active_pnls)
+    pending = sum(bp.pending for bp in active_pnls)
+    total_trades = sum(bp.total_trades for bp in active_pnls)
+    realized_pnl = round(sum(bp.realized_pnl for bp in active_pnls), 8)
+    total_fees = round(sum(bp.total_fees for bp in active_pnls), 8)
     decided = wins + losses
 
-    active_bots = [b for b in bots if getattr(b, 'is_active', True)]
     allocated = sum(b.initial_balance or 0 for b in active_bots)
     available = (user.initial_balance or 0) - allocated
     current_balance = round(sum(b.balance or 0 for b in active_bots) + available, 8)
@@ -493,7 +500,7 @@ def _user_pnl(user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> Us
         win_rate=round(wins / decided * 100, 2) if decided else 0.0,
         avg_profit_per_trade=round(realized_pnl / decided, 8) if decided else 0.0,
         total_fees=total_fees,
-        bots=bot_pnls,
+        bots=active_pnls,
     )
 
 

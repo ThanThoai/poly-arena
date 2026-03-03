@@ -35,10 +35,14 @@ def record_user_balance(
     if not user:
         return
 
-    # Get all bot names belonging to this user
+    # Get bot names for ACTIVE bots only.
+    # Deleted bots' P&L has already been absorbed into user.initial_balance
+    # (see bots.py delete_bot), so including their trades here would double-count.
     user_bot_names = [
         row[0]
-        for row in db.query(Bot.bot_name).filter(Bot.user_id == user.id).all()
+        for row in db.query(Bot.bot_name).filter(
+            Bot.user_id == user.id, Bot.is_active == True
+        ).all()
     ]
 
     if not user_bot_names:
