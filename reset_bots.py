@@ -25,6 +25,8 @@ from models import Bot
 TABLES_TO_CLEAR = [
     "bot_achievements",
     "balance_history",
+    "user_balance_history",
+    "user_balance_snapshots",
     "binary_options",
 ]
 

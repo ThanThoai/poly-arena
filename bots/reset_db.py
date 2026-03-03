@@ -49,6 +49,8 @@ def reset(skip_confirm: bool = False) -> None:
 
         r_ach = db.execute(text("DELETE FROM bot_achievements"))
         r_bh  = db.execute(text("DELETE FROM balance_history"))
+        r_ubh = db.execute(text("DELETE FROM user_balance_history"))
+        r_ubs = db.execute(text("DELETE FROM user_balance_snapshots"))
         r_bo  = db.execute(text("DELETE FROM binary_options"))
 
         for b in bots:
@@ -59,6 +61,8 @@ def reset(skip_confirm: bool = False) -> None:
         print()
         print(f"✓ Đã xóa {r_bo.rowcount} lệnh")
         print(f"✓ Đã xóa {r_bh.rowcount} balance history records")
+        print(f"✓ Đã xóa {r_ubh.rowcount} user balance history records")
+        print(f"✓ Đã xóa {r_ubs.rowcount} user balance snapshot records")
         print(f"✓ Đã xóa {r_ach.rowcount} achievements")
         print(f"✓ Reset balance {len(bots)} bot về initial_balance")
         print("✓ Bots và users được giữ nguyên")
