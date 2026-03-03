@@ -137,6 +137,45 @@ A1_PROFILE = {
 
 A1_LIMIT_PRICES = [0.49, 0.50, 0.51]
 
+# ---------------------------------------------------------------------------
+# Random BTC-M5 trader profiles — simple random orders, no edge cases
+# ---------------------------------------------------------------------------
+
+RANDOM_TRADER_USER = os.environ.get("RANDOM_TRADER_USER", "random-trader")
+RANDOM_TRADER_NUM_BOTS = int(os.environ.get("RANDOM_TRADER_BOTS", "4"))
+RANDOM_TRADER_INTERVAL = int(os.environ.get("RANDOM_TRADER_INTERVAL", "15"))  # seconds between orders
+
+RANDOM_BTC_PROFILES = [
+    {
+        "suffix": "btc-sniper",
+        "amount_range": (5, 40),
+        "limit_pct": 0.20,       # 20% limit, 80% market
+        "ttl_range": (15, 120),
+        "description": "Fast market orders, occasional limits",
+    },
+    {
+        "suffix": "btc-limit-hunter",
+        "amount_range": (8, 50),
+        "limit_pct": 0.80,       # 80% limit
+        "ttl_range": (30, 300),
+        "description": "Mostly limit orders at various prices",
+    },
+    {
+        "suffix": "btc-yolo",
+        "amount_range": (15, 80),
+        "limit_pct": 0.05,       # almost all market
+        "ttl_range": (10, 60),
+        "description": "Big market orders, go hard",
+    },
+    {
+        "suffix": "btc-cautious",
+        "amount_range": (3, 20),
+        "limit_pct": 0.60,       # 60% limit
+        "ttl_range": (60, 300),
+        "description": "Small careful orders",
+    },
+]
+
 
 # ---------------------------------------------------------------------------
 # Trade builders — normal profile trades
@@ -177,6 +216,64 @@ def build_trade(
         p["reason"] = random.choice(REASONS)
 
     return p
+
+
+def build_random_btc_trade(profile: dict) -> dict:
+    """Build a single random BTC M5 trade from a random-trader profile."""
+    lo, hi = profile["amount_range"]
+    forecast = random.choice(FORECASTS)
+    payload: dict = {
+        "symbol": "BTC",
+        "timeframe": "M5",
+        "forecast": forecast,
+        "amount": round(random.uniform(lo, hi), 2),
+    }
+
+    is_limit = random.random() < profile["limit_pct"]
+    if is_limit:
+        # Random limit price biased around 0.50 ± 0.25
+        payload["limit_price"] = round(random.uniform(0.25, 0.75), 2)
+        # Add TTL for ~70% of limit orders
+        if random.random() < 0.70:
+            ttl_lo, ttl_hi = profile["ttl_range"]
+            payload["ttl"] = random.choice(range(ttl_lo, ttl_hi + 1, 5))
+
+    if random.random() < 0.30:
+        payload["reason"] = random.choice(REASONS)
+
+    return payload
+
+
+def random_trader_loop(bot_name: str, api_key: str, profile: dict) -> None:
+    """Continuous random trading loop for BTC M5 — fires every N seconds."""
+    interval = RANDOM_TRADER_INTERVAL
+    log.info(
+        "%s [random-trader] started: style=%s interval=%ds amount=%s",
+        bot_name, profile["suffix"], interval, profile["amount_range"],
+    )
+
+    # Initial stagger
+    jitter = random.uniform(0, 8)
+    time.sleep(jitter)
+
+    while True:
+        try:
+            payload = build_random_btc_trade(profile)
+            otype = "LIMIT" if payload.get("limit_price") else "MKT"
+            ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
+            log.info(
+                "%s [random] %s %s $%.2f%s%s",
+                bot_name, otype, payload["forecast"],
+                payload["amount"],
+                f" @{payload['limit_price']}" if payload.get("limit_price") else "",
+                ttl_str,
+            )
+            place_trade(api_key, payload, bot_name)
+        except Exception as e:
+            log.error("%s [random] Error: %s", bot_name, e)
+
+        # Sleep with small random jitter
+        time.sleep(interval + random.uniform(-3, 3))
 
 
 def build_a1_batch(target_ts: int | None = None) -> list[dict]:
@@ -327,18 +424,19 @@ def build_case_pool(ref: float, target_ts: int | None) -> list[tuple[str, dict, 
          "amount": 10.0, "limit_price": round(max(0.02, ref - 0.05), 2),
          "session_offset": 0},
     ))
-    # offset=1 (A+1) — all symbols × forecasts
-    for sym in SYMBOLS:
-        for fc in FORECASTS:
-            pool.append(_make_case(
-                f"A+1-{sym}-{fc}",
-                {"symbol": sym, "timeframe": "M5", "forecast": fc,
-                 "amount": round(random.uniform(5, 15), 2),
-                 "limit_price": round(random.uniform(0.40, 0.60), 2),
-                 "session_offset": 1},
-            ))
+    # offset=1,2,3 (A+1, A+2, A+3) — all symbols × forecasts
+    for offset in [1, 2, 3]:
+        for sym in SYMBOLS:
+            for fc in FORECASTS:
+                pool.append(_make_case(
+                    f"A+{offset}-{sym}-{fc}",
+                    {"symbol": sym, "timeframe": "M5", "forecast": fc,
+                     "amount": round(random.uniform(5, 15), 2),
+                     "limit_price": round(random.uniform(0.40, 0.60), 2),
+                     "session_offset": offset},
+                ))
     # Invalid offset
-    for off in [2, -1, 99]:
+    for off in [4, -1, 99]:
         pool.append(_make_case(
             f"BAD-offset={off}",
             {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
@@ -381,7 +479,7 @@ def build_case_pool(ref: float, target_ts: int | None) -> list[tuple[str, dict, 
     pool.append(_make_case(
         "ts=far-future",
         {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
-         "amount": 5.0, "timestamp": next_b + period * 3},
+         "amount": 5.0, "timestamp": next_b + period * 5},
         expect_fail=True,
     ))
 
@@ -827,15 +925,83 @@ def main():
         log.error("No bots available, exiting")
         return
 
+    # ── Setup random BTC-M5 trader ────────────────────────────────────────
+    random_bot_slots: list[tuple[str, str, dict]] = []
+    log.info("=" * 60)
+    log.info(
+        "Setting up random-trader: %s (%d bots)",
+        RANDOM_TRADER_USER, RANDOM_TRADER_NUM_BOTS,
+    )
+    try:
+        rt_jwt = register_or_login_user(RANDOM_TRADER_USER, PASSWORD)
+        existing_rt = []
+        try:
+            existing_rt = fetch_my_bots(rt_jwt)
+        except Exception:
+            pass
+
+        # Reuse existing bots
+        for bot_data in existing_rt:
+            if len(random_bot_slots) >= RANDOM_TRADER_NUM_BOTS:
+                break
+            if not bot_data.get("is_active", True):
+                continue
+            if bot_data.get("status") == "DELETED":
+                continue
+            name = bot_data["bot_name"]
+            # Match to a random profile
+            matched = None
+            for rp in RANDOM_BTC_PROFILES:
+                if rp["suffix"] in name:
+                    matched = rp
+                    break
+            if matched is None:
+                matched = RANDOM_BTC_PROFILES[len(random_bot_slots) % len(RANDOM_BTC_PROFILES)]
+            random_bot_slots.append((name, bot_data["api_key"], matched))
+            log.info(
+                "[%s] Reusing bot: %s (style=%s, balance=$%.0f)",
+                RANDOM_TRADER_USER, name, matched["suffix"],
+                bot_data.get("balance", 0),
+            )
+
+        # Create new bots if needed
+        for i in range(len(random_bot_slots), RANDOM_TRADER_NUM_BOTS):
+            profile = RANDOM_BTC_PROFILES[i % len(RANDOM_BTC_PROFILES)]
+            bot_name = f"{RANDOM_TRADER_USER}-{profile['suffix']}"
+            balance = random.randint(BOT_BALANCE_MIN, BOT_BALANCE_MAX)
+            balance = round(balance / 50) * 50
+            balance = max(BOT_BALANCE_MIN, balance)
+            try:
+                api_key = create_bot(bot_name, rt_jwt, initial_balance=balance)
+                random_bot_slots.append((bot_name, api_key, profile))
+            except Exception as e:
+                log.error(
+                    "[%s] Failed to create bot '%s': %s",
+                    RANDOM_TRADER_USER, bot_name, e,
+                )
+    except Exception as e:
+        log.error("Failed to setup random-trader '%s': %s", RANDOM_TRADER_USER, e)
+
+    log.info(
+        "[%s] Setup complete: %d random BTC-M5 bot(s)",
+        RANDOM_TRADER_USER, len(random_bot_slots),
+    )
+
     # Summary
     log.info("=" * 60)
     log.info(
         "Launching %d bots across %d users | trades/tick=%d cases/tick=%d",
         len(all_bot_slots), NUM_USERS, TRADES_PER_TICK, CASES_PER_TICK,
     )
+    log.info(
+        "  + %d random BTC-M5 bots (user=%s, interval=%ds)",
+        len(random_bot_slots), RANDOM_TRADER_USER, RANDOM_TRADER_INTERVAL,
+    )
     log.info("=" * 60)
 
     threads = []
+
+    # Snipe-based bot threads (existing)
     for bot_name, api_key, profile in all_bot_slots:
         t = threading.Thread(
             target=bot_loop,
@@ -846,6 +1012,21 @@ def main():
         t.start()
         threads.append(t)
         log.info("Thread started for %s (%s)", bot_name, profile["suffix"])
+
+    # Random trader threads (continuous, every N seconds)
+    for bot_name, api_key, profile in random_bot_slots:
+        t = threading.Thread(
+            target=random_trader_loop,
+            args=(bot_name, api_key, profile),
+            name=bot_name,
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info(
+            "Thread started for %s (%s) [random-trader, %ds interval]",
+            bot_name, profile["suffix"], RANDOM_TRADER_INTERVAL,
+        )
 
     log.info(
         "All %d bots running. Press Ctrl+C to stop.", len(threads),

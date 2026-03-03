@@ -625,6 +625,7 @@ class ShadowOrderbook:
         tp_price:          Optional[Decimal] = None,
         sl_price:          Optional[Decimal] = None,
         on_bracket_exit:   Optional[Callable] = None,
+        expire_at:         Optional[datetime] = None,
     ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
         """
         Register an already-filled order for bracket (TP/SL) monitoring only.
@@ -632,6 +633,11 @@ class ShadowOrderbook:
 
         Used for MARKET orders that were filled via Polymarket REST API.
         The ME only monitors TP/SL conditions and fires bracket exit callbacks.
+
+        Args:
+            expire_at: Optional expiry (settlement time).  When set, the order
+                       is auto-cleaned from the book after this time, preventing
+                       zombie orders from accumulating in memory.
 
         Returns:
             Tuple of (order, bracket_results).  Bracket exit callbacks are NOT
@@ -648,6 +654,7 @@ class ShadowOrderbook:
             _entry_cost=avg_entry_price * filled,
             tp_price=tp_price,
             sl_price=sl_price,
+            expire_at=expire_at,
             _on_bracket_exit=on_bracket_exit,
         )
 
@@ -906,6 +913,18 @@ class ShadowOrderbook:
                 logger.info(
                     "Order expired (PARTIAL→CANCELED): id=%s filled=%s unfilled=%s",
                     order.order_id[:12], order.filled, unfilled,
+                )
+            elif order.status == OrderStatus.FILLED and not order.position_closed:
+                # Prefilled bracket order whose session has settled but
+                # TP/SL never triggered.  Mark position_closed so the order
+                # is no longer eligible for bracket monitoring and can be
+                # cleaned up from memory.
+                order.position_closed = True
+                expired.append(order)
+                logger.info(
+                    "Bracket order expired (session settled): id=%s filled=%s tp=%s sl=%s",
+                    order.order_id[:12], order.filled,
+                    order.tp_price, order.sl_price,
                 )
         return expired
 
@@ -1673,6 +1692,7 @@ class MatchingEngine:
         tp_price:          Optional[Decimal] = None,
         sl_price:          Optional[Decimal] = None,
         on_bracket_exit:   Optional[Callable] = None,
+        expire_at:         Optional[datetime] = None,
     ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
         """
         Convenience wrapper: get/create book and register a pre-filled bracket order.
@@ -1689,6 +1709,7 @@ class MatchingEngine:
             )
         return book.place_prefilled_bracket_order(
             side, avg_entry_price, filled, tp_price, sl_price, on_bracket_exit,
+            expire_at,
         )
 
     def cancel_order(self, token_id: str, order_id: str) -> Optional[SimulatedOrder]:

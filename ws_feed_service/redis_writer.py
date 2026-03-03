@@ -61,6 +61,7 @@ def _record_price_history_sync(
     best_bid: Optional[float],
     bids: Optional[list] = None,
     asks: Optional[list] = None,
+    candle_ts: Optional[int] = None,
 ) -> None:
     """Insert one PriceHistory row. Runs in a thread via run_in_executor."""
     try:
@@ -77,6 +78,7 @@ def _record_price_history_sync(
                 best_bid=best_bid,
                 bids=bids,
                 asks=asks,
+                candle_ts=candle_ts,
             )
             db.add(row)
             db.commit()
@@ -319,6 +321,7 @@ class RedisWriter:
         if combos:
             for sym, tf, direction in combos:
                 combo_key = f"{sym}:{tf}:{direction}"
+                current_candle = self._current_sessions.get(tf)
                 last_ts = self._last_price_record_ts.get(combo_key, 0.0)
                 if now_mono - last_ts >= PRICE_HISTORY_INTERVAL_S:
                     self._last_price_record_ts[combo_key] = now_mono
@@ -329,7 +332,7 @@ class RedisWriter:
                         None,
                         _record_price_history_sync,
                         sym, tf, direction, best_ask, best_bid,
-                        ob_bids, ob_asks,
+                        ob_bids, ob_asks, current_candle,
                     )
 
         # Future session combos — use candle_ts in throttle key to
@@ -350,7 +353,7 @@ class RedisWriter:
                         None,
                         _record_price_history_sync,
                         sym, tf, direction, best_ask, best_bid,
-                        ob_bids, ob_asks,
+                        ob_bids, ob_asks, candle_ts,
                     )
 
     async def clear_price_keys(self, combos: list[tuple[str, str, str]]) -> None:

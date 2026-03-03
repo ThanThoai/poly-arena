@@ -1,7 +1,7 @@
 """
 WS Feed Service — standalone entry point.
 
-Runs the Polymarket WebSocket feed, matching engine, and token registry
+Runs the Polymarket WebSocket feed, session manager, and token registry
 as an independent process. Communicates with the FastAPI process via Redis.
 
 Usage:
@@ -18,13 +18,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.redis_client import get_async_redis, get_sync_redis, close_async_redis, close_sync_redis
-from services.matching_engine import MatchingEngine, get_engine
+from services.session_manager import SessionManager, get_session_manager
+from services.session_engine import SessionState
 from services.token_registry import TokenRegistry
 from services.ws_feed import PolymarketFeed
-from ws_feed_service.config import QUEUE_ORDERS_NEW, ORDERBOOK_DEPTH_LEVELS
+from ws_feed_service.config import ORDERBOOK_DEPTH_LEVELS
 from ws_feed_service.redis_writer import RedisWriter
 from ws_feed_service.order_consumer import OrderConsumer
 
+from config.timing import TF_SECONDS as _TF_SECONDS
 from database import SessionLocal
 from models import BinaryOption, BOResult
 
@@ -37,10 +39,110 @@ logging.basicConfig(
 log = logging.getLogger("ws_feed_service")
 
 
-async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: TokenRegistry) -> int:
+# ── Session creation from registry ────────────────────────────────────────────
+
+
+def _create_sessions_from_registry(sm: SessionManager, registry: TokenRegistry) -> None:
+    """
+    Create initial SessionEngine instances from TokenRegistry's current + future mappings.
+
+    Groups UP+DOWN tokens for the same (sym, tf, candle_ts) into one SessionEngine.
+    """
+    import time
+
+    # Group tokens by (sym, tf, candle_ts) → {"UP": token_id, "DOWN": token_id}
+    session_tokens: dict[str, dict[str, str]] = {}  # session_id → {dir: token_id}
+
+    # Current candle tokens → ACTIVE
+    for (sym, tf, direction), token_id in registry._mapping.items():
+        period_s = _TF_SECONDS[tf]
+        now_ts = int(time.time())
+        candle_open = now_ts - (now_ts % period_s)
+        session_id = f"{sym}:{tf}:{candle_open}"
+        session_tokens.setdefault(session_id, {})[direction] = token_id
+
+    for session_id, tokens in session_tokens.items():
+        sm.create_session(session_id, tokens, initial_state=SessionState.ACTIVE)
+
+    # Future candle tokens → PREFETCH
+    future_session_tokens: dict[str, dict[str, str]] = {}
+    for (sym, tf, direction), future_ids in registry._future_mapping.items():
+        for token_id in future_ids:
+            candle_ts = registry._token_sessions.get(token_id, 0)
+            if candle_ts == 0:
+                continue
+            session_id = f"{sym}:{tf}:{candle_ts}"
+            future_session_tokens.setdefault(session_id, {})[direction] = token_id
+
+    for session_id, tokens in future_session_tokens.items():
+        sm.create_session(session_id, tokens, initial_state=SessionState.PREFETCH)
+
+    log.info(
+        "Created %d ACTIVE + %d PREFETCH session(s) from registry",
+        len(session_tokens), len(future_session_tokens),
+    )
+
+
+def _update_sessions_from_registry(sm: SessionManager, registry: TokenRegistry) -> None:
+    """
+    Called on token rotation. Creates new sessions for newly discovered tokens
+    and transitions old sessions: detect which (sym, tf) rotated → old ACTIVE → SETTLING.
+    """
+    import time
+
+    # Detect candle boundaries for each timeframe
+    for tf in ["M5", "M15", "H1"]:
+        period_s = _TF_SECONDS[tf]
+        now_ts = int(time.time())
+        new_candle_ts = now_ts - (now_ts % period_s)
+
+        for sym in ["BTC", "ETH", "SOL", "XRP"]:
+            # Check if we have a new current session for this (sym, tf)
+            up_token = registry.get_token_id(sym, tf, "UP")
+            down_token = registry.get_token_id(sym, tf, "DOWN")
+            if not up_token and not down_token:
+                continue
+
+            new_session_id = f"{sym}:{tf}:{new_candle_ts}"
+            existing = sm.get_session(new_session_id)
+
+            if existing is None:
+                # New session — create as ACTIVE
+                tokens = {}
+                if up_token:
+                    tokens["UP"] = up_token
+                if down_token:
+                    tokens["DOWN"] = down_token
+                sm.create_session(new_session_id, tokens, initial_state=SessionState.ACTIVE)
+            elif existing.state == SessionState.PREFETCH:
+                # Promote PREFETCH → ACTIVE
+                sm.transition_session(new_session_id, SessionState.ACTIVE)
+
+            # Transition old ACTIVE sessions for this (sym, tf) to SETTLING
+            sm.on_candle_boundary(sym, tf, new_candle_ts)
+
+    # Create PREFETCH sessions for future tokens
+    future_session_tokens: dict[str, dict[str, str]] = {}
+    for (sym, tf, direction), future_ids in registry._future_mapping.items():
+        for token_id in future_ids:
+            candle_ts = registry._token_sessions.get(token_id, 0)
+            if candle_ts == 0:
+                continue
+            session_id = f"{sym}:{tf}:{candle_ts}"
+            future_session_tokens.setdefault(session_id, {})[direction] = token_id
+
+    for session_id, tokens in future_session_tokens.items():
+        if sm.get_session(session_id) is None:
+            sm.create_session(session_id, tokens, initial_state=SessionState.PREFETCH)
+
+
+# ── Recovery ──────────────────────────────────────────────────────────────────
+
+
+async def _recover_pending_orders(sync_redis, session_manager: SessionManager, registry: TokenRegistry) -> int:
     """
     Re-push PENDING BOs that have bracket orders (tp_price or sl_price set)
-    back to the Redis queue so the OrderConsumer can re-register them
+    back to the per-session Redis queue so the OrderConsumer can re-register them
     in the matching engine after a restart.
 
     Returns the number of orders re-pushed.
@@ -120,6 +222,30 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
                 )
                 continue
 
+            # Compute session_id from settlement_at
+            period_s = _TF_SECONDS.get(tf_val, 300)
+            if bo.settlement_at:
+                candle_open = int(bo.settlement_at.timestamp()) - period_s
+            else:
+                now_ts = int(now.timestamp())
+                candle_open = now_ts - (now_ts % period_s)
+            session_id = f"{sym_val}:{tf_val}:{candle_open}"
+
+            # Ensure session exists for recovery
+            session = session_manager.get_session(session_id)
+            if session is None:
+                # Create session if missing (e.g. orders from previous candle)
+                up_token = registry.get_token_id(sym_val, tf_val, "UP")
+                down_token = registry.get_token_id(sym_val, tf_val, "DOWN")
+                tokens = {}
+                if up_token:
+                    tokens["UP"] = up_token
+                if down_token:
+                    tokens["DOWN"] = down_token
+                if tokens:
+                    session_manager.create_session(session_id, tokens, initial_state=SessionState.ACTIVE)
+                    log.info("Recovery: created session %s for BO #%d", session_id, bo.id)
+
             # Determine if this is an already-filled order (MARKET+bracket)
             # that should be registered as prefilled (monitoring only)
             is_already_filled = (
@@ -147,6 +273,7 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
                 "sl_price": bo.sl_price,
                 "timeframe": tf_val,
                 "ttl": ttl_remaining,
+                "session_id": session_id,
             }
 
             # Already-filled MARKET+bracket: set prefilled so OrderConsumer
@@ -157,7 +284,8 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
                 payload["prefilled_filled"] = bo.num_shares
 
             order_data = json.dumps(payload)
-            sync_redis.lpush(QUEUE_ORDERS_NEW, order_data)
+            queue_key = f"queue:orders:{session_id}"
+            sync_redis.lpush(queue_key, order_data)
             count += 1
     except Exception as exc:
         log.error("Recovery failed: %s", exc)
@@ -168,23 +296,32 @@ async def _recover_pending_orders(sync_redis, engine: MatchingEngine, registry: 
     return count
 
 
-def _patch_dispatch_event(engine: MatchingEngine, writer: RedisWriter, loop: asyncio.AbstractEventLoop):
-    """
-    Monkey-patch engine.dispatch_event to also write prices to Redis
-    after book/price_change/best_bid_ask events.
+# ── Dispatch event patching ───────────────────────────────────────────────────
 
-    This avoids modifying matching_engine.py or ws_feed.py.
-    """
-    original_dispatch = engine.dispatch_event
 
-    def patched_dispatch(event: dict) -> None:
-        original_dispatch(event)
+def _patch_dispatch_event(session_manager: SessionManager, writer: RedisWriter, loop: asyncio.AbstractEventLoop):
+    """
+    Monkey-patch both MatchingEngine.dispatch_event and session_manager.dispatch_event
+    to bridge WS events from the feed (which calls MatchingEngine) to the SessionManager
+    (which manages per-session books and writes prices/orderbooks to Redis).
+
+    Without this bridge, PolymarketFeed._on_message → get_engine().dispatch_event()
+    would only update the MatchingEngine's internal books, leaving the SessionManager
+    books stale and skipping all Redis price writes + PriceHistory recording.
+    """
+    from services.matching_engine import get_engine
+
+    # 1. Patch session_manager.dispatch_event to also write prices to Redis
+    original_sm_dispatch = session_manager.dispatch_event
+
+    def patched_sm_dispatch(event: dict) -> None:
+        original_sm_dispatch(event)
 
         etype = event.get("event_type", "")
         asset_id = event.get("asset_id", "")
 
         if etype in ("book", "price_change", "best_bid_ask") and asset_id:
-            book = engine.get_book(asset_id)
+            book = session_manager.get_book(asset_id)
             if book is not None:
                 best_ask = book.best_ask()
                 best_bid = book.best_bid()
@@ -210,8 +347,26 @@ def _patch_dispatch_event(engine: MatchingEngine, writer: RedisWriter, loop: asy
                 except Exception:
                     pass
 
-    engine.dispatch_event = patched_dispatch
-    log.info("Patched engine.dispatch_event to write prices to Redis")
+    session_manager.dispatch_event = patched_sm_dispatch
+
+    # 2. Patch MatchingEngine.dispatch_event to also call session_manager.dispatch_event.
+    #    PolymarketFeed._on_message calls get_engine().dispatch_event(event) — this bridge
+    #    ensures WS events also flow through the SessionManager (multi-session books + Redis).
+    engine = get_engine()
+    original_me_dispatch = engine.dispatch_event
+
+    def patched_me_dispatch(event: dict) -> None:
+        original_me_dispatch(event)
+        try:
+            session_manager.dispatch_event(event)
+        except Exception as exc:
+            log.error("SessionManager dispatch failed: %s", exc)
+
+    engine.dispatch_event = patched_me_dispatch
+    log.info("Patched MatchingEngine + SessionManager dispatch_event to write prices to Redis")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 
 async def main():
@@ -229,8 +384,8 @@ async def main():
         log.error("Cannot connect to Redis: %s", exc)
         sys.exit(1)
 
-    # 2. Init MatchingEngine + RedisWriter
-    engine = get_engine()
+    # 2. Init SessionManager + RedisWriter
+    session_manager = get_session_manager()
     writer = RedisWriter(async_redis)
 
     # 3. Token discovery (blocking REST)
@@ -240,13 +395,15 @@ async def main():
     if not token_ids:
         log.warning("No token IDs discovered — running without WS feed")
 
-    # 4. Register token mapping in RedisWriter + valid tokens in engine
+    # 4. Register token mapping in RedisWriter + create sessions
     writer.register_token_mapping(registry._mapping)
     # Register session-aware token mapping for future session orderbook writes
     current_sessions = {tf: registry.get_current_candle_open(tf) for tf in ["M5", "M15", "H1"]}
     writer.register_session_tokens(registry.get_all_token_mapping(), current_sessions)
     await writer.publish_token_mapping()
-    engine.register_valid_tokens(list(registry._mapping.values()))
+
+    # Create initial sessions from discovered tokens
+    _create_sessions_from_registry(session_manager, registry)
 
     # Seed Redis with initial orderbook depth from REST discovery
     initial_books = registry.pop_initial_books()
@@ -262,9 +419,9 @@ async def main():
                 await writer.update_price(token_id, best_ask, best_bid)
         log.info("Seeded Redis with %d initial orderbook(s) from REST", len(initial_books))
 
-    # 5. Patch engine.dispatch_event to write Redis
+    # 5. Patch session_manager.dispatch_event to write Redis
     loop = asyncio.get_event_loop()
-    _patch_dispatch_event(engine, writer, loop)
+    _patch_dispatch_event(session_manager, writer, loop)
 
     # 6. Start PolymarketFeed
     feed = None
@@ -289,12 +446,9 @@ async def main():
             # "no data" instead of old prices while waiting for first
             # WS tick from the new session's token.
             asyncio.ensure_future(writer.clear_price_keys(rotated))
-        # Update valid token set: add new, remove old
-        engine.register_valid_tokens(list(registry._mapping.values()))
-        if old_token_ids:
-            # Expire old books so pending LIMIT orders don't fill against
-            # stale asks from the previous candle (e.g. $0.01 after RED).
-            engine.invalidate_books(old_token_ids)
+
+        # Update sessions from registry (create new, transition old)
+        _update_sessions_from_registry(session_manager, registry)
 
         # Seed Redis with initial orderbook depth from REST fetch.
         # Critical for M5: tokens rotate every 5 minutes and Polymarket WS
@@ -314,10 +468,9 @@ async def main():
             asyncio.ensure_future(_seed())
 
         log.info(
-            "TokenRegistry pushed %d new token(s)%s%s, seeded %d book(s)",
+            "TokenRegistry pushed %d new token(s)%s, seeded %d book(s)",
             len(ids),
             f", cleared {len(rotated)} stale price key(s)" if rotated else "",
-            f", expired {len(old_token_ids)} old book(s)" if old_token_ids else "",
             len(initial_books),
         )
 
@@ -325,10 +478,10 @@ async def main():
     await registry.start()
 
     # 8. Start OrderConsumer daemon thread
-    consumer = OrderConsumer(sync_redis, engine, writer, loop, registry=registry)
+    consumer = OrderConsumer(sync_redis, session_manager, writer, loop, registry=registry)
     consumer.start()
 
-    # 8b. Wire up market_resolved callback on MatchingEngine
+    # 8b. Wire up market_resolved callback on SessionManager
     # When Polymarket resolves a market early, publish affected bo_ids to Redis
     # so the FastAPI consumer can process only the correct orders.
     def _on_market_resolved(asset_id: str, resolved_orders: list) -> None:
@@ -351,10 +504,10 @@ async def main():
                 asset_id[:16], bo_ids,
             )
 
-    engine._on_market_resolved = _on_market_resolved
+    session_manager._on_market_resolved = _on_market_resolved
 
-    # 9. Recovery: re-push PENDING BOs
-    recovered = await _recover_pending_orders(sync_redis, engine, registry)
+    # 9. Recovery: re-push PENDING BOs to per-session queues
+    recovered = await _recover_pending_orders(sync_redis, session_manager, registry)
     if recovered:
         log.info("Recovery: re-pushed %d pending order(s) to queue", recovered)
 
@@ -363,9 +516,13 @@ async def main():
     async def _expiry_tick():
         while not shutdown_event.is_set():
             try:
-                n = engine.expire_all_pending()
+                n = session_manager.expire_all_pending()
                 if n:
                     log.info("Expiry tick: expired %d order(s)", n)
+                # Archive sessions that have been SETTLING > 30s
+                archived = session_manager.archive_settling_sessions(grace_seconds=30)
+                if archived:
+                    log.info("Expiry tick: archived %d settling session(s)", len(archived))
             except Exception as exc:
                 log.error("Expiry tick error: %s", exc)
             await asyncio.sleep(5)
@@ -389,7 +546,7 @@ async def main():
     await registry.stop()
     if feed is not None:
         await feed.stop()
-    engine.shutdown()
+    session_manager.shutdown()
     await close_async_redis()
     close_sync_redis()
     log.info("WS Feed Service stopped")

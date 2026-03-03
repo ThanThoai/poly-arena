@@ -10,7 +10,8 @@ from config.timing import (                         # noqa: F401 — re-exported
 
 # ── Redis keys ───────────────────────────────────────────────────────────────
 
-QUEUE_ORDERS_NEW = "queue:orders:new"
+QUEUE_ORDERS_PREFIX = "queue:orders"    # Per-session: queue:orders:{SYM}:{TF}:{CANDLE_TS}
+QUEUE_ORDERS_NEW = "queue:orders:new"   # DEPRECATED — kept for backward reference only
 STREAM_BRACKET_EXITS = "stream:bracket:exits"
 STREAM_ORDER_CANCELS = "stream:order:cancels"
 STREAM_ORDER_FILLS   = "stream:order:fills"
@@ -31,7 +32,7 @@ STREAM_MAXLEN = 10_000              # XADD MAXLEN ~ for bracket exits
 
 # ── UI Future Sessions ──────────────────────────────────────────────────
 
-UI_FUTURE_SESSIONS = 2              # Number of future sessions to expose to UI
+UI_FUTURE_SESSIONS = 3              # Number of future sessions to expose to UI (A+1, A+2, A+3)
 UI_PAST_SESSIONS = 1                # Number of past sessions to keep for UI
 
 # ── Market constants ─────────────────────────────────────────────────────────

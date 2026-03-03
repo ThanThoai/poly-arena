@@ -196,4 +196,5 @@ class PriceHistory(Base):
     best_bid    = Column(Numeric(18, 8, asdecimal=False), nullable=True)
     bids        = Column(JSON, nullable=True)   # [[price, size], ...]
     asks        = Column(JSON, nullable=True)   # [[price, size], ...]
+    candle_ts   = Column(Integer, nullable=True, index=True)  # candle open ts — tags which session this snapshot belongs to
     recorded_at = Column(DateTime(timezone=True), default=_now, index=True)

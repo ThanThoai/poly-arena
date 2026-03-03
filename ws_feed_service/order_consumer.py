@@ -26,7 +26,8 @@ from services.matching_engine import (
     MatchingEngine, OrderSide, OrderStatus, OrderStateChangeEvent,
     BracketFillResult,
 )
-from ws_feed_service.config import QUEUE_ORDERS_NEW, BRPOP_TIMEOUT_S
+from services.session_manager import SessionManager
+from ws_feed_service.config import BRPOP_TIMEOUT_S
 from ws_feed_service.redis_writer import RedisWriter
 
 logger = logging.getLogger(__name__)
@@ -109,13 +110,13 @@ class OrderConsumer:
     def __init__(
         self,
         sync_redis: redis.Redis,
-        engine: MatchingEngine,
+        session_manager: SessionManager,
         redis_writer: RedisWriter,
         loop: asyncio.AbstractEventLoop,
         registry=None,
     ) -> None:
         self._r = sync_redis
-        self._engine = engine
+        self._session_manager = session_manager
         self._writer = redis_writer
         self._loop = loop
         self._running = False
@@ -144,19 +145,27 @@ class OrderConsumer:
         logger.info("OrderConsumer stopped")
 
     def _run(self) -> None:
-        """Main BRPOP loop."""
+        """Main multi-key BRPOP loop — dynamically polls active session queues."""
         while self._running:
             try:
-                result = self._r.brpop(QUEUE_ORDERS_NEW, timeout=BRPOP_TIMEOUT_S)
+                keys = self._session_manager.active_queue_keys()
+                if not keys:
+                    import time
+                    time.sleep(BRPOP_TIMEOUT_S)
+                    continue
+                result = self._r.brpop(keys, timeout=BRPOP_TIMEOUT_S)
                 if result is None:
                     continue  # timeout, check _running flag
-                _key, raw = result
-                self._process_order(raw)
+                queue_key, raw = result
+                # Extract session_id: "queue:orders:BTC:M5:1709313000" → "BTC:M5:1709313000"
+                key_str = queue_key.decode() if isinstance(queue_key, bytes) else queue_key
+                session_id = key_str.split(":", 2)[2] if key_str.count(":") >= 2 else None
+                self._process_order(raw, session_id)
             except Exception as exc:
                 if self._running:
                     logger.error("OrderConsumer BRPOP error: %s", exc)
 
-    def _process_order(self, raw: str) -> None:
+    def _process_order(self, raw: str, session_id: Optional[str] = None) -> None:
         """Parse JSON and place virtual order in the matching engine."""
         try:
             data = json.loads(raw)
@@ -183,9 +192,29 @@ class OrderConsumer:
                 )
             return
 
-        # Token_id comes from API's Polymarket REST lookup — ensure the
-        # matching engine accepts it even if TokenRegistry hasn't refreshed yet.
-        self._engine.add_valid_token(token_id)
+        # Resolve session from queue key or payload
+        if session_id is None:
+            session_id = data.get("session_id")
+
+        # Validate session exists
+        session = self._session_manager.get_session(session_id) if session_id else None
+        if session is None:
+            logger.warning(
+                "OrderConsumer: session %s not found for bo_id=%s — rejecting",
+                session_id, bo_id,
+            )
+            if bo_id is not None:
+                self._publish_async(
+                    self._writer.publish_order_cancel(
+                        bo_id=bo_id, order_id="",
+                        reason="SESSION_NOT_FOUND",
+                        filled=0.0, avg_entry_price=0.0,
+                    )
+                )
+            return
+
+        # Ensure session owns this token
+        self._session_manager.add_valid_token(token_id)
 
         tp_price = data.get("tp_price")
         sl_price = data.get("sl_price")
@@ -197,21 +226,29 @@ class OrderConsumer:
 
         if is_prefilled:
             # ── Pre-filled MARKET order: register for bracket monitoring only ──
-            self._process_prefilled_order(data, bo_id, token_id, on_bracket_exit)
+            self._process_prefilled_order(data, bo_id, token_id, on_bracket_exit, session)
         else:
             # ── Standard order flow (LIMIT or legacy MARKET) ──────────────────
-            self._process_standard_order(data, bo_id, token_id, on_bracket_exit)
+            self._process_standard_order(data, bo_id, token_id, on_bracket_exit, session)
 
     def _process_prefilled_order(
         self, data: dict, bo_id: Optional[int],
         token_id: Optional[str], on_bracket_exit,
+        session=None,
     ) -> None:
         """Handle a pre-filled MARKET order — register for bracket monitoring only."""
         tp_price = data.get("tp_price")
         sl_price = data.get("sl_price")
 
+        # Compute expire_at from settlement_at so bracket-monitoring orders
+        # are auto-cleaned when the session settles (prevents zombie orders).
+        expire_at = None
+        settlement_at_str = data.get("settlement_at")
+        if settlement_at_str:
+            expire_at = datetime.fromisoformat(settlement_at_str)
+
         try:
-            order, bracket_results = self._engine.place_prefilled_bracket_order(
+            order, bracket_results = session.place_prefilled_bracket_order(
                 token_id=token_id,
                 side=OrderSide.BUY,
                 avg_entry_price=Decimal(str(data["prefilled_avg_price"])),
@@ -219,21 +256,22 @@ class OrderConsumer:
                 tp_price=Decimal(str(tp_price)) if tp_price else None,
                 sl_price=Decimal(str(sl_price)) if sl_price else None,
                 on_bracket_exit=on_bracket_exit,
+                expire_at=expire_at,
             )
 
             logger.info(
                 "Prefilled bracket order registered from queue: bo_id=%s "
-                "me_order=%s filled=%s avg=%s tp=%s sl=%s",
+                "me_order=%s filled=%s avg=%s tp=%s sl=%s session=%s",
                 bo_id, order.order_id[:12],
                 order.filled, order.avg_entry_price,
-                tp_price, sl_price,
+                tp_price, sl_price, session.session_id,
             )
 
             # Register for centralized monitoring (bracket exits)
             if bo_id is not None:
                 self._order_to_bo[order.order_id] = bo_id
                 self._order_to_token[order.order_id] = token_id
-                book = self._engine.get_book(token_id)
+                book = self._session_manager.get_book(token_id)
                 if book is not None:
                     # Seed as FILLED so no duplicate fill events are emitted
                     book.seed_last_reported(order.order_id, order.filled, order.status)
@@ -276,6 +314,7 @@ class OrderConsumer:
     def _process_standard_order(
         self, data: dict, bo_id: Optional[int],
         token_id: Optional[str], on_bracket_exit,
+        session=None,
     ) -> None:
         """Handle standard LIMIT/MARKET order flow via matching engine."""
         side = OrderSide(data.get("side", "BUY"))
@@ -293,13 +332,28 @@ class OrderConsumer:
 
         is_market = limit_price is None
 
-        # TTL: pass as ttl_seconds so matching engine uses raw offset
-        # For session_offset=1, compute TTL from settlement_at so the order
-        # doesn't expire at the current candle close.
+        # TTL: pass as ttl_seconds so matching engine uses raw offset.
+        # For future sessions (offset >= 1), ensure the order lives at least
+        # until settlement_at so it doesn't expire before the target candle.
+        settlement_dt = None
+        if settlement_at_str:
+            settlement_dt = datetime.fromisoformat(settlement_at_str)
+
         if ttl is not None:
             ttl_seconds = float(ttl)
-        elif session_offset == 1 and settlement_at_str:
-            settlement_dt = datetime.fromisoformat(settlement_at_str)
+            # Clamp: user TTL on future sessions must not expire before
+            # the target session settles — otherwise the order dies before
+            # the candle even opens.
+            if session_offset >= 1 and settlement_dt:
+                min_ttl = max((settlement_dt - datetime.now(timezone.utc)).total_seconds(), 1.0)
+                if ttl_seconds < min_ttl:
+                    logger.info(
+                        "TTL clamped for future session (offset=%d): "
+                        "user_ttl=%.0fs < min_ttl=%.0fs → using min_ttl",
+                        session_offset, ttl_seconds, min_ttl,
+                    )
+                    ttl_seconds = min_ttl
+        elif session_offset >= 1 and settlement_dt:
             ttl_seconds = max((settlement_dt - datetime.now(timezone.utc)).total_seconds(), 1.0)
         else:
             ttl_seconds = None
@@ -309,7 +363,7 @@ class OrderConsumer:
         # price check and sweeps all available levels).
         if is_market:
             if amount is not None and token_id is not None:
-                me_best_ask = self._engine.best_ask(token_id)
+                me_best_ask = self._session_manager.best_ask(token_id)
                 if me_best_ask is not None and me_best_ask > 0:
                     orig_qty = quantity
                     quantity = Decimal(str(amount)) / Decimal(str(me_best_ask))
@@ -334,7 +388,7 @@ class OrderConsumer:
             if is_market and side == OrderSide.BUY and amount is not None:
                 cost_cap = Decimal(str(amount))
 
-            order, bracket_results = self._engine.place_virtual_order(
+            order, bracket_results = session.place_virtual_order(
                 token_id=token_id,
                 side=side,
                 price=Decimal(str(limit_price)) if limit_price is not None else price,
@@ -380,7 +434,7 @@ class OrderConsumer:
 
                 # Log limit order fill to file with orderbook snapshot
                 if not is_market:
-                    book = self._engine.get_book(token_id)
+                    book = self._session_manager.get_book(token_id)
                     bids_snap = book.depth(side="bid", levels=10) if book else []
                     asks_snap = book.depth(side="ask", levels=10) if book else []
                     _log_limit_fill(
@@ -400,7 +454,7 @@ class OrderConsumer:
                 self._order_to_bo[order.order_id] = bo_id
                 self._order_to_token[order.order_id] = token_id
                 # Seed last_reported so callback won't duplicate the immediate fill
-                book = self._engine.get_book(token_id)
+                book = self._session_manager.get_book(token_id)
                 if book is not None:
                     book.seed_last_reported(order.order_id, order.filled, order.status)
                     # Register callback once per book
@@ -496,7 +550,7 @@ class OrderConsumer:
                 # Log limit order fill to file with orderbook snapshot
                 token_id = self._order_to_token.get(event.order_id, "")
                 if token_id:
-                    book = self._engine.get_book(token_id)
+                    book = self._session_manager.get_book(token_id)
                     bids_snap = book.depth(side="bid", levels=10) if book else []
                     asks_snap = book.depth(side="ask", levels=10) if book else []
                     _log_limit_fill(

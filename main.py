@@ -15,10 +15,6 @@ from services.redis_client import get_async_redis, close_async_redis
 from config.fees import maker_rebate_from_levels
 from services.order_trace import make_trace, append_trace
 from services.user_balance import record_user_balance
-from services.rest_exit import (
-    fetch_best_bid_from_rest,
-    simulate_bracket_exit_from_rest,
-)
 from ws_feed_service.config import (
     STREAM_BRACKET_EXITS,
     STREAM_ORDER_CANCELS,
@@ -317,9 +313,14 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                # Maker rebate: resting limit orders earn rebate on fill
-                rebate = 0.0
-                if wp_str:
+                # Fee handling: maker rebate for passive LIMIT fills only.
+                # MARKET and aggressive LIMIT orders are filled at API level
+                # (snapshot fill with taker fee already deducted), so only
+                # passive LIMIT fills arrive here → apply maker rebate.
+                # Safety: skip rebate if entry_fee > 0 (already charged as taker).
+                fee_applied = 0.0
+                is_passive_limit = (bo.entry_fee or 0) <= 0
+                if wp_str and is_passive_limit:
                     try:
                         fill_levels = json.loads(wp_str)
                         rebate = maker_rebate_from_levels(fill_levels)
@@ -329,36 +330,35 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                             ).first()
                             if bot:
                                 bot.balance = round(bot.balance + rebate, 8)
-                            # Store rebate as negative entry_fee
                             bo.entry_fee = round(
                                 (bo.entry_fee or 0) - rebate, 8,
                             )
+                        fee_applied = rebate
                     except (json.JSONDecodeError, TypeError, KeyError):
                         pass
 
                 # MATCHING trace
+                nominal = round(fee_applied / 0.20, 8) if fee_applied > 0 else 0.0
                 if status == "FILLED":
-                    nominal = round(rebate / 0.20, 8) if rebate > 0 else 0.0
                     append_trace(bo, make_trace(
                         "MATCHING", "ORDER_FILLED",
                         f"Order fully filled. Avg Entry Price: ${avg_entry:.4f}. "
                         f"Shares: {filled:.4f}. "
-                        f"Rebate: ${rebate:.4f} (MAKER).",
+                        f"Rebate: ${fee_applied:.4f} (MAKER).",
                         {"avg_entry_price": avg_entry, "filled": filled,
                          "status": status, "nominal_fee": nominal,
                          "role": "MAKER", "actual_fee_deducted": 0.0,
-                         "rebate_earned": rebate},
+                         "rebate_earned": fee_applied},
                     ))
                 elif status == "PARTIAL":
-                    nominal = round(rebate / 0.20, 8) if rebate > 0 else 0.0
                     append_trace(bo, make_trace(
                         "MATCHING", "PARTIAL_FILL",
                         f"Partial fill: {filled:.4f} shares @ ${avg_entry:.4f}. "
-                        f"Rebate: ${rebate:.4f} (MAKER).",
+                        f"Rebate: ${fee_applied:.4f} (MAKER).",
                         {"avg_entry_price": avg_entry, "filled": filled,
                          "status": status, "nominal_fee": nominal,
                          "role": "MAKER", "actual_fee_deducted": 0.0,
-                         "rebate_earned": rebate},
+                         "rebate_earned": fee_applied},
                     ))
 
                 db.commit()
@@ -366,118 +366,16 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                 # Publish trace to Redis for real-time UI
                 _publish_trace_sync(bo)
 
+                role = "MAKER" if is_passive_limit else "TAKER"
                 log.info(
-                    "Fill update: BO #%d filled=%.4f avg=%.6f status=%s",
+                    "Fill update: BO #%d filled=%.4f avg=%.6f status=%s role=%s fee=%.6f",
                     bo_id,
                     filled,
                     avg_entry,
                     status,
+                    role,
+                    fee_applied,
                 )
-
-                # ── Auto-Exit: TP < entry hoặc SL > entry ──────────────
-                # Khi LIMIT order FILLED mà avg_entry_price đã vi phạm
-                # điều kiện TP/SL (do slippage hoặc book dynamics), tự
-                # động kích hoạt bracket exit ngay lập tức.
-                if (
-                    status == "FILLED"
-                    and bo.result == BOResult.PENDING
-                    and bo.exit_trigger is None
-                ):
-                    tp = bo.tp_price
-                    sl = bo.sl_price
-                    tp_violated = tp is not None and avg_entry >= tp
-                    sl_violated = sl is not None and avg_entry <= sl
-
-                    if tp_violated or sl_violated:
-                        trigger = "TP" if tp_violated else "SL"
-                        cond_price = tp if tp_violated else sl
-                        log.info(
-                            "Auto-Exit: BO #%d %s violated at fill — "
-                            "entry=%.6f %s=%.6f",
-                            bo_id, trigger, avg_entry, trigger, cond_price,
-                        )
-                        append_trace(bo, make_trace(
-                            "MONITORING", "SLIPPAGE_VIOLATION",
-                            f"Post-fill check: Avg Entry ${avg_entry:.4f} "
-                            f"violates {trigger} ${cond_price:.4f}. "
-                            f"Triggering Auto-Exit...",
-                            {"avg_entry_price": avg_entry, "trigger": trigger,
-                             "condition_price": cond_price},
-                        ))
-
-                        # Resolve token_id for REST bid lookup
-                        _FORECAST_MAP = {"GREEN": "UP", "RED": "DOWN"}
-                        pm_dir = _FORECAST_MAP.get(
-                            bo.forecast.value
-                            if hasattr(bo.forecast, "value")
-                            else str(bo.forecast),
-                            "UP",
-                        )
-                        token_id = _get_token_id(
-                            bo.symbol.value
-                            if hasattr(bo.symbol, "value")
-                            else str(bo.symbol),
-                            bo.timeframe.value
-                            if hasattr(bo.timeframe, "value")
-                            else str(bo.timeframe),
-                            pm_dir,
-                        )
-
-                        exit_done = False
-                        if token_id:
-                            best_bid, bid_levels = fetch_best_bid_from_rest(
-                                token_id,
-                            )
-                            if best_bid is not None and bid_levels:
-                                exit_price, exit_filled, exit_walk = (
-                                    simulate_bracket_exit_from_rest(
-                                        filled, bid_levels,
-                                    )
-                                )
-                                if exit_filled > 0:
-                                    # Record exit data only — profit
-                                    # deferred to session-end settlement
-                                    bo.exit_trigger = trigger
-                                    bo.exit_price = exit_price
-                                    bo.exit_filled = exit_filled
-                                    bo.exit_at = datetime.now(timezone.utc)
-
-                                    wp = bo.walk_prices or {}
-                                    wp["exit"] = exit_walk
-                                    bo.walk_prices = wp
-
-                                    append_trace(bo, make_trace(
-                                        "MONITORING",
-                                        "AUTO_EXIT_RECORDED",
-                                        f"Auto-Exit: {trigger} violated at "
-                                        f"entry. Entry: ${avg_entry:.4f} → "
-                                        f"Exit: ${exit_price:.4f}. "
-                                        f"Shares: {exit_filled:.4f}. "
-                                        f"Pending session-end settlement.",
-                                        {"trigger": trigger,
-                                         "entry_price": avg_entry,
-                                         "exit_price": exit_price,
-                                         "exit_filled": exit_filled},
-                                    ))
-                                    db.commit()
-                                    _publish_trace_sync(bo)
-                                    exit_done = True
-                                    log.info(
-                                        "Auto-Exit recorded (deferred): "
-                                        "BO #%d %s entry=%.6f exit=%.6f "
-                                        "shares=%.4f",
-                                        bo_id, trigger, avg_entry,
-                                        exit_price, exit_filled,
-                                    )
-
-                        if not exit_done:
-                            log.warning(
-                                "Auto-Exit BO #%d: no bid liquidity or "
-                                "token_id unavailable — ME will monitor",
-                                bo_id,
-                            )
-                            db.commit()
-                            _publish_trace_sync(bo)
 
                 # ── Immediate settlement khi fill đến muộn ────────────────
                 # Nếu lệnh đã FILLED và settlement_at đã qua, không cần chờ
