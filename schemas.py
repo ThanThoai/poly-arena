@@ -13,8 +13,8 @@ class BOCreate(BaseModel):
     amount:      float
     reason:      Optional[str]   = None
     limit_price: Optional[float] = None   # None = MARKET order; set = LIMIT order
-    tp_price:    Optional[float] = None   # Take Profit — triggers shadow profit on WIN
-    sl_price:    Optional[float] = None   # Stop Loss   — triggers shadow profit on LOSS
+    tp_price:    Optional[float] = None   # Deprecated — silently ignored
+    sl_price:    Optional[float] = None   # Deprecated — silently ignored
     ttl:                Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
     slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
     session_offset:     Optional[int]   = Field(default=0, ge=0, le=1)  # 0 = current session, 1 = next session
@@ -56,15 +56,10 @@ class BOCreate(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_single_condition(self) -> "BOCreate":
-        """Single Condition Policy: an order can have at most one condition (TP or SL, not both)."""
-        # ── TP/SL temporarily disabled ──────────────────────────────────
-        # Silently ignore any TP/SL values sent by clients.
-        # To re-enable, remove these two lines and uncomment the check below.
+    def strip_deprecated_tp_sl(self) -> "BOCreate":
+        """TP/SL is deprecated — silently ignore any values sent by clients."""
         self.tp_price = None
         self.sl_price = None
-        # if self.tp_price is not None and self.sl_price is not None:
-        #     raise ValueError("Only one condition allowed: set tp_price OR sl_price, not both")
         return self
 
 
@@ -103,6 +98,7 @@ class BOResponse(BaseModel):
     traces:          Optional[list]  = None
     position_closed: Optional[bool]  = None
     session_offset:  Optional[int]   = None
+    entry_fee:       Optional[float] = None
 
     model_config = {"from_attributes": True}
 
@@ -154,6 +150,7 @@ class BOForecastStats(BaseModel):
 
 class BotPnlResponse(BaseModel):
     bot_name: str
+    status: str = "ACTIVE"
     initial_balance: float
     current_balance: float
     realized_pnl: float
@@ -164,6 +161,7 @@ class BotPnlResponse(BaseModel):
     total_trades: int
     win_rate: float
     avg_profit_per_trade: float
+    total_fees: float = 0.0
 
 
 class UserPnlResponse(BaseModel):
@@ -181,6 +179,7 @@ class UserPnlResponse(BaseModel):
     total_trades: int
     win_rate: float
     avg_profit_per_trade: float
+    total_fees: float = 0.0
     bots: List[BotPnlResponse]
 
 
@@ -201,6 +200,8 @@ class UserBalanceHistoryResponse(BaseModel):
     user_id:     int
     balance:     float
     trade_id:    Optional[int] = None
+    bot_id:      Optional[int] = None
+    pnl_amount:  Optional[float] = None
     recorded_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -216,11 +217,16 @@ class BotRename(BaseModel):
     api_key: Optional[str] = None
 
 
+class BotBalanceAdjust(BaseModel):
+    balance: float = Field(..., gt=0)
+
+
 class BotResponse(BaseModel):
     id:              int
     bot_name:        str
     api_key:         str
     is_active:       bool
+    status:          str = "ACTIVE"
     initial_balance: float
     balance:         float
     created_at:      Optional[datetime] = None
@@ -233,6 +239,7 @@ class BotPublic(BaseModel):
     id:              int
     bot_name:        str
     is_active:       bool
+    status:          str = "ACTIVE"
     initial_balance: float
     balance:         float
     user_id:         Optional[int] = None
@@ -270,6 +277,7 @@ class UserResponse(BaseModel):
     available_balance: float
     total_balance: float = 0.0       # sum of current bot balances
     total_pnl: float = 0.0           # total_balance - allocated_balance
+    is_admin: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -282,6 +290,81 @@ class UserSettingsResponse(BaseModel):
     settings: dict
 
     model_config = {"from_attributes": True}
+
+
+# ── Admin schemas ────────────────────────────────────────────────────────────
+
+class AdminBalanceAdjust(BaseModel):
+    balance: float
+
+
+class AdminCreateAdmin(BaseModel):
+    username: str = Field(..., min_length=1, max_length=100)
+    password: str = Field(..., min_length=6, max_length=128)
+    email: Optional[str] = None
+
+
+class BotPerformanceResponse(BaseModel):
+    bot_name: str
+    status: str
+    initial_balance: float
+    current_balance: float
+    realized_pnl: float
+    realized_pnl_pct: float
+    wins: int
+    losses: int
+    pending: int
+    win_rate: float
+    recent_trades: List[BOResponse] = []
+    balance_history: List[BalanceHistoryResponse] = []
+
+
+class PriceHistoryResponse(BaseModel):
+    id: int
+    symbol: str
+    timeframe: str
+    direction: str
+    best_ask: Optional[float] = None
+    best_bid: Optional[float] = None
+    bids: Optional[list] = None   # [[price, size], ...]
+    asks: Optional[list] = None   # [[price, size], ...]
+    recorded_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class AdminUserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    initial_balance: float
+    is_active: bool
+    is_admin: bool
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Trade Inspector schemas ──────────────────────────────────────────────────
+
+class TimelineEvent(BaseModel):
+    timestamp: str
+    category: str       # trace | price | fill_entry | fill_exit
+    action: str
+    details: str = ""
+    data: Optional[dict | list] = None
+
+class SessionInfo(BaseModel):
+    symbol: str
+    timeframe: str
+    direction: str
+    session_start: int
+    session_end: int
+
+class TradeInspectResponse(BaseModel):
+    trade: BOResponse
+    timeline: List[TimelineEvent]
+    session: SessionInfo
 
 
 # ── Achievement schemas ──────────────────────────────────────────────────────

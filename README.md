@@ -1,6 +1,6 @@
 # PolyArena
 
-Binary Options paper trading platform built on top of Polymarket with a shadow matching engine. Three independent services communicate via Redis to provide real-time order matching, bracket orders (TP/SL), and automated settlement.
+Binary Options paper trading platform built on top of Polymarket with a shadow matching engine. Three independent services communicate via Redis to provide real-time order matching and automated settlement.
 
 ## Architecture
 
@@ -34,7 +34,7 @@ Binary Options paper trading platform built on top of Polymarket with a shadow m
 
 | Service | Description |
 |---------|-------------|
-| **FastAPI API** (`main.py`) | Order CRUD, Redis stream consumers for bracket exits / fills / cancels |
+| **FastAPI API** (`main.py`) | Order CRUD, Redis stream consumers for fills / cancels |
 | **WS Feed Service** (`ws_feed_service/`) | Polymarket WebSocket client, runs the MatchingEngine, publishes prices to Redis |
 | **Scheduler Service** (`scheduler_service/`) | APScheduler — settlement via Binance candles, stuck order sweeping, heartbeat |
 
@@ -62,7 +62,6 @@ pytest tests/
 
 - **MARKET** — IOC fill against shadow orderbook, fallback to Polymarket REST
 - **LIMIT** — Placed in shadow orderbook with optional TTL (auto-cancel)
-- **Bracket (TP/SL)** — Take Profit / Stop Loss monitored in real-time by MatchingEngine; fires partial or full exit
 
 ## API
 
@@ -103,7 +102,7 @@ curl -X POST http://localhost:8099/poly-arena/binary-options/ \
   -H "X-API-Key: <api_key>" \
   -d '{"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN", "amount": 100}'
 
-# Place a LIMIT order with TP/SL
+# Place a LIMIT order with TTL
 curl -X POST http://localhost:8099/poly-arena/binary-options/ \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <api_key>" \
@@ -113,8 +112,6 @@ curl -X POST http://localhost:8099/poly-arena/binary-options/ \
     "forecast": "GREEN",
     "amount": 50,
     "limit_price": 0.45,
-    "tp_price": 0.70,
-    "sl_price": 0.30,
     "ttl": 120
   }'
 ```
@@ -131,7 +128,7 @@ curl -X POST http://localhost:8099/poly-arena/binary-options/ \
 │   ├── bots.py                # Bot CRUD
 │   └── dashboard.py           # Health & scheduler status
 ├── services/
-│   ├── matching_engine.py     # Shadow orderbook, bracket TP/SL monitoring
+│   ├── matching_engine.py     # Shadow orderbook, order matching
 │   ├── ws_feed.py             # Polymarket WebSocket client
 │   ├── token_registry.py      # Auto-refresh token IDs at candle boundaries
 │   ├── settlement.py          # Settle trades using Binance candle data
@@ -172,7 +169,7 @@ python migrate.py
 |--------------|---------|
 | `price:{SYM}:{TF}:{DIR}` | Price hash (best_ask, best_bid, token_id) — 120s TTL |
 | `queue:orders:new` | LIMIT/bracket order queue consumed by WS Feed |
-| `stream:bracket:exits` | Bracket exit events → API consumer |
+| `stream:bracket:exits` | Exit events → API consumer |
 | `stream:order:fills` | Fill updates → API consumer |
 | `stream:order:cancels` | Cancel events → API consumer |
 | `scheduler:heartbeat` | Liveness probe — 60s TTL |

@@ -4,6 +4,7 @@ RedisWriter — writes price data and bracket exit events to Redis.
 Used by the WS Feed Service to publish data that FastAPI consumes.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -15,6 +16,7 @@ import redis.asyncio as aioredis
 from ws_feed_service.config import (
     PRICE_KEY_PREFIX,
     PRICE_CACHE_TTL_S,
+    PRICE_HISTORY_INTERVAL_S,
     ORDERBOOK_KEY_PREFIX,
     STREAM_BRACKET_EXITS,
     STREAM_ORDER_CANCELS,
@@ -30,6 +32,59 @@ TOKEN_MAPPING_TTL_S = 600            # 10 min TTL (refreshed on every rotation)
 
 logger = logging.getLogger(__name__)
 
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.1  # seconds, doubles each retry
+
+
+async def _retry_pipe(pipe, label: str) -> bool:
+    """Execute a Redis pipeline with retries. Returns True on success."""
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            await pipe.execute()
+            return True
+        except Exception as exc:
+            if attempt == _RETRY_ATTEMPTS:
+                logger.error("%s failed after %d attempts: %s", label, _RETRY_ATTEMPTS, exc)
+                return False
+            delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning("%s attempt %d/%d failed: %s — retrying in %.1fs",
+                           label, attempt, _RETRY_ATTEMPTS, exc, delay)
+            await asyncio.sleep(delay)
+    return False
+
+
+def _record_price_history_sync(
+    symbol: str,
+    timeframe: str,
+    direction: str,
+    best_ask: Optional[float],
+    best_bid: Optional[float],
+    bids: Optional[list] = None,
+    asks: Optional[list] = None,
+) -> None:
+    """Insert one PriceHistory row. Runs in a thread via run_in_executor."""
+    try:
+        from database import SessionLocal
+        from models import PriceHistory
+
+        db = SessionLocal()
+        try:
+            row = PriceHistory(
+                symbol=symbol,
+                timeframe=timeframe,
+                direction=direction,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                bids=bids,
+                asks=asks,
+            )
+            db.add(row)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.error("_record_price_history_sync failed: %s", exc)
+
 
 class RedisWriter:
     """Writes price cache entries and bracket exit stream events to Redis."""
@@ -44,6 +99,10 @@ class RedisWriter:
         self._current_sessions: dict[str, int] = {}
         # Dedup cache: key → (bids_json, asks_json) to skip redundant writes
         self._last_ob_json: dict[str, tuple[str, str]] = {}
+        # Throttle: combo key → last monotonic timestamp for DB recording
+        self._last_price_record_ts: dict[str, float] = {}
+        # Cache latest orderbook per combo for DB recording: combo_key → (bids_list, asks_list)
+        self._last_ob_by_combo: dict[str, tuple[list, list]] = {}
 
     def register_token_mapping(
         self, mapping: dict[tuple[str, str, str], str]
@@ -222,31 +281,77 @@ class RedisWriter:
         the hash so no stale bid from a previous session leaks through.
         """
         combos = self._token_map.get(token_id)
-        if not combos or best_ask is None:
+        session_combos = self._session_token_map.get(token_id)
+        if (not combos and not session_combos) or best_ask is None:
             return
 
         now_ts = str(time.time())
-        pipe = self._r.pipeline(transaction=False)
 
-        for sym, tf, direction in combos:
-            key = f"{PRICE_KEY_PREFIX}:{sym}:{tf}:{direction}"
-            mapping: dict[str, str] = {
-                "best_ask": str(best_ask),
-                "token_id": token_id,
-                "updated_at": now_ts,
-            }
-            if best_bid is not None:
-                mapping["best_bid"] = str(best_bid)
-            else:
-                # Remove stale bid from previous session / tick
-                pipe.hdel(key, "best_bid")
-            pipe.hset(key, mapping=mapping)
-            pipe.expire(key, PRICE_CACHE_TTL_S)
+        # ── Redis price cache (current session only) ─────────────────────
+        if combos:
+            pipe = self._r.pipeline(transaction=False)
 
-        try:
-            await pipe.execute()
-        except Exception as exc:
-            logger.error("RedisWriter.update_price failed: %s", exc)
+            for sym, tf, direction in combos:
+                key = f"{PRICE_KEY_PREFIX}:{sym}:{tf}:{direction}"
+                mapping: dict[str, str] = {
+                    "best_ask": str(best_ask),
+                    "token_id": token_id,
+                    "updated_at": now_ts,
+                }
+                if best_bid is not None:
+                    mapping["best_bid"] = str(best_bid)
+                else:
+                    # Remove stale bid from previous session / tick
+                    pipe.hdel(key, "best_bid")
+                pipe.hset(key, mapping=mapping)
+                pipe.expire(key, PRICE_CACHE_TTL_S)
+
+            if not await _retry_pipe(pipe, "RedisWriter.update_price"):
+                return
+
+        # ── Throttled price history recording (all sessions) ─────────────
+        # Record for both current and future session combos so that A+1
+        # orders have price snapshots in their target session window.
+        now_mono = time.monotonic()
+        loop = asyncio.get_running_loop()
+
+        # Current session combos
+        if combos:
+            for sym, tf, direction in combos:
+                combo_key = f"{sym}:{tf}:{direction}"
+                last_ts = self._last_price_record_ts.get(combo_key, 0.0)
+                if now_mono - last_ts >= PRICE_HISTORY_INTERVAL_S:
+                    self._last_price_record_ts[combo_key] = now_mono
+                    ob = self._last_ob_by_combo.get(combo_key)
+                    ob_bids = ob[0] if ob else None
+                    ob_asks = ob[1] if ob else None
+                    loop.run_in_executor(
+                        None,
+                        _record_price_history_sync,
+                        sym, tf, direction, best_ask, best_bid,
+                        ob_bids, ob_asks,
+                    )
+
+        # Future session combos — use candle_ts in throttle key to
+        # separate from current session recording
+        if session_combos:
+            for sym, tf, direction, candle_ts in session_combos:
+                current_ts = self._current_sessions.get(tf, 0)
+                if candle_ts <= current_ts:
+                    continue  # current or past — already handled above
+                combo_key = f"{sym}:{tf}:{direction}:{candle_ts}"
+                last_ts = self._last_price_record_ts.get(combo_key, 0.0)
+                if now_mono - last_ts >= PRICE_HISTORY_INTERVAL_S:
+                    self._last_price_record_ts[combo_key] = now_mono
+                    ob = self._last_ob_by_combo.get(combo_key)
+                    ob_bids = ob[0] if ob else None
+                    ob_asks = ob[1] if ob else None
+                    loop.run_in_executor(
+                        None,
+                        _record_price_history_sync,
+                        sym, tf, direction, best_ask, best_bid,
+                        ob_bids, ob_asks,
+                    )
 
     async def clear_price_keys(self, combos: list[tuple[str, str, str]]) -> None:
         """
@@ -255,6 +360,10 @@ class RedisWriter:
         Called when session rotates (new token_id detected by TokenRegistry)
         so the UI shows "no data" immediately instead of stale prices until
         the 60-second TTL expires naturally.
+
+        Also clears in-memory orderbook and price-history caches so the first
+        snapshot of the new session does not contain stale bids/asks from the
+        previous candle.
         """
         if not combos:
             return
@@ -263,16 +372,32 @@ class RedisWriter:
         for sym, tf, direction in combos:
             key = f"{PRICE_KEY_PREFIX}:{sym}:{tf}:{direction}"
             pipe.delete(key)
+            # Also delete legacy orderbook key so readers don't see old depth
+            ob_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
+            pipe.delete(ob_key)
 
         try:
             await pipe.execute()
-            logger.info(
-                "Cleared %d rotated price key(s): %s",
-                len(combos),
-                [f"{s}:{t}:{d}" for s, t, d in combos],
-            )
         except Exception as exc:
             logger.error("RedisWriter.clear_price_keys failed: %s", exc)
+            return
+
+        # Clear in-memory caches for rotated combos so new-session snapshots
+        # are not polluted with old-session orderbook data.
+        cleared_ob = 0
+        for sym, tf, direction in combos:
+            combo_key = f"{sym}:{tf}:{direction}"
+            if self._last_ob_by_combo.pop(combo_key, None) is not None:
+                cleared_ob += 1
+            # Reset price-history throttle so the first tick of the new
+            # session records a fresh snapshot immediately.
+            self._last_price_record_ts.pop(combo_key, None)
+
+        logger.info(
+            "Cleared %d rotated price key(s) + %d cached orderbook(s): %s",
+            len(combos), cleared_ob,
+            [f"{s}:{t}:{d}" for s, t, d in combos],
+        )
 
     async def update_orderbook(
         self,
@@ -332,41 +457,60 @@ class RedisWriter:
                 pipe.hset(key, mapping=ob_mapping)
                 pipe.expire(key, PRICE_CACHE_TTL_S)
 
-        try:
-            await pipe.execute()
+        if not await _retry_pipe(pipe, "RedisWriter.update_orderbook"):
+            return
 
-            # Publish change notifications for WebSocket subscribers
-            # Legacy combos: publish without session (backward compat)
-            if legacy_combos:
-                for sym, tf, direction in legacy_combos:
-                    payload = json.dumps({
-                        "symbol": sym,
-                        "timeframe": tf,
-                        "direction": direction,
-                        "bids": bids_json,
-                        "asks": asks_json,
-                        "updated_at": now_ts,
-                    })
-                    await self._r.publish("orderbook:updates", payload)
+        # Cache parsed orderbook per combo for DB price history recording
+        bids_parsed = json.loads(bids_json)
+        asks_parsed = json.loads(asks_json)
+        if legacy_combos:
+            for sym, tf, direction in legacy_combos:
+                self._last_ob_by_combo[f"{sym}:{tf}:{direction}"] = (bids_parsed, asks_parsed)
+        # Also cache for future session combos so price history recording
+        # includes orderbook depth for A+1 sessions
+        if session_combos:
+            for sym, tf, direction, candle_ts in session_combos:
+                current_ts = self._current_sessions.get(tf, 0)
+                if candle_ts <= current_ts:
+                    continue  # current — already cached above
+                self._last_ob_by_combo[f"{sym}:{tf}:{direction}:{candle_ts}"] = (bids_parsed, asks_parsed)
 
-            # Session combos: publish with session field for future sessions
-            if session_combos:
-                for sym, tf, direction, candle_ts in session_combos:
-                    current_ts = self._current_sessions.get(tf, 0)
-                    if candle_ts == current_ts:
-                        continue  # already published via legacy path
-                    payload = json.dumps({
-                        "symbol": sym,
-                        "timeframe": tf,
-                        "direction": direction,
-                        "session": candle_ts,
-                        "bids": bids_json,
-                        "asks": asks_json,
-                        "updated_at": now_ts,
-                    })
+        # Publish change notifications for WebSocket subscribers
+        # Legacy combos: publish without session (backward compat)
+        if legacy_combos:
+            for sym, tf, direction in legacy_combos:
+                payload = json.dumps({
+                    "symbol": sym,
+                    "timeframe": tf,
+                    "direction": direction,
+                    "bids": bids_json,
+                    "asks": asks_json,
+                    "updated_at": now_ts,
+                })
+                try:
                     await self._r.publish("orderbook:updates", payload)
-        except Exception as exc:
-            logger.error("RedisWriter.update_orderbook failed: %s", exc)
+                except Exception as exc:
+                    logger.warning("RedisWriter.publish orderbook:updates failed: %s", exc)
+
+        # Session combos: publish with session field for future sessions
+        if session_combos:
+            for sym, tf, direction, candle_ts in session_combos:
+                current_ts = self._current_sessions.get(tf, 0)
+                if candle_ts == current_ts:
+                    continue  # already published via legacy path
+                payload = json.dumps({
+                    "symbol": sym,
+                    "timeframe": tf,
+                    "direction": direction,
+                    "session": candle_ts,
+                    "bids": bids_json,
+                    "asks": asks_json,
+                    "updated_at": now_ts,
+                })
+                try:
+                    await self._r.publish("orderbook:updates", payload)
+                except Exception as exc:
+                    logger.warning("RedisWriter.publish orderbook:updates (session) failed: %s", exc)
 
     async def publish_bracket_exit(
         self,
