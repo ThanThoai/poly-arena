@@ -294,16 +294,28 @@ def get_user_balance_snapshots(
     else:
         target_users = db.query(User).filter(User.is_active == True).all()
 
-    # Build seed records: initial balance at account creation
+    # Build seed records: current total equity (bot balances + available pool)
+    user_ids = [u.id for u in target_users]
+    all_active_bots = db.query(Bot).filter(
+        Bot.user_id.in_(user_ids), Bot.is_active == True,
+    ).all() if user_ids else []
+    bots_by_user: dict[int, list] = {}
+    for b in all_active_bots:
+        bots_by_user.setdefault(b.user_id, []).append(b)
+
     seeds = []
     for u in target_users:
-        init_bal = u.initial_balance or 0
+        user_bots = bots_by_user.get(u.id, [])
+        bot_balance = round(sum(b.balance or 0 for b in user_bots), 8)
+        allocated = sum(b.initial_balance or 0 for b in user_bots)
+        available = round((u.initial_balance or 0) - allocated, 8)
+        balance = round(bot_balance + available, 8)
         seeds.append(UserBalanceSnapshot(
             id=0,
             user_id=u.id,
-            balance=init_bal,
-            bot_balance=0,
-            available=init_bal,
+            balance=balance,
+            bot_balance=bot_balance,
+            available=available,
             session_id=None,
             recorded_at=u.created_at,
         ))
