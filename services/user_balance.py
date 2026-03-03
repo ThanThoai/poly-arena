@@ -1,16 +1,19 @@
 """
-Helper to record user-level balance history based on Realized P&L.
+Helper to record user-level balance history based on Realized P&L,
+and periodic balance snapshots.
 
 User realized balance = user.initial_balance + sum(profit) for all settled trades
 across all of the user's bots.
 """
 
 import logging
+from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from models import BinaryOption, Bot, BOResult, User, UserBalanceHistory
+from models import BinaryOption, Bot, BOResult, User, UserBalanceHistory, UserBalanceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -74,3 +77,35 @@ def record_user_balance(
         user.id, user.username, realized_balance,
         user.initial_balance or 0, total_profit, trade_id,
     )
+
+
+def snapshot_all_user_balances(db: Session, session_label: Optional[str] = None) -> int:
+    """Snapshot balance for all active users. Returns number of snapshots created."""
+    users = db.query(User).filter(User.is_active == True).all()
+    count = 0
+
+    for user in users:
+        active_bots = db.query(Bot).filter(
+            Bot.user_id == user.id,
+            Bot.is_active == True,
+        ).all()
+
+        bot_balance = round(sum(b.balance or 0 for b in active_bots), 8)
+        allocated = sum(b.initial_balance or 0 for b in active_bots)
+        available = round((user.initial_balance or 0) - allocated, 8)
+        balance = round(bot_balance + available, 8)
+
+        db.add(UserBalanceSnapshot(
+            user_id=user.id,
+            balance=balance,
+            bot_balance=bot_balance,
+            available=available,
+            session_id=session_label,
+            recorded_at=datetime.now(timezone.utc),
+        ))
+        count += 1
+
+    if count:
+        db.commit()
+
+    return count

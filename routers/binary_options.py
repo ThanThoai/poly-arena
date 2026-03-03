@@ -11,8 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import BinaryOption, BalanceHistory, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast, PriceHistory
-from services.settlement import calc_settlement_time
+from models import BinaryOption, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast, PriceHistory
 from services.polymarket import PolymarketClient
 from config.timing import (
     HTTP_TIMEOUT_FAST,
@@ -40,7 +39,7 @@ _FORECAST_TO_STATUS = {"GREEN": "UP", "RED": "DOWN"}
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
-_TF_PERIOD_S = {"M5": 300, "M15": 900, "H1": 3600}
+_TF_PERIOD_S = {"M5": 300, "M15": 900}
 
 
 # ── Session resolution ────────────────────────────────────────────────────────
@@ -75,7 +74,7 @@ def resolve_session(
     Parameters
     ----------
     timeframe : str
-        "M5", "M15", or "H1".
+        "M5" or "M15".
     timestamp : int | None
         Optional Unix timestamp (seconds).  When set, ``session_offset``
         is ignored.
@@ -145,14 +144,6 @@ def resolve_session(
     )
 
 
-def _resolve_future_token(
-    pm: PolymarketClient, symbol: str, tf: str, direction: str, candle_open: int,
-) -> Optional[str]:
-    """Resolve token_id for a specific candle_open timestamp via REST."""
-    pm_status = _FORECAST_TO_STATUS[direction]
-    return pm.get_token_id_at(symbol, tf, pm_status, candle_open)
-
-
 def _compute_stats(items: list):
     wins    = sum(1 for b in items if b.result == BOResult.WIN)
     losses  = sum(1 for b in items if b.result == BOResult.LOSS)
@@ -171,57 +162,25 @@ def _compute_stats(items: list):
 
 # ─── Tạo lệnh ─────────────────────────────────────────────────────────────────
 
-def _try_redis_price(
-    symbol: str, timeframe: str, pm_status: str,
-) -> Tuple[Optional[float], Optional[str]]:
-    """
-    Try to get best ask from Redis price cache (written by WS Feed Service).
-    Returns (price, token_id) or (None, None) if unavailable/stale.
-    """
-    try:
-        from services.redis_client import get_sync_redis
-        sr = get_sync_redis()
-
-        key = f"{PRICE_KEY_PREFIX}:{symbol}:{timeframe}:{pm_status}"
-        data = sr.hgetall(key)
-        if not data:
-            return None, None
-
-        # Check staleness
-        updated_at = data.get("updated_at")
-        if updated_at:
-            age = time.time() - float(updated_at)
-            if age > STALE_THRESHOLD_S:
-                logger.debug(
-                    "Redis price stale: %s age=%.1fs > %ds",
-                    key, age, STALE_THRESHOLD_S,
-                )
-                return None, None
-
-        best_ask = float(data["best_ask"])
-        token_id = data["token_id"]
-        logger.info(
-            "Redis hit: %s %s %s → best_ask=%.4f (token=%s)",
-            symbol, timeframe, pm_status, best_ask, token_id[:16],
-        )
-        return best_ask, token_id
-    except Exception as exc:
-        logger.warning("Redis price lookup failed: %s", exc)
-        return None, None
-
-
-
-
 _DEFAULT_SLIPPAGE_TOLERANCE = 0.10
 
 
-def _snapshot_best_ask(symbol: str, timeframe: str, direction: str) -> Optional[float]:
-    """Read the best ask from Redis orderbook snapshot. Returns None if unavailable."""
+def _snapshot_best_ask(
+    symbol: str, timeframe: str, direction: str,
+    candle_open: int = 0,
+) -> Optional[float]:
+    """Read the best ask from the session-keyed Redis orderbook snapshot.
+
+    Key format: ``orderbook:{SYM}:{TF}:{DIR}:{candle_open}``
+    Returns None if unavailable.
+    """
     try:
         from services.redis_client import get_sync_redis
         sr = get_sync_redis()
-        key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}"
+
+        key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
         data = sr.hgetall(key)
+
         if not data or "asks" not in data:
             return None
         asks = json.loads(data["asks"])
@@ -235,13 +194,20 @@ def _snapshot_best_ask(symbol: str, timeframe: str, direction: str) -> Optional[
 def _fill_market_from_snapshot(
     symbol: str, timeframe: str, direction: str, amount: float,
     slippage_tolerance: Optional[float] = None,
+    limit_price: Optional[float] = None,
+    candle_open: int = 0,
 ) -> Tuple[float, float, list]:
     """
-    Simulate a MARKET BUY by walking the asks from the Redis orderbook snapshot.
+    Simulate a BUY by walking the asks from the session-keyed Redis orderbook.
 
-    Reads ``orderbook:{SYM}:{TF}:{DIR}`` (hash with ``asks`` JSON array of
-    ``[price, size]`` pairs) and walks levels until ``amount`` is spent or
-    slippage is exceeded.
+    Key format: ``orderbook:{SYM}:{TF}:{DIR}:{candle_open}``
+
+    Walks levels until ``amount`` is spent or the price cap is exceeded.
+
+    Price cap logic:
+    - MARKET orders (limit_price=None): cap = best_ask × (1 + slippage)
+    - Aggressive LIMIT orders (limit_price set): cap = limit_price
+      (fills all asks from best_ask up to the limit price)
 
     Returns
     -------
@@ -258,8 +224,10 @@ def _fill_market_from_snapshot(
     from services.redis_client import get_sync_redis
 
     sr = get_sync_redis()
-    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}"
+
+    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
     data = sr.hgetall(key)
+
     if not data or "asks" not in data:
         raise HTTPException(
             status_code=503,
@@ -280,9 +248,13 @@ def _fill_market_from_snapshot(
             detail="Orderbook snapshot has no asks",
         )
 
-    slippage = slippage_tolerance if slippage_tolerance is not None else _DEFAULT_SLIPPAGE_TOLERANCE
-    best_ask = Decimal(str(asks[0][0]))
-    max_price = best_ask * (Decimal("1") + Decimal(str(slippage)))
+    # Price cap: LIMIT orders use limit_price; MARKET orders use slippage from best_ask
+    if limit_price is not None:
+        max_price = Decimal(str(limit_price))
+    else:
+        slippage = slippage_tolerance if slippage_tolerance is not None else _DEFAULT_SLIPPAGE_TOLERANCE
+        best_ask = Decimal(str(asks[0][0]))
+        max_price = best_ask * (Decimal("1") + Decimal(str(slippage)))
 
     budget = Decimal(str(amount))
     total_cost = Decimal("0")
@@ -326,26 +298,51 @@ def _fill_market_from_snapshot(
     return round(avg_price, 8), round(num_shares, 8), walk_levels
 
 
+def _queue_order_to_session(
+    bo_id: int,
+    session_id: str,
+    order_data: dict,
+) -> None:
+    """
+    Push an order payload to the per-session Redis queue.
+
+    Centralizes the queue push logic used by all order paths (passive LIMIT,
+    future MARKET, prefilled bracket).
+
+    Args:
+        bo_id: BinaryOption ID for logging.
+        session_id: e.g. "BTC:M5:1709313000" — determines the queue key.
+        order_data: Full order payload dict (will be JSON-serialized).
+    """
+    from services.redis_client import get_sync_redis
+    sr = get_sync_redis()
+    session_queue_key = f"queue:orders:{session_id}"
+    order_data["session_id"] = session_id
+    sr.lpush(session_queue_key, json.dumps(order_data))
+    logger.info(
+        "Order queued: bo_id=%d → queue=%s",
+        bo_id, session_queue_key,
+    )
+
+
 def _queue_prefilled_to_me(
     bo: "BinaryOption",
     avg_price: float, num_shares: float,
     payload: "BOCreate",
-    token_id: Optional[str] = None,
+    direction: str = "UP",
     session_offset: int = 0,
     settlement_at: Optional[datetime] = None,
     candle_open: Optional[int] = None,
 ) -> None:
     """Queue a pre-filled MARKET bracket order to the matching engine via Redis."""
     try:
-        from services.redis_client import get_sync_redis
-        sr = get_sync_redis()
         if candle_open is None:
             _period = _TF_PERIOD_S.get(payload.timeframe.value, 300)
             candle_open = int(settlement_at.timestamp()) - _period if settlement_at else 0
         session_id = f"{payload.symbol.value}:{payload.timeframe.value}:{candle_open}"
-        order_payload = json.dumps({
+        _queue_order_to_session(bo.id, session_id, {
             "bo_id": bo.id,
-            "token_id": token_id,
+            "direction": direction,
             "symbol": payload.symbol.value,
             "forecast": payload.forecast.value,
             "side": "BUY",
@@ -357,10 +354,7 @@ def _queue_prefilled_to_me(
             "timeframe": payload.timeframe.value,
             "session_offset": session_offset,
             "settlement_at": settlement_at.isoformat() if settlement_at else None,
-            "session_id": session_id,
         })
-        session_queue_key = f"queue:orders:{session_id}"
-        sr.lpush(session_queue_key, order_payload)
 
         condition_type = "TP" if payload.tp_price else "SL"
         condition_price = payload.tp_price or payload.sl_price
@@ -371,13 +365,6 @@ def _queue_prefilled_to_me(
             {"condition_type": condition_type, "condition_price": condition_price,
              "avg_entry_price": avg_price, "num_shares": num_shares},
         ))
-
-        logger.info(
-            "Prefilled bracket order queued for BO #%d: "
-            "avg_price=%.6f shares=%.4f tp=%s sl=%s",
-            bo.id, avg_price, num_shares,
-            payload.tp_price, payload.sl_price,
-        )
     except Exception as exc:
         logger.error(
             "Failed to queue prefilled bracket order for BO #%d: %s",
@@ -421,81 +408,22 @@ def create_bo(
             detail=f"Insufficient balance: {bot.balance:.2f} < {payload.amount:.2f}",
         )
 
-    # ── Pre-validation: condition price vs Best Ask (v2 spec Section 2) ────
-    # Prevents "logical suicide" orders where the condition is already met
     pending_traces: list[dict] = []
-    if payload.tp_price is not None or payload.sl_price is not None:
-        pm_status_val = _FORECAST_TO_STATUS[payload.forecast.value]
-        best_ask_val, _ = _try_redis_price(
-            payload.symbol.value, payload.timeframe.value, pm_status_val,
-        )
-        if best_ask_val is None:
-            # Redis price unavailable — skip TP/SL pre-validation
-            pass
-
-        if best_ask_val is not None:
-            if payload.sl_price is not None and payload.sl_price >= best_ask_val:
-                pending_traces.append(make_trace(
-                    "VALIDATION", "PRE_VALIDATION_FAILED",
-                    f"Validation Failed: SL ${payload.sl_price:.4f} must be lower than "
-                    f"estimated entry ${best_ask_val:.4f}. Order Rejected.",
-                    {"sl_price": payload.sl_price, "best_ask": best_ask_val},
-                ))
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"SL price ({payload.sl_price:.4f}) must be lower than "
-                        f"current Best Ask ({best_ask_val:.4f})"
-                    ),
-                )
-            if payload.tp_price is not None and payload.tp_price <= best_ask_val:
-                pending_traces.append(make_trace(
-                    "VALIDATION", "PRE_VALIDATION_FAILED",
-                    f"Validation Failed: TP ${payload.tp_price:.4f} must be higher than "
-                    f"estimated entry ${best_ask_val:.4f}. Order Rejected.",
-                    {"tp_price": payload.tp_price, "best_ask": best_ask_val},
-                ))
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"TP price ({payload.tp_price:.4f}) must be higher than "
-                        f"current Best Ask ({best_ask_val:.4f})"
-                    ),
-                )
-            # Validation passed
-            condition_type = "TP" if payload.tp_price is not None else "SL"
-            condition_price = payload.tp_price if payload.tp_price is not None else payload.sl_price
-            pending_traces.append(make_trace(
-                "VALIDATION", "PRE_VALIDATION_OK",
-                f"Pre-validation successful. Condition {condition_type} at "
-                f"${condition_price:.4f} is valid against current Best Ask ${best_ask_val:.4f}.",
-                {"condition_type": condition_type, "condition_price": condition_price,
-                 "best_ask": best_ask_val},
-            ))
 
     # Deduct amount from balance upfront — refunded on cancel, settled on WIN/LOSS
     is_limit   = payload.limit_price is not None
 
-    # Check if this LIMIT order will cross the spread (aggressive limit).
-    # If limit_price >= best_ask from the snapshot, it will fill immediately
-    # as a taker → needs taker fee estimate upfront just like MARKET.
+    # Aggressive limit detection is deferred until after session resolution
+    # so we can pass the correct candle_open to _snapshot_best_ask().
+    # For now, assume taker fee for non-limit orders; limit orders recalculate below.
     is_aggressive_limit = False
-    if is_limit:
-        snapshot_best_ask = _snapshot_best_ask(
-            payload.symbol.value, payload.timeframe.value,
-            _FORECAST_TO_STATUS[payload.forecast.value],
-        )
-        if snapshot_best_ask is not None and payload.limit_price >= snapshot_best_ask:
-            is_aggressive_limit = True
 
-    max_fee = estimate_max_taker_fee(payload.amount) if (not is_limit or is_aggressive_limit) else 0
+    max_fee = estimate_max_taker_fee(payload.amount) if not is_limit else 0
     if bot.balance < payload.amount + max_fee:
         raise HTTPException(status_code=400, detail="Insufficient balance (including estimated fee)")
     bot.balance = round(bot.balance - payload.amount, 8)
 
-    pm_status  = _FORECAST_TO_STATUS[payload.forecast.value]
-    token_id:  Optional[str]   = None
-    entry_price: float
+    direction  = _FORECAST_TO_STATUS[payload.forecast.value]  # "UP" or "DOWN"
 
     has_bracket = payload.tp_price is not None or payload.sl_price is not None
 
@@ -512,37 +440,41 @@ def create_bo(
 
     settlement_at = session.settlement_at
     session_offset = session.session_offset
+    candle_open = session.candle_open
+    session_id = f"{payload.symbol.value}:{payload.timeframe.value}:{candle_open}"
 
-    # ── Token resolution for non-current session ─────────────────────────
-    future_token_id: Optional[str] = None
-    if not session.is_current:
-        try:
-            with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm_future:
-                future_token_id = _resolve_future_token(
-                    pm_future, payload.symbol.value, payload.timeframe.value,
-                    payload.forecast.value, session.candle_open,
-                )
-        except Exception as exc:
-            logger.warning("Future token resolution failed: %s", exc)
+    # Session routing trace
+    pending_traces.append(make_trace(
+        "ROUTING", "SESSION_ROUTED",
+        f"Order routed to session {session_id} "
+        f"(offset={session_offset}, candle_open={candle_open}, "
+        f"settlement={settlement_at.isoformat()}).",
+        {"session_id": session_id, "candle_open": candle_open,
+         "session_offset": session_offset,
+         "queue_key": f"queue:orders:{session_id}",
+         "is_current": session.is_current, "bumped": session.bumped},
+    ))
 
-        if not future_token_id:
-            bot.balance = round(bot.balance + payload.amount, 8)
-            raise HTTPException(
-                status_code=503,
-                detail="Market for the target session is not available yet on Polymarket",
-            )
+    # ── Session availability check ───────────────────────────────────────
+    # Validate that orderbook data exists for the target session.
+    # Token resolution is deferred to OrderConsumer (which reads from
+    # session.tokens[direction]).  The API only needs the session_id +
+    # direction to route the order to the correct queue.
+    snapshot_best_ask = _snapshot_best_ask(
+        payload.symbol.value, payload.timeframe.value,
+        direction, candle_open=candle_open,
+    )
 
-    # ── Token ID resolution ─────────────────────────────────────────────
-    # Redis cache first, future sessions via REST get_token_id_at()
-    if future_token_id:
-        token_id = future_token_id
-    else:
-        _, redis_token = _try_redis_price(
-            payload.symbol.value, payload.timeframe.value, pm_status,
+    if not session.is_current and snapshot_best_ask is None:
+        # Future session with no orderbook data yet — ME hasn't created it
+        bot.balance = round(bot.balance + payload.amount, 8)
+        raise HTTPException(
+            status_code=503,
+            detail="Market for the target session is not available yet",
         )
-        token_id = redis_token
 
-    if token_id is None:
+    # For current sessions, also check that ME is running (snapshot exists)
+    if session.is_current and snapshot_best_ask is None:
         bot.balance = round(bot.balance + payload.amount, 8)
         raise HTTPException(
             status_code=503,
@@ -551,16 +483,82 @@ def create_bo(
 
     ask_fetched_at = datetime.now(timezone.utc)
     latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
-    order_type = "LIMIT" if is_limit else "MARKET"
+
+    # ── Pre-validation: condition price vs Best Ask (v2 spec Section 2) ────
+    # Prevents "logical suicide" orders where the condition is already met.
+    # Runs after session resolution so we have the correct candle_open.
+    if snapshot_best_ask is not None and (payload.tp_price is not None or payload.sl_price is not None):
+        if payload.sl_price is not None and payload.sl_price >= snapshot_best_ask:
+            bot.balance = round(bot.balance + payload.amount, 8)
+            pending_traces.append(make_trace(
+                "VALIDATION", "PRE_VALIDATION_FAILED",
+                f"Validation Failed: SL ${payload.sl_price:.4f} must be lower than "
+                f"estimated entry ${snapshot_best_ask:.4f}. Order Rejected.",
+                {"sl_price": payload.sl_price, "best_ask": snapshot_best_ask},
+            ))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"SL price ({payload.sl_price:.4f}) must be lower than "
+                    f"current Best Ask ({snapshot_best_ask:.4f})"
+                ),
+            )
+        if payload.tp_price is not None and payload.tp_price <= snapshot_best_ask:
+            bot.balance = round(bot.balance + payload.amount, 8)
+            pending_traces.append(make_trace(
+                "VALIDATION", "PRE_VALIDATION_FAILED",
+                f"Validation Failed: TP ${payload.tp_price:.4f} must be higher than "
+                f"estimated entry ${snapshot_best_ask:.4f}. Order Rejected.",
+                {"tp_price": payload.tp_price, "best_ask": snapshot_best_ask},
+            ))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"TP price ({payload.tp_price:.4f}) must be higher than "
+                    f"current Best Ask ({snapshot_best_ask:.4f})"
+                ),
+            )
+        # Validation passed
+        condition_type = "TP" if payload.tp_price is not None else "SL"
+        condition_price = payload.tp_price if payload.tp_price is not None else payload.sl_price
+        pending_traces.append(make_trace(
+            "VALIDATION", "PRE_VALIDATION_OK",
+            f"Pre-validation successful. Condition {condition_type} at "
+            f"${condition_price:.4f} is valid against current Best Ask ${snapshot_best_ask:.4f}.",
+            {"condition_type": condition_type, "condition_price": condition_price,
+             "best_ask": snapshot_best_ask},
+        ))
+
+    # ── Aggressive limit detection (after session resolution) ─────────
+    # Now we have session.candle_open so we read the correct orderbook.
+    if is_limit:
+        if snapshot_best_ask is not None and payload.limit_price >= snapshot_best_ask:
+            is_aggressive_limit = True
+            # Check balance covers estimated taker fee (actual fee deducted after fill)
+            extra_fee = estimate_max_taker_fee(payload.amount)
+            if bot.balance < extra_fee:
+                bot.balance = round(bot.balance + payload.amount, 8)
+                raise HTTPException(
+                    status_code=400,
+                    detail="Insufficient balance (including estimated taker fee for aggressive limit)",
+                )
+
+    # ── Future sessions ──────────────────────────────────────────────
+    # Orderbook snapshots are session-keyed (orderbook:{SYM}:{TF}:{DIR}:{candle_open})
+    # so both aggressive limit detection and MARKET fills use the correct
+    # session's prices.  No special-casing needed.
 
     if is_limit and is_aggressive_limit:
         # ── AGGRESSIVE LIMIT: limit_price >= best_ask → fill immediately
         # as taker (same as MARKET), then queue to ME only if has bracket.
+        # Uses limit_price as max fill price (walks asks from min up to limit).
         try:
             avg_price, num_shares, walk_levels = _fill_market_from_snapshot(
-                payload.symbol.value, payload.timeframe.value, pm_status,
+                payload.symbol.value, payload.timeframe.value, direction,
                 payload.amount,
                 slippage_tolerance=payload.slippage_tolerance,
+                limit_price=payload.limit_price,
+                candle_open=candle_open,
             )
         except HTTPException:
             bot.balance = round(bot.balance + payload.amount, 8)
@@ -617,6 +615,8 @@ def create_bo(
             sl_price          = payload.sl_price,
             ttl               = payload.ttl,
             session_offset    = session_offset,
+            session_id        = session_id,
+            candle_open       = candle_open,
             entry_fee         = entry_fee,
             me_order_status   = me_order_status,
             walk_prices       = {"entry": walk_levels},
@@ -630,10 +630,10 @@ def create_bo(
         if has_bracket:
             _queue_prefilled_to_me(
                 bo, avg_price, num_shares, payload,
-                token_id=token_id,
+                direction=direction,
                 session_offset=session_offset,
                 settlement_at=settlement_at,
-                candle_open=session.candle_open,
+                candle_open=candle_open,
             )
 
     elif is_limit:
@@ -681,6 +681,8 @@ def create_bo(
             sl_price          = payload.sl_price,
             ttl               = payload.ttl,
             session_offset    = session_offset,
+            session_id        = session_id,
+            candle_open       = candle_open,
             entry_fee         = entry_fee,
             me_order_status   = "PENDING",
             traces            = order_traces if order_traces else None,
@@ -689,14 +691,11 @@ def create_bo(
         db.commit()
         db.refresh(bo)
 
-        # Queue to ME via Redis
+        # Queue to ME via per-session Redis queue
         try:
-            from services.redis_client import get_sync_redis
-            sr = get_sync_redis()
-            session_id = f"{payload.symbol.value}:{payload.timeframe.value}:{session.candle_open}"
-            order_payload = json.dumps({
+            _queue_order_to_session(bo.id, session_id, {
                 "bo_id": bo.id,
-                "token_id": token_id,
+                "direction": direction,
                 "symbol": payload.symbol.value,
                 "forecast": payload.forecast.value,
                 "side": "BUY",
@@ -712,16 +711,7 @@ def create_bo(
                 "slippage_tolerance": payload.slippage_tolerance,
                 "session_offset": session_offset,
                 "settlement_at": settlement_at.isoformat() if settlement_at else None,
-                "session_id": session_id,
             })
-            session_queue_key = f"queue:orders:{session_id}"
-            sr.lpush(session_queue_key, order_payload)
-
-            logger.info(
-                "Order queued for BO #%d: type=LIMIT limit=%s tp=%s sl=%s",
-                bo.id, payload.limit_price,
-                payload.tp_price, payload.sl_price,
-            )
         except Exception as exc:
             logger.error(
                 "Failed to queue order for BO #%d: %s",
@@ -729,12 +719,13 @@ def create_bo(
             )
 
     else:
-        # ── MARKET path: fill immediately from Redis orderbook snapshot ──
+        # ── MARKET path: fill immediately from session-keyed orderbook snapshot ──
         try:
             avg_price, num_shares, walk_levels = _fill_market_from_snapshot(
-                payload.symbol.value, payload.timeframe.value, pm_status,
+                payload.symbol.value, payload.timeframe.value, direction,
                 payload.amount,
                 slippage_tolerance=payload.slippage_tolerance,
+                candle_open=candle_open,
             )
         except HTTPException:
             bot.balance = round(bot.balance + payload.amount, 8)
@@ -786,6 +777,8 @@ def create_bo(
             sl_price          = payload.sl_price,
             ttl               = payload.ttl,
             session_offset    = session_offset,
+            session_id        = session_id,
+            candle_open       = candle_open,
             entry_fee         = entry_fee,
             me_order_status   = me_order_status,
             walk_prices       = {"entry": walk_levels},
@@ -799,10 +792,10 @@ def create_bo(
         if has_bracket:
             _queue_prefilled_to_me(
                 bo, avg_price, num_shares, payload,
-                token_id=token_id,
+                direction=direction,
                 session_offset=session_offset,
                 settlement_at=settlement_at,
-                candle_open=session.candle_open,
+                candle_open=candle_open,
             )
 
     # Persist any traces added after initial commit (e.g. from _queue_prefilled_to_me)
@@ -866,9 +859,9 @@ async def get_token_mapping(
 
     sym = symbol.upper()
     tf = timeframe.upper()
-    if sym not in ("BTC", "ETH", "SOL", "XRP"):
+    if sym not in ("BTC", "ETH"):
         raise HTTPException(400, f"Unsupported symbol: {sym}")
-    if tf not in ("M5", "M15", "H1"):
+    if tf not in ("M5", "M15"):
         raise HTTPException(400, f"Unsupported timeframe: {tf}")
 
     r = get_async_redis()
@@ -934,7 +927,7 @@ def bo_stats_by_timeframe(
         q = q.filter(BinaryOption.bot_name.ilike(f"%{bot_name}%"))
     bos = q.all()
 
-    tf_order = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+    tf_order = ["M1", "M5", "M15", "M30"]
     groups: dict[str, list] = defaultdict(list)
     for b in bos:
         groups[b.timeframe].append(b)
@@ -1006,7 +999,7 @@ def engine_status():
 
 # ─── Orderbook depth ──────────────────────────────────────────────────────
 
-_OB_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+_OB_SYMBOLS = ["BTC", "ETH"]
 _OB_DIRECTIONS = ["UP", "DOWN"]
 
 
@@ -1026,7 +1019,7 @@ def engine_orderbook(
     from services.redis_client import get_sync_redis
 
     target_syms = [symbol.upper()] if symbol else _OB_SYMBOLS
-    target_tfs = [timeframe.upper()] if timeframe else ["M5", "M15", "H1"]
+    target_tfs = [timeframe.upper()] if timeframe else ["M5", "M15"]
     target_dirs = [direction.upper()] if direction else _OB_DIRECTIONS
 
     # Build deterministic key list from filters
@@ -1066,8 +1059,8 @@ def engine_orderbook(
 
 # ─── Live prices (direct REST) ─────────────────────────────────────────────
 
-_PRICE_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
-_PRICE_TIMEFRAMES = ["M5", "M15", "H1"]
+_PRICE_SYMBOLS = ["BTC", "ETH"]
+_PRICE_TIMEFRAMES = ["M5", "M15"]
 _PRICE_DIRECTIONS = ["UP", "DOWN"]
 _PRICE_CACHE_TTL = API_PRICE_CACHE_TTL_S
 
@@ -1160,7 +1153,7 @@ def engine_prices():
 
 # ── Public Trade Inspector ──────────────────────────────────────────────────
 
-_TF_SECONDS = {"M5": 300, "M15": 900, "H1": 3600}
+_TF_SECONDS = {"M5": 300, "M15": 900}
 
 
 @router.get("/inspect/{trade_id}", response_model=TradeInspectResponse)

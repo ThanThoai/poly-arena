@@ -55,8 +55,8 @@ else:
 while len(USER_LIST) < NUM_USERS:
     USER_LIST.append(f"trader-{len(USER_LIST)+1}")
 
-SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
-TIMEFRAMES = ["M5", "M15", "H1"]
+SYMBOLS = ["BTC", "ETH"]
+TIMEFRAMES = ["M5", "M15"]
 FORECASTS = ["GREEN", "RED"]
 
 REASONS = [
@@ -795,7 +795,7 @@ def run_batch(
 
 def bot_loop(bot_name: str, api_key: str, profile: dict) -> None:
     tf = profile["preferred_tf"][0]
-    period = {"M5": 300, "M15": 900, "H1": 3600}.get(tf, 300)
+    period = {"M5": 300, "M15": 900}.get(tf, 300)
 
     log.info(
         "%s started: style=%s trades=%d cases=%d period=%ds snipe=%ds",

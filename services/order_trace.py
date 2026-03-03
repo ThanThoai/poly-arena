@@ -16,6 +16,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _REDIS_TRACE_MAX = 10  # Keep latest N traces per order in Redis
+_REDIS_TRACE_TTL_S = 3600  # 1 hour TTL for trace keys
 
 
 def make_trace(
@@ -70,6 +71,7 @@ def publish_trace_to_redis(redis_client, bo_id: int, trace: dict) -> None:
         payload = json.dumps(trace)
         redis_client.lpush(list_key, payload)
         redis_client.ltrim(list_key, 0, _REDIS_TRACE_MAX - 1)
+        redis_client.expire(list_key, _REDIS_TRACE_TTL_S)
         redis_client.publish(channel, payload)
     except Exception as exc:
         logger.warning("Failed to publish trace for BO #%d: %s", bo_id, exc)

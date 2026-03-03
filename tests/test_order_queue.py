@@ -19,11 +19,16 @@ from ws_feed_service.config import QUEUE_ORDERS_PREFIX, ORDERBOOK_KEY_PREFIX
 from config.timing import TF_SECONDS
 
 
-def _session_queue_key(symbol="BTC", tf="M5"):
-    """Compute the per-session queue key for current candle."""
+def _current_candle_open(tf="M5"):
+    """Compute the candle_open for the current session."""
     period_s = TF_SECONDS[tf]
     now_ts = int(time.time())
-    candle_open = now_ts - (now_ts % period_s)
+    return now_ts - (now_ts % period_s)
+
+
+def _session_queue_key(symbol="BTC", tf="M5"):
+    """Compute the per-session queue key for current candle."""
+    candle_open = _current_candle_open(tf)
     return f"{QUEUE_ORDERS_PREFIX}:{symbol}:{tf}:{candle_open}"
 
 
@@ -51,9 +56,11 @@ def _pop_any_session_queue(redis_client, prefix="queue:orders:"):
     return None
 
 
-def _seed_orderbook(redis_client, symbol="BTC", tf="M5", direction="UP"):
-    """Seed a fake orderbook snapshot in Redis."""
-    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{tf}:{direction}"
+def _seed_orderbook(redis_client, symbol="BTC", tf="M5", direction="UP", candle_open=None):
+    """Seed a fake orderbook snapshot in Redis using session-keyed key."""
+    if candle_open is None:
+        candle_open = _current_candle_open(tf)
+    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{tf}:{direction}:{candle_open}"
     asks = [[0.52, 500.0], [0.53, 300.0], [0.54, 200.0]]
     redis_client.hset(key, mapping={
         "asks": json.dumps(asks),
@@ -65,10 +72,12 @@ def _seed_orderbook(redis_client, symbol="BTC", tf="M5", direction="UP"):
 # ── LIMIT order → queue ──────────────────────────────────────────────────────
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_create_bo_limit_order_pushes_to_queue(mock_price, client, test_bot, fake_sync_redis):
+def test_create_bo_limit_order_pushes_to_queue(client, test_bot, fake_sync_redis):
     """LIMIT order should LPUSH to per-session queue with me_order_status=PENDING."""
     bot_name, api_key = test_bot
+
+    # Seed orderbook so the session availability check passes
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -101,19 +110,18 @@ def test_create_bo_limit_order_pushes_to_queue(mock_price, client, test_bot, fak
     assert order["timeframe"] == "M5"
     assert order["symbol"] == "BTC"
     assert order["forecast"] == "GREEN"
-    assert order["token_id"] == "fake-token-btc-m5-up"
+    assert order["direction"] == "UP"
 
 
 # ── MARKET order → snapshot fill ─────────────────────────────────────────────
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_create_bo_market_order_fills_from_snapshot(mock_price, client, test_bot, fake_sync_redis):
+def test_create_bo_market_order_fills_from_snapshot(client, test_bot, fake_sync_redis):
     """MARKET order should fill immediately from orderbook snapshot."""
     bot_name, api_key = test_bot
 
-    # Seed orderbook snapshot in Redis
-    _seed_orderbook(fake_sync_redis)
+    # Seed orderbook snapshot in Redis (session-keyed)
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -142,12 +150,11 @@ def test_create_bo_market_order_fills_from_snapshot(mock_price, client, test_bot
     assert queue_len == 0
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_create_bo_market_with_bracket_queues_prefilled(mock_price, client, test_bot, fake_sync_redis):
+def test_create_bo_market_with_bracket_queues_prefilled(client, test_bot, fake_sync_redis):
     """MARKET order with TP/SL should fill immediately and queue as PREFILLED."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -177,12 +184,11 @@ def test_create_bo_market_with_bracket_queues_prefilled(mock_price, client, test
     assert order["prefilled"] is True
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_create_bo_market_applies_taker_fee(mock_price, client, test_bot, fake_sync_redis, db):
+def test_create_bo_market_applies_taker_fee(client, test_bot, fake_sync_redis, db):
     """MARKET order should deduct taker fee from balance at API level."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     from models import Bot
     bot = db.query(Bot).filter(Bot.bot_name == bot_name).first()
@@ -208,14 +214,14 @@ def test_create_bo_market_applies_taker_fee(mock_price, client, test_bot, fake_s
     assert bot.balance < initial_balance - 10.0
 
 
-# ── Token ID unavailable → 503 ──────────────────────────────────────────────
+# ── Orderbook unavailable → 503 ──────────────────────────────────────────────
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(None, None))
-def test_create_bo_no_token_returns_503(mock_price, client, test_bot, fake_sync_redis):
-    """When token_id is unavailable, return 503."""
+def test_create_bo_no_orderbook_returns_503(client, test_bot, fake_sync_redis):
+    """When orderbook snapshot is unavailable, return 503."""
     bot_name, api_key = test_bot
 
+    # Don't seed any orderbook data
     resp = client.post(
         "/poly-arena/binary-options/",
         json={
@@ -234,8 +240,7 @@ def test_create_bo_no_token_returns_503(mock_price, client, test_bot, fake_sync_
 # ── MARKET without orderbook snapshot → 503 ─────────────────────────────────
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_create_bo_market_no_orderbook_returns_503(mock_price, client, test_bot, fake_sync_redis):
+def test_create_bo_market_no_orderbook_returns_503(client, test_bot, fake_sync_redis):
     """MARKET order with no orderbook snapshot should return 503."""
     bot_name, api_key = test_bot
 
@@ -258,10 +263,11 @@ def test_create_bo_market_no_orderbook_returns_503(mock_price, client, test_bot,
 # ── Session queue routing ────────────────────────────────────────────────────
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_limit_order_queue_key_matches_session(mock_price, client, test_bot, fake_sync_redis):
+def test_limit_order_queue_key_matches_session(client, test_bot, fake_sync_redis):
     """LIMIT order queue key must contain the correct candle_open for current session."""
     bot_name, api_key = test_bot
+
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -278,9 +284,7 @@ def test_limit_order_queue_key_matches_session(mock_price, client, test_bot, fak
     assert resp.status_code == 201
 
     # Verify queue key is session-specific
-    period_s = TF_SECONDS["M5"]
-    now_ts = int(time.time())
-    expected_candle_open = now_ts - (now_ts % period_s)
+    expected_candle_open = _current_candle_open("M5")
     expected_key = f"queue:orders:BTC:M5:{expected_candle_open}"
 
     # The order should be in exactly this key
@@ -293,10 +297,13 @@ def test_limit_order_queue_key_matches_session(mock_price, client, test_bot, fak
     assert order["bo_id"] == resp.json()["id"]
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_limit_different_timeframes_route_to_different_queues(mock_price, client, test_bot, fake_sync_redis):
+def test_limit_different_timeframes_route_to_different_queues(client, test_bot, fake_sync_redis):
     """LIMIT orders for M5 and M15 should go to different session queues."""
     bot_name, api_key = test_bot
+
+    # Seed orderbooks for both timeframes
+    _seed_orderbook(fake_sync_redis, tf="M5", direction="UP")
+    _seed_orderbook(fake_sync_redis, tf="M15", direction="UP")
 
     # M5 order
     resp_m5 = client.post(
@@ -327,9 +334,8 @@ def test_limit_different_timeframes_route_to_different_queues(mock_price, client
     assert resp_m15.status_code == 201
 
     # Verify they went to different queues
-    now_ts = int(time.time())
-    m5_candle = now_ts - (now_ts % TF_SECONDS["M5"])
-    m15_candle = now_ts - (now_ts % TF_SECONDS["M15"])
+    m5_candle = _current_candle_open("M5")
+    m15_candle = _current_candle_open("M15")
 
     m5_key = f"queue:orders:BTC:M5:{m5_candle}"
     m15_key = f"queue:orders:BTC:M15:{m15_candle}"
@@ -344,12 +350,11 @@ def test_limit_different_timeframes_route_to_different_queues(mock_price, client
     assert m15_order["session_id"] == f"BTC:M15:{m15_candle}"
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_prefilled_bracket_uses_same_session_queue_as_limit(mock_price, client, test_bot, fake_sync_redis):
+def test_prefilled_bracket_uses_same_session_queue_as_limit(client, test_bot, fake_sync_redis):
     """MARKET+bracket prefilled order should route to the same session queue format as LIMIT."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -368,9 +373,7 @@ def test_prefilled_bracket_uses_same_session_queue_as_limit(mock_price, client, 
     assert data["me_order_status"] == "PREFILLED"
 
     # Verify the prefilled order is in the correct session queue
-    period_s = TF_SECONDS["M5"]
-    now_ts = int(time.time())
-    expected_candle_open = now_ts - (now_ts % period_s)
+    expected_candle_open = _current_candle_open("M5")
     expected_key = f"queue:orders:BTC:M5:{expected_candle_open}"
 
     queue_len = fake_sync_redis.llen(expected_key)
@@ -383,10 +386,11 @@ def test_prefilled_bracket_uses_same_session_queue_as_limit(mock_price, client, 
     assert order["bo_id"] == data["id"]
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_multiple_limit_orders_same_session_share_queue(mock_price, client, test_bot, fake_sync_redis):
+def test_multiple_limit_orders_same_session_share_queue(client, test_bot, fake_sync_redis):
     """Multiple LIMIT orders for the same session should all be in the same queue."""
     bot_name, api_key = test_bot
+
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     for i in range(3):
         resp = client.post(
@@ -403,9 +407,7 @@ def test_multiple_limit_orders_same_session_share_queue(mock_price, client, test
         assert resp.status_code == 201
 
     # All 3 should be in the same session queue
-    period_s = TF_SECONDS["M5"]
-    now_ts = int(time.time())
-    candle_open = now_ts - (now_ts % period_s)
+    candle_open = _current_candle_open("M5")
     key = f"queue:orders:BTC:M5:{candle_open}"
 
     assert fake_sync_redis.llen(key) == 3, "All 3 orders should be in the same session queue"
@@ -550,10 +552,11 @@ def test_limit_buy_partial_fill_across_levels():
     assert abs(order.avg_entry_price - expected_avg) < Decimal("0.0001")
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_limit_green_queue_payload_has_up_token(mock_price, client, test_bot, fake_sync_redis):
-    """GREEN LIMIT → queue payload should contain UP token_id."""
+def test_limit_green_queue_payload_has_up_direction(client, test_bot, fake_sync_redis):
+    """GREEN LIMIT → queue payload should contain direction=UP."""
     bot_name, api_key = test_bot
+
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -570,16 +573,17 @@ def test_limit_green_queue_payload_has_up_token(mock_price, client, test_bot, fa
 
     raw = _pop_any_session_queue(fake_sync_redis)
     order = json.loads(raw)
-    assert order["token_id"] == "fake-token-btc-m5-up"
+    assert order["direction"] == "UP"
     assert order["forecast"] == "GREEN"
     assert order["side"] == "BUY"
     assert order["limit_price"] == 0.45
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.48, "fake-token-btc-m5-down"))
-def test_limit_red_queue_payload_has_down_token(mock_price, client, test_bot, fake_sync_redis):
-    """RED LIMIT → queue payload should contain DOWN token_id."""
+def test_limit_red_queue_payload_has_down_direction(client, test_bot, fake_sync_redis):
+    """RED LIMIT → queue payload should contain direction=DOWN."""
     bot_name, api_key = test_bot
+
+    _seed_orderbook(fake_sync_redis, direction="DOWN")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -596,7 +600,7 @@ def test_limit_red_queue_payload_has_down_token(mock_price, client, test_bot, fa
 
     raw = _pop_any_session_queue(fake_sync_redis)
     order = json.loads(raw)
-    assert order["token_id"] == "fake-token-btc-m5-down"
+    assert order["direction"] == "DOWN"
     assert order["forecast"] == "RED"
     assert order["side"] == "BUY"
     assert order["limit_price"] == 0.40
@@ -605,12 +609,11 @@ def test_limit_red_queue_payload_has_down_token(mock_price, client, test_bot, fa
 # ── Aggressive LIMIT (limit_price >= best_ask) → taker fee ───────────────────
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_aggressive_limit_fills_immediately_as_taker(mock_price, client, test_bot, fake_sync_redis):
+def test_aggressive_limit_fills_immediately_as_taker(client, test_bot, fake_sync_redis):
     """LIMIT with limit_price >= best_ask should fill immediately like MARKET (taker fee)."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)  # best_ask = 0.52
+    _seed_orderbook(fake_sync_redis, direction="UP")  # best_ask = 0.52
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -640,12 +643,11 @@ def test_aggressive_limit_fills_immediately_as_taker(mock_price, client, test_bo
     assert queue_len == 0
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_aggressive_limit_deducts_taker_fee_from_balance(mock_price, client, test_bot, fake_sync_redis, db):
+def test_aggressive_limit_deducts_taker_fee_from_balance(client, test_bot, fake_sync_redis, db):
     """Aggressive LIMIT should deduct both amount and taker fee from balance."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     from models import Bot
     bot = db.query(Bot).filter(Bot.bot_name == bot_name).first()
@@ -673,12 +675,11 @@ def test_aggressive_limit_deducts_taker_fee_from_balance(mock_price, client, tes
     assert abs(bot.balance - expected_balance) < 0.01
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_aggressive_limit_with_bracket_queues_prefilled(mock_price, client, test_bot, fake_sync_redis):
+def test_aggressive_limit_with_bracket_queues_prefilled(client, test_bot, fake_sync_redis):
     """Aggressive LIMIT + bracket → fill as taker, queue PREFILLED for monitoring."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)
+    _seed_orderbook(fake_sync_redis, direction="UP")
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -704,12 +705,11 @@ def test_aggressive_limit_with_bracket_queues_prefilled(mock_price, client, test
     assert queue_len == 1
 
 
-@patch("routers.binary_options._try_redis_price", return_value=(0.52, "fake-token-btc-m5-up"))
-def test_passive_limit_no_fee_queued_to_me(mock_price, client, test_bot, fake_sync_redis):
+def test_passive_limit_no_fee_queued_to_me(client, test_bot, fake_sync_redis):
     """Passive LIMIT (limit < best_ask) should queue to ME with entry_fee=0."""
     bot_name, api_key = test_bot
 
-    _seed_orderbook(fake_sync_redis)  # best_ask = 0.52
+    _seed_orderbook(fake_sync_redis, direction="UP")  # best_ask = 0.52
 
     resp = client.post(
         "/poly-arena/binary-options/",
@@ -732,3 +732,77 @@ def test_passive_limit_no_fee_queued_to_me(mock_price, client, test_bot, fake_sy
     # Should be queued to ME
     queue_len = _any_session_queue_len(fake_sync_redis)
     assert queue_len == 1
+
+
+def _seed_wide_spread_orderbook(redis_client, symbol="BTC", tf="M5", direction="UP", candle_open=None):
+    """Seed orderbook with wide price spread: asks from 0.10 to 0.60."""
+    if candle_open is None:
+        candle_open = _current_candle_open(tf)
+    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{tf}:{direction}:{candle_open}"
+    asks = [[0.10, 50.0], [0.20, 50.0], [0.30, 50.0], [0.40, 50.0], [0.50, 50.0], [0.60, 50.0]]
+    redis_client.hset(key, mapping={
+        "asks": json.dumps(asks),
+        "bids": json.dumps([[0.09, 100.0]]),
+        "updated_at": str(time.time()),
+    })
+
+
+def test_aggressive_limit_walks_up_to_limit_price(client, test_bot, fake_sync_redis):
+    """Aggressive LIMIT should fill all asks from min up to limit_price, not just slippage band."""
+    bot_name, api_key = test_bot
+
+    # Orderbook: asks at [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
+    _seed_wide_spread_orderbook(fake_sync_redis)
+
+    resp = client.post(
+        "/poly-arena/binary-options/",
+        json={
+            "symbol": "BTC",
+            "timeframe": "M5",
+            "forecast": "GREEN",
+            "amount": 10.0,
+            "limit_price": 0.50,  # >= best_ask 0.10, should fill asks 0.10-0.50
+        },
+        headers={"x-api-key": api_key},
+    )
+
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["avg_price"] is not None
+    # avg_price should be between 0.10 and 0.50 (weighted avg of multiple levels)
+    # NOT just 0.10 (which would happen if slippage capped at best_ask * 1.1 = 0.11)
+    assert data["avg_price"] > 0.10, (
+        f"avg_price={data['avg_price']} — should walk asks above 0.10 up to limit 0.50"
+    )
+    assert data["avg_price"] <= 0.50
+    # walk_prices should include multiple levels
+    assert data["walk_prices"] is not None
+    walk_entry = data["walk_prices"].get("entry", [])
+    assert len(walk_entry) > 1, (
+        f"Expected multiple fill levels, got {len(walk_entry)}: {walk_entry}"
+    )
+
+
+def test_session_keyed_orderbook_used(client, test_bot, fake_sync_redis):
+    """Session-keyed orderbook should be used for order fills."""
+    bot_name, api_key = test_bot
+
+    # Session-keyed key has correct data (0.52)
+    candle_open = _current_candle_open("M5")
+    _seed_orderbook(fake_sync_redis, direction="UP", candle_open=candle_open)
+
+    resp = client.post(
+        "/poly-arena/binary-options/",
+        json={
+            "symbol": "BTC",
+            "timeframe": "M5",
+            "forecast": "GREEN",
+            "amount": 10.0,
+        },
+        headers={"x-api-key": api_key},
+    )
+
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["avg_price"] is not None
+    assert data["avg_price"] >= 0.52

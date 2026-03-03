@@ -84,43 +84,45 @@ async def test_update_price_unknown_token_is_noop(fake_async_redis):
     assert len(keys) == 0
 
 
-# ── _try_redis_price ─────────────────────────────────────────────────────────
+# ── _snapshot_best_ask ────────────────────────────────────────────────────────
 
 
-def test_try_redis_price_hit(fake_sync_redis):
-    """_try_redis_price should return (price, token_id) for fresh cache."""
-    key = f"{PRICE_KEY_PREFIX}:ETH:M15:DOWN"
+def test_snapshot_best_ask_hit(fake_sync_redis):
+    """_snapshot_best_ask should return best_ask from session-keyed orderbook."""
+    import json
+    from ws_feed_service.config import ORDERBOOK_KEY_PREFIX
+    candle_open = 1709313000
+    key = f"{ORDERBOOK_KEY_PREFIX}:ETH:M15:DOWN:{candle_open}"
     fake_sync_redis.hset(key, mapping={
-        "best_ask": "0.4500",
-        "token_id": "token-eth-m15-down-999",
+        "asks": json.dumps([[0.45, 500.0], [0.46, 300.0]]),
+        "bids": json.dumps([[0.44, 400.0]]),
         "updated_at": str(time.time()),
     })
 
-    from routers.binary_options import _try_redis_price
-    price, token_id = _try_redis_price("ETH", "M15", "DOWN")
+    from routers.binary_options import _snapshot_best_ask
+    price = _snapshot_best_ask("ETH", "M15", "DOWN", candle_open=candle_open)
     assert price == 0.45
-    assert token_id == "token-eth-m15-down-999"
 
 
-def test_try_redis_price_miss(fake_sync_redis):
-    """_try_redis_price should return (None, None) when key doesn't exist."""
-    from routers.binary_options import _try_redis_price
-    price, token_id = _try_redis_price("SOL", "H1", "UP")
+def test_snapshot_best_ask_miss(fake_sync_redis):
+    """_snapshot_best_ask should return None when key doesn't exist."""
+    from routers.binary_options import _snapshot_best_ask
+    price = _snapshot_best_ask("BTC", "M5", "UP", candle_open=9999999999)
     assert price is None
-    assert token_id is None
 
 
-def test_try_redis_price_stale(fake_sync_redis):
-    """Prices older than STALE_THRESHOLD_S should be treated as miss."""
-    key = f"{PRICE_KEY_PREFIX}:BTC:M5:UP"
-    stale_ts = time.time() - STALE_THRESHOLD_S - 10  # 10s beyond threshold
+def test_snapshot_best_ask_empty_asks(fake_sync_redis):
+    """_snapshot_best_ask should return None when asks list is empty."""
+    import json
+    from ws_feed_service.config import ORDERBOOK_KEY_PREFIX
+    candle_open = 1709313000
+    key = f"{ORDERBOOK_KEY_PREFIX}:BTC:M5:UP:{candle_open}"
     fake_sync_redis.hset(key, mapping={
-        "best_ask": "0.5000",
-        "token_id": "token-old",
-        "updated_at": str(stale_ts),
+        "asks": json.dumps([]),
+        "bids": json.dumps([[0.50, 600.0]]),
+        "updated_at": str(time.time()),
     })
 
-    from routers.binary_options import _try_redis_price
-    price, token_id = _try_redis_price("BTC", "M5", "UP")
+    from routers.binary_options import _snapshot_best_ask
+    price = _snapshot_best_ask("BTC", "M5", "UP", candle_open=candle_open)
     assert price is None
-    assert token_id is None

@@ -26,16 +26,13 @@ _CLOB_URL = "https://clob.polymarket.com/book"
 _TF_NORMALIZE: dict[str, str] = {
     "M5": "5m",
     "M15": "15m",
-    "H1": "1h",
     "5m": "5m",
     "15m": "15m",
-    "1h": "1h",
 }
 
 _TF_SECONDS: dict[str, int] = {
     "5m": TF_SECONDS["M5"],
     "15m": TF_SECONDS["M15"],
-    "1h": TF_SECONDS["H1"],
 }
 
 # Polymarket token index: 0 = UP, 1 = DOWN
@@ -186,7 +183,7 @@ class PolymarketClient:
 
         Args:
             symbol:        e.g. "ETH", "BTC"
-            timeframe:     e.g. "5m", "15m", "1h"  (or "M5", "M15", "H1")
+            timeframe:     e.g. "5m", "15m"  (or "M5", "M15")
             status:        "UP" or "DOWN"
         settlement_ts: Unix timestamp of the settlement candle.
                            Defaults to the next candle boundary.

@@ -92,6 +92,8 @@ class BOResponse(BaseModel):
     traces:          Optional[list]  = None
     position_closed: Optional[bool]  = None
     session_offset:  Optional[int]   = None
+    session_id:      Optional[str]   = None
+    candle_open:     Optional[int]   = None
     entry_fee:       Optional[float] = None
 
     model_config = {"from_attributes": True}
@@ -196,6 +198,18 @@ class UserBalanceHistoryResponse(BaseModel):
     trade_id:    Optional[int] = None
     bot_id:      Optional[int] = None
     pnl_amount:  Optional[float] = None
+    recorded_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class UserBalanceSnapshotResponse(BaseModel):
+    id:          int
+    user_id:     int
+    balance:     float
+    bot_balance: float
+    available:   float
+    session_id:  Optional[str] = None
     recorded_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}

@@ -24,12 +24,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from database import SessionLocal
 from services.redis_client import get_sync_redis, close_sync_redis
 from services.settlement import settle_pending_trades, sweep_stuck_orders
+from services.user_balance import snapshot_all_user_balances
 from scheduler_service.config import (
     SETTLEMENT_CRON_SECOND,
     STUCK_SWEEP_INTERVAL_MIN,
     HEARTBEAT_INTERVAL_S,
     HEARTBEAT_KEY,
     HEARTBEAT_TTL_S,
+    BALANCE_SNAPSHOT_CRON_SECOND,
 )
 
 _log_level = logging.DEBUG if os.getenv("DEBUG", "").strip() in ("1", "true", "yes") else logging.INFO
@@ -63,6 +65,22 @@ def _run_stuck_sweep() -> None:
             log.info("Stuck sweep resolved %d trade(s)", resolved)
     except Exception as exc:
         log.error("Stuck sweep job error: %s", exc)
+    finally:
+        db.close()
+
+
+def _run_balance_snapshot() -> None:
+    """Called every 5 minutes at :10s to snapshot all user balances."""
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        # Align to M5 candle boundary (floor to nearest 5 min)
+        candle_open = int(now.timestamp()) // 300 * 300
+        session_label = f"M5:{candle_open}"
+        count = snapshot_all_user_balances(db, session_label=session_label)
+        log.info("Balance snapshot: %d users (session=%s)", count, session_label)
+    except Exception as exc:
+        log.error("Balance snapshot job error: %s", exc)
     finally:
         db.close()
 
@@ -110,6 +128,14 @@ async def main():
         trigger="interval",
         minutes=STUCK_SWEEP_INTERVAL_MIN,
         id="stuck-sweep",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_balance_snapshot,
+        trigger="cron",
+        minute="*/5",
+        second=BALANCE_SNAPSHOT_CRON_SECOND,
+        id="balance-snapshot",
         replace_existing=True,
     )
     scheduler.add_job(
