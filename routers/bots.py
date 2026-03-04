@@ -305,6 +305,9 @@ def get_user_balance_snapshots(
             bot_balance=0,
             available=init_bal,
             session_id=None,
+            session_pnl=None,
+            prev_balance=None,
+            bot_pnl=None,
             recorded_at=u.created_at,
         ))
 

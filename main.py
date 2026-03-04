@@ -184,9 +184,19 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                     bo.me_order_id = order_id
 
                 if filled > 0 and avg_entry > 0:
+                    # Preserve original budget before adjustment
+                    if bo.original_amount is None:
+                        bo.original_amount = bo.amount
+
                     # Tính phần chưa fill để hoàn lại
                     actual_cost = round(filled * avg_entry, 8)
                     unfilled_refund = round(max(0, bo.amount - actual_cost), 8)
+
+                    # Compute fill breakdown for trace
+                    original_budget = bo.original_amount or bo.amount
+                    limit_price = bo.limit_price or avg_entry
+                    requested_qty = round(original_budget / limit_price, 8) if limit_price > 0 else 0
+                    unfilled_qty = round(max(0, requested_qty - filled), 8)
 
                     # Cập nhật lệnh: chỉ giữ lại phần đã fill
                     bo.avg_price = avg_entry
@@ -197,10 +207,13 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                     append_trace(bo, make_trace(
                         "MATCHING", "PARTIAL_FILL_EXPIRY",
                         f"Order expired with partial fill. "
-                        f"Filled: {filled:.4f} @ ${avg_entry:.4f}. "
+                        f"Filled: {filled:.4f} / {requested_qty:.4f} shares @ ${avg_entry:.4f}. "
+                        f"Unfilled: {unfilled_qty:.4f} shares. "
                         f"Unfilled refund: ${unfilled_refund:.4f}.",
                         {"filled": filled, "avg_entry_price": avg_entry,
                          "actual_cost": actual_cost, "unfilled_refund": unfilled_refund,
+                         "requested_quantity": requested_qty, "unfilled_quantity": unfilled_qty,
+                         "original_amount": original_budget,
                          "reason": reason},
                     ))
 
@@ -351,11 +364,16 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                          "rebate_earned": fee_applied},
                     ))
                 elif status == "PARTIAL":
+                    # Compute requested quantity for trace
+                    _orig_budget = bo.original_amount or bo.amount
+                    _lp = bo.limit_price or avg_entry
+                    _req_qty = round(_orig_budget / _lp, 8) if _lp > 0 else 0
                     append_trace(bo, make_trace(
                         "MATCHING", "PARTIAL_FILL",
-                        f"Partial fill: {filled:.4f} shares @ ${avg_entry:.4f}. "
+                        f"Partial fill: {filled:.4f} / {_req_qty:.4f} shares @ ${avg_entry:.4f}. "
                         f"Rebate: ${fee_applied:.4f} (MAKER).",
                         {"avg_entry_price": avg_entry, "filled": filled,
+                         "requested_quantity": _req_qty,
                          "status": status, "nominal_fee": nominal,
                          "role": "MAKER", "actual_fee_deducted": 0.0,
                          "rebate_earned": fee_applied},

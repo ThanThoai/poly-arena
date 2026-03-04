@@ -101,6 +101,8 @@ class RedisWriter:
         self._current_sessions: dict[str, int] = {}
         # Dedup cache: key → (bids_json, asks_json) to skip redundant writes
         self._last_ob_json: dict[str, tuple[str, str]] = {}
+        # Track last Redis write time per token for TTL refresh
+        self._last_ob_write_ts: dict[str, float] = {}
         # Throttle: combo key → last monotonic timestamp for DB recording
         self._last_price_record_ts: dict[str, float] = {}
         # Cache latest orderbook per combo for DB recording: combo_key → (bids_list, asks_list)
@@ -127,6 +129,7 @@ class RedisWriter:
 
         self._token_map.clear()
         self._last_ob_json.clear()
+        self._last_ob_write_ts.clear()
         for (sym, tf, direction), token_id in mapping.items():
             self._token_map.setdefault(token_id, []).append((sym, tf, direction))
 
@@ -396,6 +399,18 @@ class RedisWriter:
             # session records a fresh snapshot immediately.
             self._last_price_record_ts.pop(combo_key, None)
 
+        # Clear orderbook dedup + write-time caches for old token_ids
+        # so the new session's first write is not deduped or delayed.
+        old_forward: dict[tuple[str, str, str], str] = {}
+        for token_id, token_combos in self._token_map.items():
+            for combo in token_combos:
+                old_forward[combo] = token_id
+        for combo in combos:
+            old_token = old_forward.get(combo)
+            if old_token:
+                self._last_ob_json.pop(old_token, None)
+                self._last_ob_write_ts.pop(old_token, None)
+
         logger.info(
             "Cleared %d rotated price key(s) + %d cached orderbook(s): %s",
             len(combos), cleared_ob,
@@ -427,11 +442,18 @@ class RedisWriter:
         bids_json = json.dumps([[float(p), float(s)] for p, s in bids])
         asks_json = json.dumps([[float(p), float(s)] for p, s in asks])
 
-        # Skip write if orderbook data is unchanged
+        # Skip write if orderbook data is unchanged AND TTL is not about to expire.
+        # Force re-write every (TTL - 30s) to prevent Redis keys from expiring
+        # when orderbook data is stable (no changes for extended periods).
+        now_mono = time.monotonic()
+        last_write = self._last_ob_write_ts.get(token_id, 0.0)
+        ttl_refresh_needed = (now_mono - last_write) >= (PRICE_CACHE_TTL_S - 30)
+
         cached = self._last_ob_json.get(token_id)
-        if cached is not None and cached == (bids_json, asks_json):
+        if cached is not None and cached == (bids_json, asks_json) and not ttl_refresh_needed:
             return
         self._last_ob_json[token_id] = (bids_json, asks_json)
+        self._last_ob_write_ts[token_id] = now_mono
 
         now_ts = str(time.time())
         ob_mapping = {

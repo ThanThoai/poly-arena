@@ -196,6 +196,8 @@ def _fill_market_from_snapshot(
     slippage_tolerance: Optional[float] = None,
     limit_price: Optional[float] = None,
     candle_open: int = 0,
+    order_type: str = "FAK",
+    ceiling_price: Optional[float] = None,
 ) -> Tuple[float, float, list]:
     """
     Simulate a BUY by walking the asks from the session-keyed Redis orderbook.
@@ -207,7 +209,15 @@ def _fill_market_from_snapshot(
     Price cap logic:
     - MARKET orders (limit_price=None): cap = best_ask × (1 + slippage)
     - Aggressive LIMIT orders (limit_price set): cap = limit_price
-      (fills all asks from best_ask up to the limit price)
+    - When ceiling_price is set, it overrides the above cap with
+      min(ceiling_price, original_cap). Best-price-first is guaranteed
+      since asks are sorted ascending.
+
+    Order type logic:
+    - FAK (Fill-And-Kill): fill as much as possible up to ceiling_price,
+      cancel the unfilled remainder immediately.
+    - FOK (Fill-Or-Kill): check if the full amount can be filled within
+      ceiling_price; if not, reject the entire order.
 
     Returns
     -------
@@ -219,7 +229,7 @@ def _fill_market_from_snapshot(
     HTTPException(503)
         If the orderbook snapshot is unavailable or has no asks.
     HTTPException(400)
-        If slippage tolerance is exceeded before filling.
+        If FOK order cannot be fully filled, or slippage exceeded.
     """
     from services.redis_client import get_sync_redis
 
@@ -256,6 +266,13 @@ def _fill_market_from_snapshot(
         best_ask = Decimal(str(asks[0][0]))
         max_price = best_ask * (Decimal("1") + Decimal(str(slippage)))
 
+    # Apply ceiling_price cap — always uses the tighter of max_price and ceiling_price.
+    # Asks are sorted ascending (best price first), so walking naturally
+    # fills the cheapest levels first even when ceiling_price > current market.
+    if ceiling_price is not None:
+        ceiling_dec = Decimal(str(ceiling_price))
+        max_price = min(max_price, ceiling_dec)
+
     budget = Decimal(str(amount))
     total_cost = Decimal("0")
     total_qty = Decimal("0")
@@ -287,7 +304,25 @@ def _fill_market_from_snapshot(
         if total_cost >= budget:
             break
 
+    # FOK: require full budget to be spent; otherwise reject entirely
+    if order_type == "FOK" and ceiling_price is not None:
+        # Budget not fully consumed means insufficient liquidity under ceiling_price
+        if total_cost < budget and total_qty > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"FOK order rejected: insufficient liquidity under ceiling price "
+                    f"{ceiling_price:.4f}. Available: ${float(total_cost):.4f} "
+                    f"of ${amount:.4f} requested."
+                ),
+            )
+
     if total_qty == 0:
+        if order_type == "FOK":
+            raise HTTPException(
+                status_code=400,
+                detail=f"FOK order rejected: no liquidity available under ceiling price {ceiling_price}",
+            )
         raise HTTPException(
             status_code=503,
             detail="Could not fill any shares from orderbook snapshot",
@@ -296,6 +331,104 @@ def _fill_market_from_snapshot(
     avg_price = float(total_cost / total_qty)
     num_shares = float(total_qty)
     return round(avg_price, 8), round(num_shares, 8), walk_levels
+
+
+def _fill_limit_from_snapshot(
+    symbol: str, timeframe: str, direction: str, amount: float,
+    limit_price: float,
+    candle_open: int = 0,
+) -> Tuple[float, float, list, float]:
+    """
+    Fill a LIMIT order by walking asks up to limit_price.
+
+    Only fills levels where ask price <= limit_price.  Any budget left
+    over (because the orderbook ran out of liquidity at or below limit_price)
+    is reported as ``remaining_budget`` so the caller can queue it to the
+    matching engine as a passive LIMIT order.
+
+    Returns
+    -------
+    (avg_price, num_shares, walk_levels, remaining_budget)
+        avg_price:        0.0 if nothing filled
+        num_shares:       0.0 if nothing filled
+        walk_levels:      list of {"price", "qty", "cost"}
+        remaining_budget: unspent amount to queue to ME
+
+    Raises
+    ------
+    HTTPException(503)
+        If orderbook snapshot is unavailable.
+    """
+    from services.redis_client import get_sync_redis
+
+    sr = get_sync_redis()
+    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
+    data = sr.hgetall(key)
+
+    if not data or "asks" not in data:
+        raise HTTPException(
+            status_code=503,
+            detail="Orderbook snapshot unavailable — matching engine may not be running",
+        )
+
+    try:
+        asks = json.loads(data["asks"])
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(
+            status_code=503,
+            detail="Orderbook snapshot malformed",
+        )
+
+    if not asks:
+        raise HTTPException(
+            status_code=503,
+            detail="Orderbook snapshot has no asks",
+        )
+
+    max_price = Decimal(str(limit_price))
+    budget = Decimal(str(amount))
+    total_cost = Decimal("0")
+    total_qty = Decimal("0")
+    walk_levels: list[dict] = []
+
+    for price_raw, size_raw in asks:
+        price = Decimal(str(price_raw))
+        size = Decimal(str(size_raw))
+
+        if price > max_price:
+            break
+
+        remaining = budget - total_cost
+        if remaining <= 0:
+            break
+
+        max_qty_at_level = remaining / price
+        fill_qty = min(size, max_qty_at_level)
+        level_cost = fill_qty * price
+
+        total_cost += level_cost
+        total_qty += fill_qty
+        walk_levels.append({
+            "price": float(price),
+            "qty": float(fill_qty),
+            "cost": float(level_cost),
+        })
+
+        if total_cost >= budget:
+            break
+
+    remaining_budget = float(budget - total_cost)
+    if remaining_budget < 0:
+        remaining_budget = 0.0
+
+    avg_price = float(total_cost / total_qty) if total_qty > 0 else 0.0
+    num_shares = float(total_qty)
+    return (
+        round(avg_price, 8),
+        round(num_shares, 8),
+        walk_levels,
+        round(remaining_budget, 8),
+    )
 
 
 def _queue_order_to_session(
@@ -484,6 +617,26 @@ def create_bo(
     ask_fetched_at = datetime.now(timezone.utc)
     latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
 
+    # ── Pre-validation: ceiling_price vs Best Ask ────────────────────────────
+    # ceiling_price must be >= best_ask; otherwise no fill is possible.
+    if payload.ceiling_price is not None and snapshot_best_ask is not None:
+        if payload.ceiling_price < snapshot_best_ask:
+            bot.balance = round(bot.balance + payload.amount, 8)
+            pending_traces.append(make_trace(
+                "VALIDATION", "CEILING_PRICE_REJECTED",
+                f"Ceiling price ${payload.ceiling_price:.4f} is below Best Ask "
+                f"${snapshot_best_ask:.4f}. No fills possible. Order rejected.",
+                {"ceiling_price": payload.ceiling_price, "best_ask": snapshot_best_ask,
+                 "order_type": payload.order_type},
+            ))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"ceiling_price ({payload.ceiling_price:.4f}) is below current "
+                    f"Best Ask ({snapshot_best_ask:.4f}) — no fills possible"
+                ),
+            )
+
     # ── Pre-validation: condition price vs Best Ask (v2 spec Section 2) ────
     # Prevents "logical suicide" orders where the condition is already met.
     # Runs after session resolution so we have the correct candle_open.
@@ -549,14 +702,12 @@ def create_bo(
     # session's prices.  No special-casing needed.
 
     if is_limit and is_aggressive_limit:
-        # ── AGGRESSIVE LIMIT: limit_price >= best_ask → fill immediately
-        # as taker (same as MARKET), then queue to ME only if has bracket.
-        # Uses limit_price as max fill price (walks asks from min up to limit).
+        # ── AGGRESSIVE LIMIT: limit_price >= best_ask → fill what's available
+        # at prices <= limit_price, queue remaining budget to ME as LIMIT.
         try:
-            avg_price, num_shares, walk_levels = _fill_market_from_snapshot(
+            avg_price, num_shares, walk_levels, remaining_budget = _fill_limit_from_snapshot(
                 payload.symbol.value, payload.timeframe.value, direction,
                 payload.amount,
-                slippage_tolerance=payload.slippage_tolerance,
                 limit_price=payload.limit_price,
                 candle_open=candle_open,
             )
@@ -564,37 +715,52 @@ def create_bo(
             bot.balance = round(bot.balance + payload.amount, 8)
             raise
 
-        # Apply taker fee (aggressive limit crosses the spread)
-        entry_fee = taker_fee_from_levels(walk_levels)
+        original_amount = payload.amount
+
+        # Apply taker fee on the filled portion
+        entry_fee = taker_fee_from_levels(walk_levels) if walk_levels else 0.0
         if entry_fee > 0:
             bot.balance = round(bot.balance - entry_fee, 8)
 
-        me_order_status = "PREFILLED" if has_bracket else None
+        # Determine ME status based on whether there's a remainder to queue
+        has_remainder = remaining_budget > 0
+        if num_shares > 0 and has_remainder:
+            me_order_status = "PARTIAL"
+        elif num_shares > 0 and not has_remainder:
+            me_order_status = "PREFILLED" if has_bracket else None
+        else:
+            me_order_status = "PENDING"
 
         order_traces = list(pending_traces)
         order_traces.append(make_trace(
             "MATCHING", "AGGRESSIVE_LIMIT_FILL",
-            f"LIMIT Order filled immediately (limit ${payload.limit_price:.4f} "
-            f">= best ask). Treated as TAKER. "
-            f"Avg Entry Price: ${avg_price:.4f}. "
-            f"Shares: {num_shares:.4f}. "
-            f"Fee: ${entry_fee:.4f} (TAKER).",
+            f"LIMIT Order: filled ${original_amount - remaining_budget:.4f} "
+            f"of ${original_amount:.4f} at prices <= ${payload.limit_price:.4f}. "
+            f"Avg Entry Price: ${avg_price:.4f}. Shares: {num_shares:.4f}. "
+            f"Fee: ${entry_fee:.4f} (TAKER). "
+            f"Remainder: ${remaining_budget:.4f} queued to ME."
+            if has_remainder else
+            f"LIMIT Order fully filled (limit ${payload.limit_price:.4f} "
+            f">= best ask). Avg Entry: ${avg_price:.4f}. "
+            f"Shares: {num_shares:.4f}. Fee: ${entry_fee:.4f} (TAKER).",
             {"order_type": "LIMIT", "aggressive": True,
              "limit_price": payload.limit_price,
              "avg_price": avg_price, "num_shares": num_shares,
              "walk_levels": walk_levels, "entry_fee": entry_fee,
-             "amount": payload.amount},
+             "amount": original_amount,
+             "filled_amount": round(original_amount - remaining_budget, 8),
+             "remaining_budget": remaining_budget},
         ))
 
         logger.info(
             "BO AGGRESSIVE LIMIT %s %s %s: amount=%.4f limit=%s "
-            "avg_price=%.6f shares=%.4f fee=%.4f latency=%.0fms "
-            "tp=%s sl=%s → filled from snapshot (TAKER)",
+            "avg_price=%.6f shares=%.4f fee=%.4f remainder=%.4f "
+            "latency=%.0fms tp=%s sl=%s",
             payload.symbol.value, payload.timeframe.value,
             payload.forecast.value,
-            payload.amount, payload.limit_price,
-            avg_price, num_shares, entry_fee, latency_ms,
-            payload.tp_price, payload.sl_price,
+            original_amount, payload.limit_price,
+            avg_price, num_shares, entry_fee, remaining_budget,
+            latency_ms, payload.tp_price, payload.sl_price,
         )
 
         bo = BinaryOption(
@@ -602,10 +768,11 @@ def create_bo(
             symbol            = payload.symbol,
             timeframe         = payload.timeframe,
             forecast          = payload.forecast,
-            amount            = payload.amount,
+            amount            = round(original_amount - remaining_budget, 8) if num_shares > 0 else original_amount,
+            original_amount   = original_amount,
             result            = BOResult.PENDING,
-            avg_price         = avg_price,
-            num_shares        = num_shares,
+            avg_price         = avg_price if num_shares > 0 else None,
+            num_shares        = num_shares if num_shares > 0 else None,
             reason            = payload.reason,
             order_received_at = order_received_at,
             ask_fetched_at    = ask_fetched_at,
@@ -618,16 +785,57 @@ def create_bo(
             session_id        = session_id,
             candle_open       = candle_open,
             entry_fee         = entry_fee,
+            order_type        = payload.order_type,
+            ceiling_price       = payload.ceiling_price,
             me_order_status   = me_order_status,
-            walk_prices       = {"entry": walk_levels},
+            walk_prices       = {"entry": walk_levels} if walk_levels else None,
             traces            = order_traces if order_traces else None,
         )
         db.add(bo)
         db.commit()
         db.refresh(bo)
 
-        # If has bracket (TP/SL), queue as prefilled to ME for monitoring
-        if has_bracket:
+        # Queue remainder to ME as passive LIMIT at limit_price
+        if has_remainder:
+            est_qty = round(remaining_budget / payload.limit_price, 8)
+            try:
+                _queue_order_to_session(bo.id, session_id, {
+                    "bo_id": bo.id,
+                    "direction": direction,
+                    "symbol": payload.symbol.value,
+                    "forecast": payload.forecast.value,
+                    "side": "BUY",
+                    "price": payload.limit_price,
+                    "expected_price": payload.limit_price,
+                    "quantity": est_qty,
+                    "amount": remaining_budget,
+                    "limit_price": payload.limit_price,
+                    "tp_price": payload.tp_price,
+                    "sl_price": payload.sl_price,
+                    "timeframe": payload.timeframe.value,
+                    "ttl": payload.ttl,
+                    "slippage_tolerance": payload.slippage_tolerance,
+                    "session_offset": session_offset,
+                    "settlement_at": settlement_at.isoformat() if settlement_at else None,
+                    "prefilled": True if num_shares > 0 else False,
+                    "prefilled_avg_price": avg_price if num_shares > 0 else None,
+                    "prefilled_filled": num_shares if num_shares > 0 else None,
+                })
+                append_trace(bo, make_trace(
+                    "MATCHING", "REMAINDER_QUEUED",
+                    f"Unfilled ${remaining_budget:.4f} queued to ME as LIMIT "
+                    f"at ${payload.limit_price:.4f}. Est qty: {est_qty:.4f}. "
+                    f"Expires at TTL={payload.ttl}s or settlement.",
+                    {"remaining_budget": remaining_budget,
+                     "limit_price": payload.limit_price,
+                     "est_qty": est_qty, "ttl": payload.ttl},
+                ))
+            except Exception as exc:
+                logger.error(
+                    "Failed to queue remainder for BO #%d: %s", bo.id, exc,
+                )
+        elif has_bracket:
+            # Fully filled + has bracket → queue for TP/SL monitoring
             _queue_prefilled_to_me(
                 bo, avg_price, num_shares, payload,
                 direction=direction,
@@ -669,6 +877,7 @@ def create_bo(
             timeframe         = payload.timeframe,
             forecast          = payload.forecast,
             amount            = payload.amount,
+            original_amount   = payload.amount,
             result            = BOResult.PENDING,
             avg_price         = None,
             num_shares        = None,
@@ -684,6 +893,8 @@ def create_bo(
             session_id        = session_id,
             candle_open       = candle_open,
             entry_fee         = entry_fee,
+            order_type        = payload.order_type,
+            ceiling_price       = payload.ceiling_price,
             me_order_status   = "PENDING",
             traces            = order_traces if order_traces else None,
         )
@@ -726,10 +937,19 @@ def create_bo(
                 payload.amount,
                 slippage_tolerance=payload.slippage_tolerance,
                 candle_open=candle_open,
+                order_type=payload.order_type or "FAK",
+                ceiling_price=payload.ceiling_price,
             )
         except HTTPException:
             bot.balance = round(bot.balance + payload.amount, 8)
             raise
+
+        # FAK partial fill: refund unspent budget to bot
+        actual_cost = sum(lv["cost"] for lv in walk_levels)
+        if actual_cost < payload.amount:
+            refund = round(payload.amount - actual_cost, 8)
+            bot.balance = round(bot.balance + refund, 8)
+            payload.amount = round(actual_cost, 8)
 
         # Apply taker fee
         entry_fee = taker_fee_from_levels(walk_levels)
@@ -765,6 +985,7 @@ def create_bo(
             timeframe         = payload.timeframe,
             forecast          = payload.forecast,
             amount            = payload.amount,
+            original_amount   = payload.amount,
             result            = BOResult.PENDING,
             avg_price         = avg_price,
             num_shares        = num_shares,
@@ -780,6 +1001,8 @@ def create_bo(
             session_id        = session_id,
             candle_open       = candle_open,
             entry_fee         = entry_fee,
+            order_type        = payload.order_type,
+            ceiling_price       = payload.ceiling_price,
             me_order_status   = me_order_status,
             walk_prices       = {"entry": walk_levels},
             traces            = order_traces if order_traces else None,

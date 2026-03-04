@@ -27,7 +27,7 @@ from ws_feed_service.redis_writer import RedisWriter
 from ws_feed_service.order_consumer import OrderConsumer
 
 from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S
-from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions
+from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions, check_orderbook_keys
 from database import SessionLocal
 from models import BinaryOption, BOResult
 
@@ -525,7 +525,36 @@ async def main():
                 # Subscribe new tokens on main thread (needs asyncio for WS resubscribe)
                 if feed is not None and new_token_ids:
                     feed.add_tokens(new_token_ids)
+
+                # Seed initial orderbook data for newly created sessions.
+                # ensure_future_sessions stores books in registry._initial_books;
+                # pop and write to Redis so new sessions have orderbook data
+                # before the first WS event arrives.
+                if created:
+                    from decimal import Decimal
+                    seed_books = registry.pop_initial_books()
+                    if seed_books:
+                        for token_id, (bids, asks) in seed_books.items():
+                            dec_bids = [(Decimal(str(p)), Decimal(str(s))) for p, s in bids]
+                            dec_asks = [(Decimal(str(p)), Decimal(str(s))) for p, s in asks]
+                            await writer.update_orderbook(token_id, dec_bids, dec_asks)
+                            best_ask = min((p for p, _ in asks), default=None)
+                            best_bid = max((p for p, _ in bids), default=None)
+                            if best_ask is not None:
+                                await writer.update_price(token_id, best_ask, best_bid)
+                        log.info(
+                            "Session lifecycle: seeded %d initial orderbook(s) from REST",
+                            len(seed_books),
+                        )
+
                 cleanup_expired_sessions(session_manager, sync_redis)
+
+                # Health check: verify all active/prefetch sessions have orderbook keys
+                await _loop.run_in_executor(
+                    None,
+                    check_orderbook_keys,
+                    session_manager, sync_redis, registry,
+                )
             except Exception as exc:
                 log.error("Session lifecycle tick error: %s", exc)
             await asyncio.sleep(SESSION_LIFECYCLE_TICK_S)

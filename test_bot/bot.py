@@ -209,6 +209,13 @@ def build_trade(
         else:
             p["ttl"] = random.choice([30, 60, 120, 180, 300])
 
+    # ~20% of MARKET orders get a ceiling_price + order_type (FAK/FOK)
+    if not is_limit and random.random() < 0.20:
+        ref = best_ask or 0.50
+        # ceiling_price: sometimes below market, sometimes above
+        p["ceiling_price"] = round(random.uniform(max(0.01, ref - 0.10), min(0.99, ref + 0.15)), 2)
+        p["order_type"] = random.choice(["FAK", "FOK"])
+
     if target_ts is not None:
         p["timestamp"] = target_ts
 
@@ -238,6 +245,12 @@ def build_random_btc_trade(profile: dict) -> dict:
             ttl_lo, ttl_hi = profile["ttl_range"]
             payload["ttl"] = random.choice(range(ttl_lo, ttl_hi + 1, 5))
 
+    # ~20% of MARKET orders get ceiling_price + order_type (FAK/FOK)
+    if not is_limit and random.random() < 0.20:
+        ref_price = 0.50  # fallback reference
+        payload["ceiling_price"] = round(random.uniform(max(0.01, ref_price - 0.10), min(0.99, ref_price + 0.15)), 2)
+        payload["order_type"] = random.choice(["FAK", "FOK"])
+
     if random.random() < 0.30:
         payload["reason"] = random.choice(REASONS)
 
@@ -261,12 +274,14 @@ def random_trader_loop(bot_name: str, api_key: str, profile: dict) -> None:
             payload = build_random_btc_trade(profile)
             otype = "LIMIT" if payload.get("limit_price") else "MKT"
             ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
+            ceil_str = f" ceil={payload['ceiling_price']}" if payload.get("ceiling_price") else ""
+            ot_str = f" {payload['order_type']}" if payload.get("order_type") else ""
             log.info(
-                "%s [random] %s %s $%.2f%s%s",
+                "%s [random] %s %s $%.2f%s%s%s%s",
                 bot_name, otype, payload["forecast"],
                 payload["amount"],
                 f" @{payload['limit_price']}" if payload.get("limit_price") else "",
-                ttl_str,
+                ttl_str, ot_str, ceil_str,
             )
             place_trade(api_key, payload, bot_name)
         except Exception as e:
@@ -534,7 +549,83 @@ def build_case_pool(ref: float, target_ts: int | None) -> list[tuple[str, dict, 
              "limit_price": round(random.uniform(0.30, 0.70), 2)},
         ))
 
-    # ── 15. Deep LIMIT + very short TTL (should expire fast) ─────────────
+    # ── 15. FAK/FOK MARKET orders with ceiling_price ──────────────────────
+    # FAK + ceiling_price above ask → should fill at best prices up to ceiling
+    pool.append(_make_case(
+        "FAK-ceil-above",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 15.0, "order_type": "FAK",
+         "ceiling_price": round(min(0.99, ref + 0.10), 2)},
+    ))
+    # FAK + ceiling_price at ask → should fill at ask
+    pool.append(_make_case(
+        "FAK-ceil-at-ask",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "order_type": "FAK",
+         "ceiling_price": round(ref, 2)},
+    ))
+    # FAK + ceiling_price below ask → should be rejected (ceiling < best_ask)
+    pool.append(_make_case(
+        "FAK-ceil-below",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "order_type": "FAK",
+         "ceiling_price": round(max(0.01, ref - 0.05), 2)},
+        expect_fail=True,
+    ))
+    # FOK + ceiling_price above ask, small amount → should fill
+    pool.append(_make_case(
+        "FOK-ceil-above",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 5.0, "order_type": "FOK",
+         "ceiling_price": round(min(0.99, ref + 0.10), 2)},
+    ))
+    # FOK + large amount (likely insufficient liquidity) → may reject
+    pool.append(_make_case(
+        "FOK-ceil-large",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 500.0, "order_type": "FOK",
+         "ceiling_price": round(min(0.99, ref + 0.05), 2)},
+    ))
+    # FAK without ceiling_price → normal MARKET fill
+    pool.append(_make_case(
+        "FAK-no-ceil",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "order_type": "FAK"},
+    ))
+    # FOK without ceiling_price → normal MARKET fill
+    pool.append(_make_case(
+        "FOK-no-ceil",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "RED",
+         "amount": 8.0, "order_type": "FOK"},
+    ))
+
+    # ── 16. Invalid ceiling_price / order_type ───────────────────────────
+    pool.append(_make_case(
+        "BAD-ceil=0",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "ceiling_price": 0.0, "order_type": "FAK"},
+        expect_fail=True,
+    ))
+    pool.append(_make_case(
+        "BAD-ceil=1",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "ceiling_price": 1.0, "order_type": "FAK"},
+        expect_fail=True,
+    ))
+    pool.append(_make_case(
+        "BAD-ceil-neg",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "ceiling_price": -0.5, "order_type": "FAK"},
+        expect_fail=True,
+    ))
+    pool.append(_make_case(
+        "BAD-order-type",
+        {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
+         "amount": 10.0, "order_type": "GTC"},
+        expect_fail=True,
+    ))
+
+    # ── 17. Deep LIMIT + very short TTL (should expire fast) ─────────────
     pool.append(_make_case(
         "deep-LMT+1s",
         {"symbol": "BTC", "timeframe": "M5", "forecast": "GREEN",
@@ -668,16 +759,19 @@ def place_case(api_key: str, tag: str, payload: dict, bot_name: str,
     offset_str = f" A+{payload['session_offset']}" if payload.get("session_offset") else ""
     ttl_str = f" TTL={payload['ttl']}s" if payload.get("ttl") else ""
     slip_str = f" slip={payload['slippage_tolerance']}" if payload.get("slippage_tolerance") else ""
+    ceil_str = f" ceil={payload['ceiling_price']}" if payload.get("ceiling_price") else ""
+    ot_str = f" {payload['order_type']}" if payload.get("order_type") else ""
 
     if r.ok:
         d = r.json()
         lvl = log.warning if expect_fail else log.info
         prefix = "UNEXPECTED OK" if expect_fail else "CASE OK"
         lvl(
-            "%s [%s] %s %s %s %s $%.2f%s%s%s%s → #%d avg=%.4f",
+            "%s [%s] %s %s %s %s $%.2f%s%s%s%s%s%s → #%d avg=%.4f",
             bot_name, prefix, tag, otype,
             payload.get("symbol", "?"), payload.get("forecast", "?"),
             payload.get("amount", 0), price_str, offset_str, ttl_str, slip_str,
+            ot_str, ceil_str,
             d["id"], d.get("avg_price") or 0,
         )
     else:

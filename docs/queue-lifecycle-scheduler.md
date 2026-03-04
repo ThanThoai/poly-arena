@@ -40,7 +40,7 @@ For each non-ARCHIVED session where `now > candle_open + period + 10s`:
 3. Delete Redis keys:
    - `queue:orders:{session_id}`
    - `orderbook:{SYM}:{TF}:UP:{candle_open}`
-   - `orderbook:{SYM}:{TF}:DOWN:{candle_open}`
+- `orderbook:{SYM}:{TF}:DOWN:{candle_open}`
 
 ### Configuration (`config/timing.py`)
 

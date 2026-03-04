@@ -77,7 +77,7 @@ def _run_balance_snapshot() -> None:
         # Align to M5 candle boundary (floor to nearest 5 min)
         candle_open = int(now.timestamp()) // 300 * 300
         session_label = f"M5:{candle_open}"
-        count = snapshot_all_user_balances(db, session_label=session_label)
+        count = snapshot_all_user_balances(db, session_label=session_label, candle_open=candle_open)
         log.info("Balance snapshot: %d users (session=%s)", count, session_label)
     except Exception as exc:
         log.error("Balance snapshot job error: %s", exc)

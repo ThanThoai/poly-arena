@@ -103,12 +103,14 @@ class TestExpectedCandleOpens:
 # ── Tests: ensure_future_sessions ────────────────────────────────────────────
 
 
-def _mock_resolve_tokens(sym, tf, candle_open):
-    """Mock _resolve_tokens that returns deterministic UP+DOWN tokens."""
-    return {
+def _mock_resolve_tokens(sym, tf, candle_open, pm=None):
+    """Mock _resolve_tokens that returns deterministic UP+DOWN tokens + empty books."""
+    tokens = {
         "UP": f"tok-{sym}-{tf}-UP-{candle_open}",
         "DOWN": f"tok-{sym}-{tf}-DOWN-{candle_open}",
     }
+    initial_books = {}
+    return tokens, initial_books
 
 
 class TestEnsureFutureSessions:
@@ -175,7 +177,7 @@ class TestEnsureFutureSessions:
         writer = MagicMock()
 
         # Don't populate any tokens — all resolution should fail
-        with patch("ws_feed_service.session_lifecycle._resolve_tokens", return_value={}):
+        with patch("ws_feed_service.session_lifecycle._resolve_tokens", return_value=({}, {})):
             created, new_token_ids = ensure_future_sessions(sm, None, writer, registry)
 
         assert created == 0

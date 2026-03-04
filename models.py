@@ -109,8 +109,11 @@ class UserBalanceSnapshot(Base):
     balance     = Column(Numeric(18, 8, asdecimal=False), nullable=False)
     bot_balance = Column(Numeric(18, 8, asdecimal=False), nullable=False)
     available   = Column(Numeric(18, 8, asdecimal=False), nullable=False)
-    session_id  = Column(String(50), nullable=True)
-    recorded_at = Column(DateTime(timezone=True), default=_now)
+    session_id    = Column(String(50), nullable=True)
+    session_pnl   = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+    prev_balance  = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+    bot_pnl       = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+    recorded_at   = Column(DateTime(timezone=True), default=_now)
 
 
 class BinaryOption(Base):
@@ -122,6 +125,7 @@ class BinaryOption(Base):
     timeframe   = Column(SAEnum(BOTimeframe, create_constraint=False), nullable=False)
     forecast    = Column(SAEnum(BOForecast, create_constraint=False), nullable=False)
     amount      = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+    original_amount = Column(Numeric(18, 8, asdecimal=False), nullable=True)  # original budget before partial-fill adjustment
     result      = Column(SAEnum(BOResult, create_constraint=False), default=BOResult.PENDING)
     profit      = Column(Numeric(18, 8, asdecimal=False), nullable=True)
     price_open  = Column(Numeric(18, 8, asdecimal=False), nullable=True)   # Binance candle open price
@@ -138,6 +142,8 @@ class BinaryOption(Base):
     # ── Order type ───────────────────────────────────────────────────────────
     limit_price  = Column(Numeric(18, 8, asdecimal=False), nullable=True)    # None = MARKET, set = LIMIT order
     entry_fee    = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)  # fee charged at fill (taker=30bps, maker=0)
+    order_type   = Column(String(10), nullable=True, default="FAK")          # FAK (Fill-And-Kill) or FOK (Fill-Or-Kill)
+    ceiling_price  = Column(Numeric(18, 8, asdecimal=False), nullable=True)    # max price willing to pay
 
     # ── Bracket Order (TP/SL) tracking ──────────────────────────────────────
     tp_price     = Column(Numeric(18, 8, asdecimal=False), nullable=True)    # Take Profit price (optional)

@@ -79,7 +79,11 @@ def record_user_balance(
     )
 
 
-def snapshot_all_user_balances(db: Session, session_label: Optional[str] = None) -> int:
+def snapshot_all_user_balances(
+    db: Session,
+    session_label: Optional[str] = None,
+    candle_open: Optional[int] = None,
+) -> int:
     """Snapshot balance for all active users. Returns number of snapshots created."""
     users = db.query(User).filter(User.is_active == True).all()
     count = 0
@@ -95,12 +99,42 @@ def snapshot_all_user_balances(db: Session, session_label: Optional[str] = None)
         available = round((user.initial_balance or 0) - allocated, 8)
         balance = round(bot_balance + available, 8)
 
+        # Previous balance from most recent snapshot
+        prev_snap = (
+            db.query(UserBalanceSnapshot)
+            .filter(UserBalanceSnapshot.user_id == user.id)
+            .order_by(UserBalanceSnapshot.recorded_at.desc())
+            .first()
+        )
+        prev_balance = prev_snap.balance if prev_snap else None
+
+        # Session P&L: balance delta from previous snapshot
+        session_pnl = round(balance - prev_balance, 8) if prev_balance is not None else None
+
+        # Bot P&L: sum of trade profits settled in this candle session
+        bot_pnl = None
+        if candle_open is not None:
+            user_bot_names = [b.bot_name for b in active_bots]
+            if user_bot_names:
+                bot_pnl = (
+                    db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
+                    .filter(
+                        BinaryOption.bot_name.in_(user_bot_names),
+                        BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
+                        BinaryOption.candle_open == candle_open,
+                    )
+                    .scalar()
+                ) or 0.0
+
         db.add(UserBalanceSnapshot(
             user_id=user.id,
             balance=balance,
             bot_balance=bot_balance,
             available=available,
             session_id=session_label,
+            session_pnl=session_pnl,
+            prev_balance=prev_balance,
+            bot_pnl=bot_pnl,
             recorded_at=datetime.now(timezone.utc),
         ))
         count += 1

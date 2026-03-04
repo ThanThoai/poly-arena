@@ -76,6 +76,10 @@ def ensure_future_sessions(
     Returns (created_count, new_token_ids).
     Note: Does NOT call feed.add_tokens() — caller is responsible for WS subscription
     (needed when running in executor thread where asyncio context is unavailable).
+
+    Side effects: updates registry._future_mapping, registry._token_sessions,
+    and registry._initial_books so that _register_writer() and the caller's
+    initial-book seeding logic include the newly resolved tokens.
     """
     now_ts = int(time.time())
     created = 0
@@ -84,37 +88,74 @@ def ensure_future_sessions(
     # Build set of existing session_ids for fast lookup
     existing_sessions = {s.session_id for s in sm.list_sessions()}
 
-    for sym in SYMBOLS:
-        for tf in TIMEFRAMES:
-            expected_opens = _expected_candle_opens(tf, now_ts)
+    # Lazy-init: reuse a single HTTP client for all REST calls in this tick
+    _pm = None
 
-            for candle_open in expected_opens:
-                session_id = f"{sym}:{tf}:{candle_open}"
-                if session_id in existing_sessions:
-                    continue
+    try:
+        for sym in SYMBOLS:
+            for tf in TIMEFRAMES:
+                expected_opens = _expected_candle_opens(tf, now_ts)
 
-                # Resolve UP+DOWN tokens via REST API directly
-                tokens = _resolve_tokens(sym, tf, candle_open)
-                if not tokens:
-                    # Polymarket hasn't published this market yet — retry next tick
-                    continue
+                for candle_open in expected_opens:
+                    session_id = f"{sym}:{tf}:{candle_open}"
+                    if session_id in existing_sessions:
+                        continue
 
-                # Determine initial state
-                period_s = TF_SECONDS[tf]
-                current_open = now_ts - (now_ts % period_s)
-                initial_state = SessionState.ACTIVE if candle_open == current_open else SessionState.PREFETCH
+                    # Create shared client on first actual resolve
+                    if _pm is None:
+                        try:
+                            from services.polymarket import PolymarketClient
+                            from config.timing import HTTP_TIMEOUT
+                            _pm = PolymarketClient(timeout=HTTP_TIMEOUT)
+                        except Exception:
+                            _pm = None  # Fall through — _resolve_tokens creates its own
 
-                # Create session
-                sm.create_session(session_id, tokens, initial_state=initial_state)
-                created += 1
+                    # Resolve UP+DOWN tokens + fetch initial orderbook depth
+                    tokens, initial_books = _resolve_tokens(sym, tf, candle_open, pm=_pm)
+                    if not tokens:
+                        # Polymarket hasn't published this market yet — retry next tick
+                        continue
 
-                # Collect new token IDs for batch WS subscription
-                all_new_token_ids.extend(tokens.values())
+                    # Determine initial state
+                    period_s = TF_SECONDS[tf]
+                    current_open = now_ts - (now_ts % period_s)
+                    initial_state = SessionState.ACTIVE if candle_open == current_open else SessionState.PREFETCH
 
-                logger.info(
-                    "Session lifecycle: created %s (state=%s, tokens=%d)",
-                    session_id, initial_state.value, len(tokens),
-                )
+                    # Create session
+                    sm.create_session(session_id, tokens, initial_state=initial_state)
+                    created += 1
+
+                    # Collect new token IDs for batch WS subscription
+                    all_new_token_ids.extend(tokens.values())
+
+                    # ── Update registry so _register_writer includes these tokens ──
+                    for direction, token_id in tokens.items():
+                        key = (sym, tf, direction)
+                        if candle_open == current_open:
+                            # Current candle: update _mapping directly
+                            registry._mapping[key] = token_id
+                        else:
+                            # Future candle: append to _future_mapping
+                            if key not in registry._future_mapping:
+                                registry._future_mapping[key] = []
+                            if token_id not in registry._future_mapping[key]:
+                                registry._future_mapping[key].append(token_id)
+                        # Track session timestamp for this token
+                        registry._token_sessions[token_id] = candle_open
+
+                    # Store initial books for Redis seeding by caller
+                    registry._initial_books.update(initial_books)
+
+                    logger.info(
+                        "Session lifecycle: created %s (state=%s, tokens=%d, books=%d)",
+                        session_id, initial_state.value, len(tokens), len(initial_books),
+                    )
+    finally:
+        if _pm is not None:
+            try:
+                _pm.close()
+            except Exception:
+                pass
 
     # Batch: re-register writer once after all sessions created
     if created:
@@ -128,33 +169,50 @@ def _resolve_tokens(
     sym: str,
     tf: str,
     candle_open: int,
-) -> dict[str, str]:
+    pm=None,
+) -> tuple[dict[str, str], dict[str, tuple[list, list]]]:
     """
-    Resolve UP+DOWN token_ids using Polymarket REST API directly.
-    No TokenRegistry dependency — avoids stale cache issues.
+    Resolve UP+DOWN token_ids and fetch initial orderbook depth.
 
-    get_token_id_at() uses an internal slug cache (TTL=300s) so most calls
-    are cache hits with no HTTP request. UP+DOWN share the same slug so
-    only 1 actual HTTP call per (sym, tf, candle_open) in the worst case.
+    Returns (tokens, initial_books) where:
+      tokens: {"UP": token_id, "DOWN": token_id}
+      initial_books: {token_id: (bids, asks)}
+
+    Accepts an optional PolymarketClient to reuse across calls.
     """
     tokens: dict[str, str] = {}
+    initial_books: dict[str, tuple[list, list]] = {}
 
     try:
         from services.polymarket import PolymarketClient
         from config.timing import HTTP_TIMEOUT
 
-        with PolymarketClient(timeout=HTTP_TIMEOUT) as pm:
+        should_close = pm is None
+        if pm is None:
+            pm = PolymarketClient(timeout=HTTP_TIMEOUT)
+
+        try:
             for direction in ("UP", "DOWN"):
                 token_id = pm.get_token_id_at(sym, tf, direction, candle_open)
                 if token_id:
                     tokens[direction] = token_id
+                    # Fetch initial orderbook depth for Redis seeding
+                    try:
+                        _, _, bids, asks = pm._fetch_book_depth(token_id)
+                        if bids or asks:
+                            initial_books[token_id] = (bids, asks)
+                    except Exception:
+                        pass  # Non-critical: WS will populate eventually
+        finally:
+            if should_close:
+                pm.close()
     except Exception as exc:
         logger.warning(
             "Session lifecycle: REST resolve failed %s %s ts=%d — %s",
             sym, tf, candle_open, exc,
         )
 
-    return tokens
+    return tokens, initial_books
 
 
 def _register_writer(writer: RedisWriter, registry: TokenRegistry) -> None:
@@ -162,6 +220,113 @@ def _register_writer(writer: RedisWriter, registry: TokenRegistry) -> None:
     writer.register_token_mapping(registry._mapping)
     fresh_sessions = {tf: registry.get_current_candle_open(tf) for tf in TIMEFRAMES}
     writer.register_session_tokens(registry.get_all_token_mapping(), fresh_sessions)
+
+
+def check_orderbook_keys(
+    sm: SessionManager,
+    sync_redis,
+    registry: TokenRegistry,
+) -> tuple[int, int]:
+    """
+    Periodic health check (every 5s): verify every non-ARCHIVED session has
+    its 2 expected orderbook Redis keys (UP + DOWN per session).
+
+    Missing keys are re-seeded from Polymarket REST API.
+
+    Returns (checked_sessions, repaired_keys).
+    """
+    checked = 0
+    repaired = 0
+    _pm = None
+
+    try:
+        for session in sm.list_sessions():
+            if session.state == SessionState.ARCHIVED:
+                continue
+
+            sym = session.symbol
+            tf = session.timeframe
+            candle_open = session.candle_open
+            checked += 1
+
+            missing_dirs: list[str] = []
+            for direction in ("UP", "DOWN"):
+                key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}"
+                try:
+                    if not sync_redis.exists(key):
+                        missing_dirs.append(direction)
+                except Exception as exc:
+                    logger.warning("OB health: Redis check failed %s: %s", key, exc)
+
+            if not missing_dirs:
+                continue
+
+            logger.warning(
+                "OB health: session %s missing %d key(s): %s",
+                session.session_id, len(missing_dirs), missing_dirs,
+            )
+
+            # Lazy-init REST client
+            if _pm is None:
+                try:
+                    from services.polymarket import PolymarketClient
+                    from config.timing import HTTP_TIMEOUT
+                    _pm = PolymarketClient(timeout=HTTP_TIMEOUT)
+                except Exception as exc:
+                    logger.error("OB health: cannot create PolymarketClient: %s", exc)
+                    break
+
+            for direction in missing_dirs:
+                token_id = session.tokens.get(direction)
+                if not token_id:
+                    token_id = registry.get_token_id(sym, tf, direction)
+                if not token_id:
+                    logger.warning("OB health: no token_id for %s:%s:%s:%d", sym, tf, direction, candle_open)
+                    continue
+
+                try:
+                    _, _, bids, asks = _pm._fetch_book_depth(token_id)
+                    if not bids and not asks:
+                        continue
+
+                    import json as _json
+                    bids_json = _json.dumps([[float(p), float(s)] for p, s in bids])
+                    asks_json = _json.dumps([[float(p), float(s)] for p, s in asks])
+                    ob_mapping = {
+                        "bids": bids_json,
+                        "asks": asks_json,
+                        "updated_at": str(time.time()),
+                    }
+                    ob_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}"
+                    sync_redis.hset(ob_key, mapping=ob_mapping)
+                    sync_redis.expire(ob_key, 120)
+
+                    # Also write legacy key for current session
+                    period_s = TF_SECONDS[tf]
+                    now_ts = int(time.time())
+                    current_open = now_ts - (now_ts % period_s)
+                    if candle_open == current_open:
+                        legacy_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
+                        sync_redis.hset(legacy_key, mapping=ob_mapping)
+                        sync_redis.expire(legacy_key, 120)
+
+                    repaired += 1
+                    logger.info(
+                        "OB health: repaired %s:%s:%s:%d (%d bids, %d asks)",
+                        sym, tf, direction, candle_open, len(bids), len(asks),
+                    )
+                except Exception as exc:
+                    logger.error("OB health: REST fetch failed %s:%s:%s:%d — %s", sym, tf, direction, candle_open, exc)
+    finally:
+        if _pm is not None:
+            try:
+                _pm.close()
+            except Exception:
+                pass
+
+    if repaired:
+        logger.info("OB health: checked %d session(s), repaired %d key(s)", checked, repaired)
+    return checked, repaired
 
 
 def cleanup_expired_sessions(

@@ -19,6 +19,8 @@ class BOCreate(BaseModel):
     slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
     session_offset:     Optional[int]   = Field(default=0, ge=0, le=3)  # 0 = current, 1-3 = future sessions
     timestamp:          Optional[int]   = None   # Unix timestamp (seconds) to target a specific candle session
+    order_type:  Optional[str]   = "FAK"  # FAK (Fill-And-Kill) or FOK (Fill-Or-Kill)
+    ceiling_price: Optional[float] = None   # Max price willing to pay; levels above this are skipped
 
     @field_validator("amount")
     @classmethod
@@ -55,6 +57,20 @@ class BOCreate(BaseModel):
             raise ValueError("timestamp must be a positive Unix timestamp (seconds)")
         return v
 
+    @field_validator("order_type")
+    @classmethod
+    def order_type_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("FAK", "FOK"):
+            raise ValueError("order_type must be 'FAK' or 'FOK'")
+        return v
+
+    @field_validator("ceiling_price")
+    @classmethod
+    def ceiling_price_in_range(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and not (0 < v < 1):
+            raise ValueError("ceiling_price must be between 0 and 1 (exclusive)")
+        return v
+
 
 
 class BOResponse(BaseModel):
@@ -64,6 +80,7 @@ class BOResponse(BaseModel):
     timeframe:          BOTimeframe
     forecast:           BOForecast
     amount:             float
+    original_amount:    Optional[float] = None
     result:             BOResult
     profit:             Optional[float]
     price_open:         Optional[float]
@@ -95,8 +112,37 @@ class BOResponse(BaseModel):
     session_id:      Optional[str]   = None
     candle_open:     Optional[int]   = None
     entry_fee:       Optional[float] = None
+    order_type:      Optional[str]   = None
+    ceiling_price:     Optional[float] = None
+    # Computed fill breakdown
+    requested_quantity: Optional[float] = None
+    filled_quantity:    Optional[float] = None
+    unfilled_quantity:  Optional[float] = None
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _compute_fill_quantities(self) -> "BOResponse":
+        # filled_quantity = num_shares (actual shares filled)
+        self.filled_quantity = self.num_shares
+
+        # requested_quantity: how many shares the original budget would buy
+        if self.limit_price and self.limit_price > 0:
+            budget = self.original_amount if self.original_amount is not None else self.amount
+            self.requested_quantity = round(budget / self.limit_price, 8)
+        elif self.num_shares is not None:
+            # MARKET orders are always fully filled at creation
+            self.requested_quantity = self.num_shares
+
+        # unfilled_quantity: only meaningful for partial fills
+        if (
+            self.requested_quantity is not None
+            and self.filled_quantity is not None
+            and self.requested_quantity > self.filled_quantity
+        ):
+            self.unfilled_quantity = round(self.requested_quantity - self.filled_quantity, 8)
+
+        return self
 
 
 class BOStats(BaseModel):
@@ -206,11 +252,14 @@ class UserBalanceHistoryResponse(BaseModel):
 class UserBalanceSnapshotResponse(BaseModel):
     id:          int
     user_id:     int
-    balance:     float
-    bot_balance: float
-    available:   float
-    session_id:  Optional[str] = None
-    recorded_at: Optional[datetime] = None
+    balance:      float
+    bot_balance:  float
+    available:    float
+    session_id:   Optional[str] = None
+    session_pnl:  Optional[float] = None
+    prev_balance: Optional[float] = None
+    bot_pnl:      Optional[float] = None
+    recorded_at:  Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
