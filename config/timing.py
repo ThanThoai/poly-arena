@@ -68,6 +68,12 @@ SESSION_PRE_CREATE_BUFFER_S = 20   # create next session 20s before candle bound
 SESSION_CLEANUP_DELAY_S = 10       # cleanup 10s after session period ends
 SESSION_LIFECYCLE_TICK_S = 5       # lifecycle check interval
 
+# ── REST Poller ──────────────────────────────────────────────────────────────
+
+REST_POLL_INTERVAL_S = 0.2      # 200ms between poll cycles
+REST_POLL_TIMEOUT_S = 2.0       # HTTP timeout per REST fetch
+REST_POLL_MAX_CONCURRENT = 8    # Max concurrent REST fetches
+
 # ── Timeframe Durations ─────────────────────────────────────────────────────
 
 TF_SECONDS: dict[str, int] = {

@@ -71,6 +71,10 @@ class SessionEngine:
         self.timeframe = parts[1] if len(parts) > 1 else ""
         self.candle_open = int(parts[2]) if len(parts) > 2 else 0
 
+        # When False, WS events update book data but skip matching/bracket monitoring.
+        # REST poller handles matching instead.
+        self.ws_matching_enabled = True
+
         # Lifecycle timestamps
         self.created_at = datetime.now(timezone.utc)
         self.activated_at: Optional[datetime] = None
@@ -151,13 +155,15 @@ class SessionEngine:
 
         if etype == "book":
             book.apply_snapshot(event.get("bids", []), event.get("asks", []))
-            book.run_matching()
-            book.monitor_bracket_orders()
+            if self.ws_matching_enabled:
+                book.run_matching()
+                book.monitor_bracket_orders()
 
         elif etype == "price_change":
             book.apply_changes(event.get("changes", []))
-            book.run_matching()
-            book.monitor_bracket_orders()
+            if self.ws_matching_enabled:
+                book.run_matching()
+                book.monitor_bracket_orders()
 
         elif etype == "best_bid_ask":
             self._apply_best_bid_ask(book, asset_id, event)
@@ -168,7 +174,8 @@ class SessionEngine:
                 size=event.get("size", "0"),
                 side=event.get("side", ""),
             )
-            book.monitor_bracket_orders()
+            if self.ws_matching_enabled:
+                book.monitor_bracket_orders()
 
     def _apply_best_bid_ask(self, book: ShadowOrderbook, asset_id: str, event: dict) -> None:
         """
@@ -210,13 +217,26 @@ class SessionEngine:
 
             if changes:
                 book.apply_changes(changes)
-                book.run_matching()
+                if self.ws_matching_enabled:
+                    book.run_matching()
             else:
                 with book._lock:
                     book.last_update = datetime.now(timezone.utc)
 
         # Trigger bracket monitoring
+        if self.ws_matching_enabled:
+            book.monitor_bracket_orders()
+
+    # ── REST poller helpers ─────────────────────────────────────────────────────
+
+    def try_match_pending(self, book: ShadowOrderbook) -> None:
+        """Run matching + bracket monitoring on a specific book (called by REST poller)."""
+        book.run_matching()
         book.monitor_bracket_orders()
+
+    def get_token_id(self, direction: str) -> Optional[str]:
+        """Return the token_id for a given direction (UP/DOWN)."""
+        return self.tokens.get(direction)
 
     # ── Order placement ───────────────────────────────────────────────────────
 

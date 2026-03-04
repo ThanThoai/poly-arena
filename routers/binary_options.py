@@ -164,29 +164,126 @@ def _compute_stats(items: list):
 
 _DEFAULT_SLIPPAGE_TOLERANCE = 0.10
 
+# Shared PolymarketClient for order-time REST fetches
+_pm_client: Optional[PolymarketClient] = None
+
+
+def _get_pm_client() -> PolymarketClient:
+    """Return a shared PolymarketClient instance."""
+    global _pm_client
+    if _pm_client is None:
+        _pm_client = PolymarketClient(timeout=HTTP_TIMEOUT_FAST)
+    return _pm_client
+
+
+def _resolve_token_id(
+    symbol: str, timeframe: str, direction: str,
+    candle_open: int = 0,
+) -> Optional[str]:
+    """Resolve token_id from Redis token mapping for a (symbol, tf, direction, candle_open).
+
+    Reads ``tokens:{SYM}:{TF}`` JSON, matches candle_open to find the correct token.
+    Returns None if mapping is unavailable.
+    """
+    try:
+        from services.redis_client import get_sync_redis
+        sr = get_sync_redis()
+        key = f"tokens:{symbol}:{timeframe}"
+        raw = sr.get(key)
+        if not raw:
+            return None
+        data = json.loads(raw)
+        dir_data = data.get(direction)
+        if not dir_data:
+            return None
+
+        # Check current session
+        current = dir_data.get("current")
+        if current and current.get("session") == candle_open:
+            return current.get("token_id")
+
+        # Check future sessions
+        for entry in dir_data.get("future", []):
+            if entry.get("session") == candle_open:
+                return entry.get("token_id")
+
+        # Fallback: return current token if candle_open matches approximately
+        if current and current.get("token_id"):
+            return current.get("token_id")
+
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_orderbook_from_redis(
+    symbol: str, timeframe: str, direction: str,
+    candle_open: int = 0,
+) -> Optional[list[list]]:
+    """Try to read asks from Redis orderbook snapshot. Returns None if unavailable."""
+    try:
+        from services.redis_client import get_sync_redis
+        sr = get_sync_redis()
+        key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
+        data = sr.hgetall(key)
+        if not data or "asks" not in data:
+            return None
+        asks = json.loads(data["asks"])
+        return asks if asks else None
+    except Exception:
+        return None
+
+
+def _fetch_orderbook_rest(
+    symbol: str, timeframe: str, direction: str,
+    candle_open: int = 0,
+) -> list[list]:
+    """Fetch asks from Polymarket REST API, with Redis fallback.
+
+    Primary: resolve token_id → call Polymarket CLOB /book endpoint.
+    Fallback: read from Redis orderbook snapshot (populated by RestPoller).
+
+    Returns sorted asks list (ascending by price) as [[price, size], ...].
+    Raises HTTPException(503) if both sources are unavailable.
+    """
+    # 1. Try Polymarket REST API
+    token_id = _resolve_token_id(symbol, timeframe, direction, candle_open)
+    if token_id:
+        try:
+            pm = _get_pm_client()
+            bids_raw, asks_raw = pm.fetch_book_raw(token_id)
+            if asks_raw:
+                sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
+                return [[float(a["price"]), float(a["size"])] for a in sorted_asks]
+        except Exception as exc:
+            logger.warning("REST orderbook fetch failed for %s: %s", token_id[:16], exc)
+
+    # 2. Fallback to Redis orderbook snapshot
+    redis_asks = _fetch_orderbook_from_redis(symbol, timeframe, direction, candle_open)
+    if redis_asks:
+        return redis_asks
+
+    raise HTTPException(
+        status_code=503,
+        detail="Orderbook unavailable — both REST API and cache failed",
+    )
+
 
 def _snapshot_best_ask(
     symbol: str, timeframe: str, direction: str,
     candle_open: int = 0,
 ) -> Optional[float]:
-    """Read the best ask from the session-keyed Redis orderbook snapshot.
+    """Fetch the best ask from Polymarket REST API.
 
-    Key format: ``orderbook:{SYM}:{TF}:{DIR}:{candle_open}``
     Returns None if unavailable.
     """
     try:
-        from services.redis_client import get_sync_redis
-        sr = get_sync_redis()
-
-        key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
-        data = sr.hgetall(key)
-
-        if not data or "asks" not in data:
-            return None
-        asks = json.loads(data["asks"])
+        asks = _fetch_orderbook_rest(symbol, timeframe, direction, candle_open)
         if not asks:
             return None
         return float(asks[0][0])
+    except HTTPException:
+        return None
     except Exception:
         return None
 
@@ -200,9 +297,7 @@ def _fill_market_from_snapshot(
     ceiling_price: Optional[float] = None,
 ) -> Tuple[float, float, list]:
     """
-    Simulate a BUY by walking the asks from the session-keyed Redis orderbook.
-
-    Key format: ``orderbook:{SYM}:{TF}:{DIR}:{candle_open}``
+    Simulate a BUY by walking asks fetched from Polymarket REST API.
 
     Walks levels until ``amount`` is spent or the price cap is exceeded.
 
@@ -227,36 +322,11 @@ def _fill_market_from_snapshot(
     Raises
     ------
     HTTPException(503)
-        If the orderbook snapshot is unavailable or has no asks.
+        If the orderbook is unavailable or has no asks.
     HTTPException(400)
         If FOK order cannot be fully filled, or slippage exceeded.
     """
-    from services.redis_client import get_sync_redis
-
-    sr = get_sync_redis()
-
-    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
-    data = sr.hgetall(key)
-
-    if not data or "asks" not in data:
-        raise HTTPException(
-            status_code=503,
-            detail="Orderbook snapshot unavailable — matching engine may not be running",
-        )
-
-    try:
-        asks = json.loads(data["asks"])
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(
-            status_code=503,
-            detail="Orderbook snapshot malformed",
-        )
-
-    if not asks:
-        raise HTTPException(
-            status_code=503,
-            detail="Orderbook snapshot has no asks",
-        )
+    asks = _fetch_orderbook_rest(symbol, timeframe, direction, candle_open)
 
     # Price cap: LIMIT orders use limit_price; MARKET orders use slippage from best_ask
     if limit_price is not None:
@@ -325,7 +395,7 @@ def _fill_market_from_snapshot(
             )
         raise HTTPException(
             status_code=503,
-            detail="Could not fill any shares from orderbook snapshot",
+            detail="Could not fill any shares from orderbook",
         )
 
     avg_price = float(total_cost / total_qty)
@@ -339,7 +409,7 @@ def _fill_limit_from_snapshot(
     candle_open: int = 0,
 ) -> Tuple[float, float, list, float]:
     """
-    Fill a LIMIT order by walking asks up to limit_price.
+    Fill a LIMIT order by walking asks fetched from Polymarket REST API.
 
     Only fills levels where ask price <= limit_price.  Any budget left
     over (because the orderbook ran out of liquidity at or below limit_price)
@@ -357,33 +427,9 @@ def _fill_limit_from_snapshot(
     Raises
     ------
     HTTPException(503)
-        If orderbook snapshot is unavailable.
+        If orderbook is unavailable.
     """
-    from services.redis_client import get_sync_redis
-
-    sr = get_sync_redis()
-    key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
-    data = sr.hgetall(key)
-
-    if not data or "asks" not in data:
-        raise HTTPException(
-            status_code=503,
-            detail="Orderbook snapshot unavailable — matching engine may not be running",
-        )
-
-    try:
-        asks = json.loads(data["asks"])
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(
-            status_code=503,
-            detail="Orderbook snapshot malformed",
-        )
-
-    if not asks:
-        raise HTTPException(
-            status_code=503,
-            detail="Orderbook snapshot has no asks",
-        )
+    asks = _fetch_orderbook_rest(symbol, timeframe, direction, candle_open)
 
     max_price = Decimal(str(limit_price))
     budget = Decimal(str(amount))

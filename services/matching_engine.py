@@ -465,6 +465,19 @@ class ShadowOrderbook:
             return True
         return (datetime.now(timezone.utc) - self.last_update).total_seconds() > max_age_s
 
+    def has_pending_orders(self) -> bool:
+        """Return True if there are PENDING or PARTIAL orders in this book."""
+        with self._lock:
+            return any(
+                o for o in self._virtual_orders
+                if o.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
+            )
+
+    def has_bracket_orders(self) -> bool:
+        """Return True if there are filled orders with active TP/SL brackets."""
+        with self._lock:
+            return any(o for o in self._virtual_orders if o.is_eligible_for_bracket)
+
     def expire_book(self) -> int:
         """Mark this book as expired (token rotated).
 

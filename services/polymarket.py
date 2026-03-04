@@ -21,6 +21,7 @@ from config.timing import HTTP_TIMEOUT, SLUG_CACHE_TTL_S, TF_SECONDS
 
 _GAMMA_URL = "https://gamma-api.polymarket.com/events"
 _CLOB_URL = "https://clob.polymarket.com/book"
+_CLOB_BOOKS_URL = "https://clob.polymarket.com/books"
 
 # Timeframe string normalization (accept both "M5" and "5m" styles)
 _TF_NORMALIZE: dict[str, str] = {
@@ -172,6 +173,34 @@ class PolymarketClient:
         min_ask = float(raw_asks[0]["price"]) if raw_asks else 0.0
         max_bid = float(raw_bids[0]["price"]) if raw_bids else 0.0
         return min_ask, max_bid, bid_depth, ask_depth
+
+    def fetch_books_batch(self, token_ids: list[str]) -> dict[str, tuple[list[dict], list[dict]]]:
+        """Fetch orderbooks for multiple tokens in a single POST /books request.
+
+        Returns a dict mapping token_id -> (bids, asks).
+        """
+        if not token_ids:
+            return {}
+        body = [{"token_id": tid} for tid in token_ids]
+        resp = self._http.post(_CLOB_BOOKS_URL, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        result: dict[str, tuple[list[dict], list[dict]]] = {}
+        for i, entry in enumerate(data):
+            tid = token_ids[i]
+            result[tid] = (entry.get("bids", []), entry.get("asks", []))
+        return result
+
+    def fetch_book_raw(self, token_id: str) -> tuple[list[dict], list[dict]]:
+        """Return (bids, asks) as raw dicts compatible with ShadowOrderbook.apply_snapshot().
+
+        Each entry is {"price": "0.55", "size": "100"} — the format returned
+        by the Polymarket CLOB /book endpoint.
+        """
+        resp = self._http.get(_CLOB_URL, params={"token_id": token_id})
+        resp.raise_for_status()
+        book = resp.json()
+        return book.get("bids", []), book.get("asks", [])
 
     # ── public API ────────────────────────────────────────────────────────────
 
