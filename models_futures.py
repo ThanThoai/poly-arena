@@ -38,6 +38,14 @@ class FuturesPositionStatus(str, enum.Enum):
     LIQUIDATED = "LIQUIDATED"
 
 
+# Shared SAEnum instances — reused across tables to avoid PostgreSQL
+# "DuplicateObject: type already exists" when create_all() runs.
+_side_enum = SAEnum(FuturesSide, name="futures_side_enum", create_constraint=False)
+_order_type_enum = SAEnum(FuturesOrderType, name="futures_order_type_enum", create_constraint=False)
+_order_status_enum = SAEnum(FuturesOrderStatus, name="futures_order_status_enum", create_constraint=False)
+_position_status_enum = SAEnum(FuturesPositionStatus, name="futures_position_status_enum", create_constraint=False)
+
+
 class FuturesPosition(Base):
     """An open or closed futures position."""
     __tablename__ = "futures_positions"
@@ -46,9 +54,9 @@ class FuturesPosition(Base):
     bot_name = Column(String(100), nullable=False, index=True)
     symbol = Column(String(20), nullable=False)            # BTC, ETH, SOL, XRP
     exchange = Column(String(20), nullable=False, default="binance")
-    side = Column(SAEnum(FuturesSide, name="futures_side_enum", create_constraint=False), nullable=False)
+    side = Column(_side_enum, nullable=False)
     status = Column(
-        SAEnum(FuturesPositionStatus, name="futures_position_status_enum", create_constraint=False),
+        _position_status_enum,
         nullable=False,
         default=FuturesPositionStatus.OPEN,
     )
@@ -97,13 +105,10 @@ class FuturesOrder(Base):
     bot_name = Column(String(100), nullable=False, index=True)
     symbol = Column(String(20), nullable=False)
     exchange = Column(String(20), nullable=False, default="binance")
-    side = Column(SAEnum(FuturesSide, name="futures_side_enum", create_constraint=False), nullable=False)
-    order_type = Column(
-        SAEnum(FuturesOrderType, name="futures_order_type_enum", create_constraint=False),
-        nullable=False,
-    )
+    side = Column(_side_enum, nullable=False)
+    order_type = Column(_order_type_enum, nullable=False)
     status = Column(
-        SAEnum(FuturesOrderStatus, name="futures_order_status_enum", create_constraint=False),
+        _order_status_enum,
         nullable=False,
         default=FuturesOrderStatus.PENDING,
     )
