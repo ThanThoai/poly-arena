@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Reset tất cả bot: xoá trade, balance history, achievements → reset balance = 10000.
+Reset tất cả bot: xoá trade (BO + futures), balance history, achievements → reset balance.
 
 Thực hiện:
-  1. Xoá toàn bộ binary_options (lịch sử lệnh)
-  2. Xoá toàn bộ balance_history (snapshot balance bot)
-  3. Xoá toàn bộ bot_achievements
-  4. Xoá toàn bộ user_balance_history + user_balance_snapshots
-  5. Reset mỗi bot: balance = initial_balance = 10000, status = ACTIVE
-  6. Reset mỗi user: initial_balance phù hợp với số bot × 10000
+  1. Xoá toàn bộ binary_options (lịch sử lệnh BO)
+  2. Xoá toàn bộ futures_orders (lệnh limit pending)
+  3. Xoá toàn bộ futures_positions (lịch sử vị thế futures)
+  4. Xoá toàn bộ balance_history (snapshot balance bot)
+  5. Xoá toàn bộ bot_achievements
+  6. Xoá toàn bộ user_balance_history + user_balance_snapshots
+  7. Reset mỗi bot: balance = initial_balance = 10000, status = ACTIVE
+  8. Reset mỗi user: initial_balance phù hợp với số bot × 10000
 
 Hỗ trợ filter theo user hoặc bot:
     python scripts/reset_bots.py                        # dry-run tất cả
@@ -30,6 +32,7 @@ from models import (
     BalanceHistory, BinaryOption, Bot, BotAchievement, BOResult,
     User, UserBalanceHistory, UserBalanceSnapshot,
 )
+from models_futures import FuturesPosition, FuturesOrder
 
 BOT_BALANCE = 10_000.0
 
@@ -43,7 +46,7 @@ def reset(
     db = SessionLocal()
 
     try:
-        # ── Resolve target bots ──
+        # -- Resolve target bots --
         bot_q = db.query(Bot).filter(Bot.is_active == True)
 
         if bot_filter:
@@ -63,10 +66,20 @@ def reset(
         bot_names = [b.bot_name for b in bots]
         bot_ids = [b.id for b in bots]
 
-        # ── Count affected rows ──
-        trade_count = (
+        # -- Count affected rows --
+        bo_count = (
             db.query(BinaryOption)
             .filter(BinaryOption.bot_name.in_(bot_names))
+            .count()
+        )
+        fut_pos_count = (
+            db.query(FuturesPosition)
+            .filter(FuturesPosition.bot_name.in_(bot_names))
+            .count()
+        )
+        fut_ord_count = (
+            db.query(FuturesOrder)
+            .filter(FuturesOrder.bot_name.in_(bot_names))
             .count()
         )
         bh_count = (
@@ -83,28 +96,46 @@ def reset(
         prefix = "[DRY-RUN] " if not apply else ""
         scope = f"bot={bot_filter}" if bot_filter else f"user={user_filter}" if user_filter else "ALL"
         print(f"{prefix}Reset scope: {scope}")
-        print(f"  Bots to reset:          {len(bots)}")
-        print(f"  Trades to delete:       {trade_count}")
-        print(f"  BalanceHistory to delete: {bh_count}")
-        print(f"  Achievements to delete: {ach_count}")
+        print(f"  Bots to reset:              {len(bots)}")
+        print(f"  Binary options to delete:   {bo_count}")
+        print(f"  Futures positions to delete: {fut_pos_count}")
+        print(f"  Futures orders to delete:   {fut_ord_count}")
+        print(f"  BalanceHistory to delete:   {bh_count}")
+        print(f"  Achievements to delete:     {ach_count}")
         print()
 
         for bot in bots:
-            print(f"  {bot.bot_name}: ${bot.balance:,.2f} → ${BOT_BALANCE:,.2f}")
+            print(f"  {bot.bot_name}: ${bot.balance:,.2f} -> ${BOT_BALANCE:,.2f}")
 
         if not apply:
             print("\nPass --apply to execute.")
             return
 
-        # ── 1. Delete trades ──
-        deleted_trades = (
+        # -- 1. Delete binary options --
+        deleted_bo = (
             db.query(BinaryOption)
             .filter(BinaryOption.bot_name.in_(bot_names))
             .delete(synchronize_session="fetch")
         )
-        print(f"\n  Deleted {deleted_trades} trades")
+        print(f"\n  Deleted {deleted_bo} binary options")
 
-        # ── 2. Delete balance history ──
+        # -- 2. Delete futures orders (before positions due to FK) --
+        deleted_fo = (
+            db.query(FuturesOrder)
+            .filter(FuturesOrder.bot_name.in_(bot_names))
+            .delete(synchronize_session="fetch")
+        )
+        print(f"  Deleted {deleted_fo} futures orders")
+
+        # -- 3. Delete futures positions --
+        deleted_fp = (
+            db.query(FuturesPosition)
+            .filter(FuturesPosition.bot_name.in_(bot_names))
+            .delete(synchronize_session="fetch")
+        )
+        print(f"  Deleted {deleted_fp} futures positions")
+
+        # -- 4. Delete balance history --
         deleted_bh = (
             db.query(BalanceHistory)
             .filter(BalanceHistory.bot_name.in_(bot_names))
@@ -112,7 +143,7 @@ def reset(
         )
         print(f"  Deleted {deleted_bh} balance history records")
 
-        # ── 3. Delete achievements ──
+        # -- 5. Delete achievements --
         deleted_ach = (
             db.query(BotAchievement)
             .filter(BotAchievement.bot_id.in_(bot_ids))
@@ -120,21 +151,20 @@ def reset(
         )
         print(f"  Deleted {deleted_ach} achievement records")
 
-        # ── 4. Reset bot balances ──
+        # -- 6. Reset bot balances --
         for bot in bots:
             bot.balance = BOT_BALANCE
             bot.initial_balance = BOT_BALANCE
             bot.status = "ACTIVE"
-        print(f"  Reset {len(bots)} bots → balance=${BOT_BALANCE:,.0f}")
+        print(f"  Reset {len(bots)} bots -> balance=${BOT_BALANCE:,.0f}")
 
-        # ── 5. Reset affected users ──
+        # -- 7. Reset affected users --
         affected_user_ids = set(b.user_id for b in bots if b.user_id)
         for uid in affected_user_ids:
             user = db.query(User).filter(User.id == uid).first()
             if not user:
                 continue
 
-            # All active bots for this user (including ones we just reset)
             all_user_bots = (
                 db.query(Bot)
                 .filter(Bot.user_id == uid, Bot.is_active == True)
@@ -142,7 +172,6 @@ def reset(
             )
             total_allocated = sum(b.initial_balance or 0 for b in all_user_bots)
             user.initial_balance = total_allocated
-            available = 0.0  # all funds allocated to bots
 
             # Clean user-level history
             db.query(UserBalanceHistory).filter(UserBalanceHistory.user_id == uid).delete(synchronize_session="fetch")
@@ -153,11 +182,11 @@ def reset(
                 user_id=uid,
                 balance=total_allocated,
                 bot_balance=total_allocated,
-                available=available,
+                available=0.0,
                 session_id=None,
                 recorded_at=datetime.now(timezone.utc),
             ))
-            print(f"  User '{user.username}': initial={total_allocated:,.0f} ({len(all_user_bots)} bots × balance)")
+            print(f"  User '{user.username}': initial={total_allocated:,.0f} ({len(all_user_bots)} bots x balance)")
 
         db.commit()
         print("\nDone.")
@@ -172,7 +201,7 @@ def reset(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Reset bot trades & balances → $10,000",
+        description="Reset bot trades & balances -> $10,000",
     )
     parser.add_argument("--apply", action="store_true", help="Execute (default: dry-run)")
     parser.add_argument("--user", type=str, default=None, help="Only reset bots of this user")

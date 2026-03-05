@@ -7,7 +7,12 @@ tuned in one place.  Import what you need:
     from config.timing import HTTP_TIMEOUT, ME_DUST_THRESHOLD
 """
 
+import os
 from decimal import Decimal
+
+# ── Feed Mode ───────────────────────────────────────────────────────────────
+
+FEED_MODE = os.getenv("FEED_MODE", "rest").lower()  # "rest" | "websocket"
 
 # ── HTTP Timeouts ────────────────────────────────────────────────────────────
 

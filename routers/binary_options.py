@@ -551,7 +551,7 @@ def _queue_prefilled_to_me(
         )
 
 
-@router.post("", response_model=BOResponse, status_code=201)
+@router.post("/", response_model=BOResponse, status_code=201)
 def create_bo(
     payload: BOCreate,
     x_api_key: str = Header(..., alias="x-api-key", description="Bot API key"),
@@ -1086,7 +1086,7 @@ def create_bo(
 
 # ─── Danh sách lệnh ───────────────────────────────────────────────────────────
 
-@router.get("", response_model=List[BOResponse])
+@router.get("/", response_model=List[BOResponse])
 def list_bo(
     bot_name:  Optional[str]          = Query(None),
     symbol:    Optional[BOSymbol]     = Query(None),
@@ -1140,6 +1140,27 @@ async def get_token_mapping(
         raise HTTPException(404, f"No token mapping for {sym} {tf} — ws_feed_service may not be running")
 
     return json.loads(raw)
+
+
+# ─── Volume per session ───────────────────────────────────────────────────────
+
+@router.get("/volume")
+def session_volume(
+    symbol: str = Query(..., description="BTC, ETH"),
+    timeframe: str = Query(..., description="M5, M15"),
+    session: int = Query(..., description="candle_open Unix timestamp"),
+):
+    """
+    Return per-minute volume data for a binary options session.
+
+    Response: list of {minute, up_amount, down_amount, up_trades, down_trades}
+    """
+    from services.redis_client import get_sync_redis
+    from services.volume_tracker import get_session_volume
+
+    r = get_sync_redis()
+    data = get_session_volume(r, symbol.upper(), timeframe.upper(), session)
+    return {"volume": data, "symbol": symbol.upper(), "timeframe": timeframe.upper(), "session": session}
 
 
 # ─── Lấy 1 lệnh ───────────────────────────────────────────────────────────────

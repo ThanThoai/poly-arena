@@ -21,6 +21,10 @@ STREAM_MARKET_RESOLVED = "stream:market:resolved"
 
 PRICE_KEY_PREFIX = "price"          # price:{SYM}:{TF}:{DIR}
 
+# ── Last trade / volume ─────────────────────────────────────────────────────
+
+LAST_TRADE_KEY_PREFIX = "last_trade"  # last_trade:{SYM}:{TF}:{DIR}
+
 # ── Orderbook depth ─────────────────────────────────────────────────────────
 
 ORDERBOOK_KEY_PREFIX = "orderbook"  # orderbook:{SYM}:{TF}:{DIR}

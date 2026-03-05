@@ -268,6 +268,7 @@ class UserBalanceSnapshotResponse(BaseModel):
 class BotCreate(BaseModel):
     bot_name: str
     initial_balance: float = 10000.0
+    get_or_create: bool = False
 
 
 class BotRename(BaseModel):

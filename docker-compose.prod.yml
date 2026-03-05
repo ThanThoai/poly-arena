@@ -48,6 +48,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://polyarena:${POSTGRES_PASSWORD:-polyarena_prod}@timescaledb:5432/polyarena
       - REDIS_URL=redis://redis:6379
+      - FEED_MODE=${FEED_MODE:-rest}
     env_file:
       - .env
     restart: unless-stopped

@@ -28,7 +28,7 @@ from ws_feed_service.redis_writer import RedisWriter
 from ws_feed_service.order_consumer import OrderConsumer
 from ws_feed_service.rest_poller import RestPoller, REST_POLL_INTERVAL
 
-from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S, REST_POLL_TIMEOUT_S
+from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S, REST_POLL_TIMEOUT_S, FEED_MODE
 from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions, check_orderbook_keys
 from database import SessionLocal
 from models import BinaryOption, BOResult
@@ -308,7 +308,7 @@ async def _recover_pending_orders(sync_redis, session_manager: SessionManager, r
 
 
 async def main():
-    log.info("Feed Service starting (REST polling mode)...")
+    log.info("Feed Service starting (%s mode)...", "WebSocket" if FEED_MODE == "websocket" else "REST polling")
 
     # 1. Connect Redis
     async_redis = get_async_redis()
@@ -388,6 +388,12 @@ async def main():
                         await writer.update_price(token_id, best_ask, best_bid)
             asyncio.ensure_future(_seed())
 
+        # Notify poller / volume feed of new tokens so they can subscribe
+        if FEED_MODE == "websocket":
+            poller.add_tokens(ids)
+        else:
+            trade_volume_feed.add_tokens(ids)
+
         log.info(
             "TokenRegistry pushed %d new token(s)%s, seeded %d book(s)",
             len(ids),
@@ -430,13 +436,28 @@ async def main():
     if recovered:
         log.info("Recovery: re-pushed %d pending order(s) to queue", recovered)
 
-    # 8. Start REST poller — polls Polymarket REST API, runs matching, writes to Redis
-    rest_pm_client = PolymarketClient(timeout=REST_POLL_TIMEOUT_S)
-    rest_poller = RestPoller(
-        session_manager, writer=writer,
-        pm_client=rest_pm_client, interval=REST_POLL_INTERVAL,
-    )
-    rest_poller_task = asyncio.ensure_future(rest_poller.start())
+    # 8. Start poller — REST or WebSocket depending on FEED_MODE
+    if FEED_MODE == "websocket":
+        from ws_feed_service.ws_poller import WsFeedPoller
+        all_token_ids = registry.all_token_ids()
+        poller = WsFeedPoller(session_manager, writer, all_token_ids)
+        poller_task = asyncio.ensure_future(poller.start())
+        rest_pm_client = None
+        log.info("Using WebSocket feed mode (%d token(s))", len(all_token_ids))
+    else:
+        rest_pm_client = PolymarketClient(timeout=REST_POLL_TIMEOUT_S)
+        poller = RestPoller(
+            session_manager, writer=writer,
+            pm_client=rest_pm_client, interval=REST_POLL_INTERVAL,
+        )
+        poller_task = asyncio.ensure_future(poller.start())
+
+        # Start TradeVolumeFeed — lightweight WS connection for trade volume tracking
+        from ws_feed_service.trade_volume_feed import TradeVolumeFeed
+        all_token_ids = registry.all_token_ids()
+        trade_volume_feed = TradeVolumeFeed(writer, token_ids=all_token_ids)
+        asyncio.ensure_future(trade_volume_feed.start())
+        log.info("Using REST polling feed mode + TradeVolumeFeed (%d token(s))", len(all_token_ids))
 
     # 9. Periodic TTL expiry tick
     async def _expiry_tick():
@@ -499,6 +520,11 @@ async def main():
     asyncio.ensure_future(_expiry_tick())
     asyncio.ensure_future(_session_lifecycle_tick())
 
+    # 11. Start Binance Futures price feed (runs alongside Polymarket feed)
+    from ws_feed_service.binance_feed import run_binance_feed
+    binance_task = asyncio.ensure_future(run_binance_feed())
+    log.info("Binance Futures price feed started")
+
     def _signal_handler():
         log.info("Shutdown signal received")
         shutdown_event.set()
@@ -506,14 +532,20 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
-    log.info("Feed Service running (REST polling) — press Ctrl+C to stop")
+    log.info(
+        "Feed Service running (%s mode) — press Ctrl+C to stop",
+        "WebSocket" if FEED_MODE == "websocket" else "REST polling",
+    )
     await shutdown_event.wait()
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
     log.info("Shutting down...")
-    await rest_poller.stop()
-    rest_poller_task.cancel()
-    rest_pm_client.close()
+    binance_task.cancel()
+    await poller.stop()
+    poller_task.cancel()
+    if rest_pm_client is not None:
+        rest_pm_client.close()
+        await trade_volume_feed.stop()
     consumer.stop()
     await registry.stop()
     session_manager.shutdown()

@@ -28,8 +28,6 @@ logging.basicConfig(
 log = logging.getLogger("aggressive-bot")
 
 BASE = os.environ.get("API_URL", "http://localhost:8099/poly-arena")
-BOT_USER = os.environ.get("BOT_USER", "aggressive-user")
-BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "testpass123")
 BOT_NAME = os.environ.get("BOT_NAME", "aggressive-bot")
 BOT_BALANCE = float(os.environ.get("BOT_BALANCE", "10000"))
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
@@ -129,40 +127,17 @@ def wait_for_api() -> bool:
     return False
 
 
-def register_or_login(username: str, password: str) -> str:
-    r = requests.post(f"{BASE}/auth/register", json={"username": username, "password": password}, timeout=10)
-    if r.status_code == 201:
-        log.info("User registered: %s", username)
-        return r.json()["access_token"]
-    if r.status_code == 409:
-        r = requests.post(f"{BASE}/auth/login", json={"username": username, "password": password}, timeout=10)
-        r.raise_for_status()
-        log.info("User logged in: %s", username)
-        return r.json()["access_token"]
-    r.raise_for_status()
-    return ""
-
-
-def get_or_create_bot(jwt_token: str) -> str:
-    # Try reuse existing bot
-    r = requests.get(f"{BASE}/bots/my", headers={"Authorization": f"Bearer {jwt_token}"}, timeout=10)
-    if r.ok:
-        for bot in r.json():
-            if bot["bot_name"] == BOT_NAME and bot.get("is_active", True) and bot.get("status") != "DELETED":
-                log.info("Reusing bot: %s (balance=$%.0f)", bot["bot_name"], bot.get("balance", 0))
-                return bot["api_key"]
-
-    # Create new bot
-    log.info("Creating bot '%s' (balance=$%.0f)", BOT_NAME, BOT_BALANCE)
+def get_or_create_bot() -> str:
+    """Create bot or return existing one's api_key (no user auth needed)."""
+    log.info("Getting/creating bot '%s' (balance=$%.0f)", BOT_NAME, BOT_BALANCE)
     r = requests.post(
         f"{BASE}/bots/",
-        json={"bot_name": BOT_NAME, "initial_balance": BOT_BALANCE},
-        headers={"Authorization": f"Bearer {jwt_token}"},
+        json={"bot_name": BOT_NAME, "initial_balance": BOT_BALANCE, "get_or_create": True},
         timeout=10,
     )
     r.raise_for_status()
     data = r.json()
-    log.info("Bot created: %s balance=$%.0f", data["bot_name"], data["balance"])
+    log.info("Bot ready: %s balance=$%.0f", data["bot_name"], data["balance"])
     return data["api_key"]
 
 
@@ -170,8 +145,7 @@ def main():
     if not wait_for_api():
         return
 
-    jwt_token = register_or_login(BOT_USER, BOT_PASSWORD)
-    api_key = get_or_create_bot(jwt_token)
+    api_key = get_or_create_bot()
 
     period = 300  # M5
 

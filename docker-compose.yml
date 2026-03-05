@@ -22,7 +22,7 @@ services:
   redis-test:
     image: redis:7-alpine
     ports:
-      - "6381:6379"
+    - "6381:6379"
     command: >
       redis-server
       --maxmemory 64mb
@@ -50,6 +50,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://polyarena:polyarena_test@timescaledb-test:5432/polyarena_test
       - REDIS_URL=redis://redis-test:6379
+      - FEED_MODE=${FEED_MODE:-websocket}
       - DEBUG=${DEBUG:-0}
     env_file:
       - .env
@@ -128,27 +129,27 @@ services:
     networks:
       - test-net
 
-  ui-test:
-    build:
-      context: ./ui
-      dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8099/poly-arena}
-        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
-    image: poly-arena-test/ui
-    environment:
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8099/poly-arena}
-      - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-}
-      - HOT_RELOAD=${HOT_RELOAD:-0}
-    depends_on:
-      - api-test
-    restart: unless-stopped
-    ports:
-      - "3002:3000"
-    volumes:
-      - ./ui/src:/app/src    # mount source for hot-reload (only effective when HOT_RELOAD=1)
-    networks:
-      - test-net
+  # ui-test:
+  #   build:
+  #     context: ./ui
+  #     dockerfile: Dockerfile
+  #     args:
+  #       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8099/poly-arena}
+  #       NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
+  #   image: poly-arena-test/ui
+  #   environment:
+  #     - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8099/poly-arena}
+  #     - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-}
+  #     - HOT_RELOAD=${HOT_RELOAD:-0}
+  #   depends_on:
+  #     - api-test
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3002:3000"
+  #   volumes:
+  #     - ./ui/src:/app/src    # mount source for hot-reload (only effective when HOT_RELOAD=1)
+  #   networks:
+  #     - test-net
 
 networks:
   test-net:

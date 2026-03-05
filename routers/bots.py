@@ -5,8 +5,11 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from sqlalchemy import func as sa_func
+
 from database import get_db
 from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory, UserBalanceSnapshot
+from models_futures import FuturesPosition, FuturesPositionStatus, FuturesOrder, FuturesOrderStatus
 from schemas import (
     BalanceHistoryResponse, BOResponse, BotBalanceAdjust, BotCreate, BotPerformanceResponse,
     BotPnlResponse, BotPublic, BotRename, BotResponse,
@@ -16,7 +19,7 @@ from schemas import (
 router = APIRouter()
 
 
-@router.post("", response_model=BotResponse, status_code=201)
+@router.post("/", response_model=BotResponse, status_code=201)
 def create_bot(
     payload: BotCreate,
     db: Session = Depends(get_db),
@@ -25,7 +28,10 @@ def create_bot(
     if not name:
         raise HTTPException(status_code=422, detail="bot_name cannot be empty")
 
-    if db.query(Bot).filter(Bot.bot_name == name).first():
+    existing = db.query(Bot).filter(Bot.bot_name == name).first()
+    if existing:
+        if payload.get_or_create:
+            return existing
         raise HTTPException(status_code=409, detail=f"Bot '{name}' already exists")
 
     bot = Bot(
@@ -41,7 +47,7 @@ def create_bot(
     return bot
 
 
-@router.get("", response_model=List[BotPublic])
+@router.get("/", response_model=List[BotPublic])
 def list_bots(db: Session = Depends(get_db)):
     bots = db.query(Bot).order_by(Bot.created_at.desc()).all()
     user_ids = {b.user_id for b in bots if b.user_id}
@@ -188,12 +194,50 @@ def get_balance_history(
         for b in bots
     ]
 
-    # Current bot balance as the latest data point
+    # Current bot equity (cash + locked positions) as the latest data point
+    # b.balance = initial + realized_pnl - open_locked - net_fees (cash only)
+    # To match BalanceHistory which stores equity, add back open_locked.
+    bot_locked: dict[str, float] = {}
+    for b in bots:
+        # Binary options: amount locked in PENDING orders
+        bo_locked = (
+            db.query(sa_func.coalesce(sa_func.sum(BinaryOption.amount), 0.0))
+            .filter(
+                BinaryOption.bot_name == b.bot_name,
+                BinaryOption.result == BOResult.PENDING,
+            )
+            .scalar()
+        ) or 0.0
+
+        # Futures: margin locked in OPEN positions (already deducted from bot.balance)
+        fut_pos_margin = (
+            db.query(sa_func.coalesce(sa_func.sum(FuturesPosition.margin), 0.0))
+            .filter(
+                FuturesPosition.bot_name == b.bot_name,
+                FuturesPosition.status == FuturesPositionStatus.OPEN,
+            )
+            .scalar()
+        ) or 0.0
+
+        # Futures: margin reserved by PENDING limit orders
+        fut_ord_margin = (
+            db.query(sa_func.coalesce(
+                sa_func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0
+            ))
+            .filter(
+                FuturesOrder.bot_name == b.bot_name,
+                FuturesOrder.status == FuturesOrderStatus.PENDING,
+            )
+            .scalar()
+        ) or 0.0
+
+        bot_locked[b.bot_name] = bo_locked + fut_pos_margin + fut_ord_margin
+
     current_records = [
         BalanceHistory(
             id=0,
             bot_name=b.bot_name,
-            balance=b.balance,
+            balance=round((b.balance or 0) + bot_locked.get(b.bot_name, 0), 8),
             trade_id=None,
             recorded_at=now,
         )
@@ -382,11 +426,12 @@ def bot_performance(
         .all()
     )
 
+    locked = _bot_locked_margin(db, bot.bot_name)
     return BotPerformanceResponse(
         bot_name=bot.bot_name,
         status=getattr(bot, "status", "ACTIVE") or "ACTIVE",
         initial_balance=initial,
-        current_balance=bot.balance or 0,
+        current_balance=round((bot.balance or 0) + locked, 8),
         realized_pnl=realized_pnl,
         realized_pnl_pct=round(realized_pnl / initial * 100, 2) if initial else 0.0,
         wins=wins,
@@ -400,7 +445,29 @@ def bot_performance(
 
 # ── P&L helpers ──────────────────────────────────────────────────────────────
 
-def _bot_pnl(bot: Bot, trades: list) -> BotPnlResponse:
+def _bot_locked_margin(db: Session, bot_name: str) -> float:
+    """Sum of margin locked in open futures positions + pending limit orders."""
+    fut_pos_margin = (
+        db.query(sa_func.coalesce(sa_func.sum(FuturesPosition.margin), 0.0))
+        .filter(FuturesPosition.bot_name == bot_name, FuturesPosition.status == FuturesPositionStatus.OPEN)
+        .scalar()
+    ) or 0.0
+    fut_ord_margin = (
+        db.query(sa_func.coalesce(
+            sa_func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0
+        ))
+        .filter(FuturesOrder.bot_name == bot_name, FuturesOrder.status == FuturesOrderStatus.PENDING)
+        .scalar()
+    ) or 0.0
+    bo_locked = (
+        db.query(sa_func.coalesce(sa_func.sum(BinaryOption.amount), 0.0))
+        .filter(BinaryOption.bot_name == bot_name, BinaryOption.result == BOResult.PENDING)
+        .scalar()
+    ) or 0.0
+    return bo_locked + fut_pos_margin + fut_ord_margin
+
+
+def _bot_pnl(db: Session, bot: Bot, trades: list) -> BotPnlResponse:
     """Build a BotPnlResponse from a Bot and its trades."""
     wins = sum(1 for t in trades if t.result == BOResult.WIN)
     losses = sum(1 for t in trades if t.result == BOResult.LOSS)
@@ -409,11 +476,12 @@ def _bot_pnl(bot: Bot, trades: list) -> BotPnlResponse:
     realized_pnl = round(sum(t.profit or 0 for t in trades if t.result in (BOResult.WIN, BOResult.LOSS)), 8)
     total_fees = round(sum(t.entry_fee or 0 for t in trades), 8)
     initial = bot.initial_balance or 0
+    locked = _bot_locked_margin(db, bot.bot_name)
     return BotPnlResponse(
         bot_name=bot.bot_name,
         status=getattr(bot, "status", "ACTIVE") or "ACTIVE",
         initial_balance=initial,
-        current_balance=bot.balance or 0,
+        current_balance=round((bot.balance or 0) + locked, 8),
         realized_pnl=realized_pnl,
         realized_pnl_pct=round(realized_pnl / initial * 100, 2) if initial else 0.0,
         wins=wins,
@@ -449,13 +517,13 @@ def bots_pnl(
         trades_by_bot.setdefault(t.bot_name, []).append(t)
 
     return sorted(
-        [_bot_pnl(b, trades_by_bot.get(b.bot_name, [])) for b in bots],
+        [_bot_pnl(db, b, trades_by_bot.get(b.bot_name, [])) for b in bots],
         key=lambda x: x.realized_pnl,
         reverse=True,
     )
 
 
-def _user_pnl(user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> UserPnlResponse:
+def _user_pnl(db: Session, user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> UserPnlResponse:
     """Build UserPnlResponse for a single user.
 
     Only ACTIVE bots contribute to realized_pnl — deleted bots' P&L has already
@@ -463,7 +531,7 @@ def _user_pnl(user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> Us
     trades here would double-count.
     """
     active_bots = [b for b in bots if getattr(b, 'is_active', True)]
-    active_pnls = [_bot_pnl(b, trades_by_bot.get(b.bot_name, [])) for b in active_bots]
+    active_pnls = [_bot_pnl(db, b, trades_by_bot.get(b.bot_name, [])) for b in active_bots]
 
     wins = sum(bp.wins for bp in active_pnls)
     losses = sum(bp.losses for bp in active_pnls)
@@ -475,7 +543,8 @@ def _user_pnl(user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> Us
 
     allocated = sum(b.initial_balance or 0 for b in active_bots)
     available = (user.initial_balance or 0) - allocated
-    current_balance = round(sum(b.balance or 0 for b in active_bots) + available, 8)
+    bot_equity = sum(bp.current_balance for bp in active_pnls)
+    current_balance = round(bot_equity + available, 8)
     initial = user.initial_balance or 0
 
     return UserPnlResponse(
@@ -530,7 +599,7 @@ def user_pnl(
         user_bots = bots_by_user.get(u.id, [])
         if not user_bots:
             continue
-        result.append(_user_pnl(u, user_bots, trades_by_bot))
+        result.append(_user_pnl(db, u, user_bots, trades_by_bot))
 
     return sorted(result, key=lambda x: x.realized_pnl, reverse=True)
 
@@ -561,6 +630,6 @@ def user_pnl_all(db: Session = Depends(get_db)):
         user_bots = bots_by_user.get(u.id, [])
         if not user_bots:
             continue
-        result.append(_user_pnl(u, user_bots, trades_by_bot))
+        result.append(_user_pnl(db, u, user_bots, trades_by_bot))
 
     return sorted(result, key=lambda x: x.realized_pnl, reverse=True)

@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from database import SessionLocal
 from models import BalanceHistory, BinaryOption, Bot, BOResult
-from routers import achievements as achievements_router, admin as admin_router, auth, binary_options, bots, dashboard, ws as ws_router, ws_polymarket
+from routers import achievements as achievements_router, admin as admin_router, auth, binary_options, bots, dashboard, ws as ws_router, ws_polymarket, futures as futures_router
 from services.orderbook_broadcaster import broadcaster
 from services.redis_client import get_async_redis, close_async_redis
 from config.fees import maker_rebate_from_levels
@@ -423,6 +423,13 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                             open_price, close_price = candle
                             _settle_single_trade(
                                 bo, open_price, close_price, db, tag="LATE_FILL"
+                            )
+                            # Reconcile balance from DB truth
+                            from services.settlement import reconcile_bot_balances
+                            reconcile_bot_balances(
+                                db,
+                                {bo.bot_name},
+                                {bo.bot_name: [bo.id]},
                             )
                             db.commit()
                             _check_achievements(bo, db)
@@ -854,6 +861,7 @@ app.include_router(bots.router, prefix="/poly-arena/bots", tags=["Bots"])
 app.include_router(dashboard.router, prefix="/poly-arena/dashboard", tags=["Dashboard"])
 app.include_router(admin_router.router, prefix="/poly-arena/admin", tags=["Admin"])
 app.include_router(achievements_router.router, prefix="/poly-arena/achievements", tags=["Achievements"])
+app.include_router(futures_router.router, prefix="/poly-arena/futures", tags=["Futures"])
 app.include_router(ws_router.router, prefix="/poly-arena")
 app.include_router(ws_polymarket.router, prefix="/poly-arena")
 

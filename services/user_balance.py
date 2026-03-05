@@ -14,6 +14,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory, UserBalanceSnapshot
+from models_futures import FuturesPosition, FuturesPositionStatus, FuturesSide, FuturesOrder, FuturesOrderStatus
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,61 @@ def _calc_bot_unrealized_pnl(db: Session, bot_name: str, sr) -> float:
     return round(total_unrealized, 8)
 
 
+def _calc_futures_locked_and_pnl(db: Session, bot_name: str, sr) -> tuple[float, float]:
+    """
+    Calculate futures locked margin and unrealized PnL for a bot.
+
+    Returns (locked_margin, unrealized_pnl):
+      - locked_margin: sum of margin from OPEN positions + PENDING limit orders
+        (already deducted from bot.balance, must be added back for equity)
+      - unrealized_pnl: mark-to-market P&L of open positions
+    """
+    # Open positions — margin already deducted from balance
+    open_positions = (
+        db.query(FuturesPosition)
+        .filter(
+            FuturesPosition.bot_name == bot_name,
+            FuturesPosition.status == FuturesPositionStatus.OPEN,
+        )
+        .all()
+    )
+
+    locked_margin = 0.0
+    unrealized = 0.0
+    for pos in open_positions:
+        locked_margin += pos.margin or 0
+        # entry_fee is a sunk cost — not returned on close (refund = margin + realized_pnl)
+        # so it should NOT be counted as locked equity
+
+        # Unrealized P&L from Redis mark price
+        mark = None
+        try:
+            data = sr.hgetall(f"futures:price:{pos.symbol}")
+            if data and "price" in data:
+                mark = float(data["price"])
+        except Exception:
+            pass
+
+        if mark:
+            if pos.side == FuturesSide.LONG:
+                unrealized += (mark - pos.entry_price) * pos.size
+            else:
+                unrealized += (pos.entry_price - mark) * pos.size
+
+    # Pending LIMIT orders — margin reserved (deducted from balance)
+    pending_margin = (
+        db.query(func.coalesce(func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0))
+        .filter(
+            FuturesOrder.bot_name == bot_name,
+            FuturesOrder.status == FuturesOrderStatus.PENDING,
+        )
+        .scalar()
+    ) or 0.0
+    locked_margin += pending_margin
+
+    return round(locked_margin, 8), round(unrealized, 8)
+
+
 def snapshot_all_user_balances(
     db: Session,
     session_label: Optional[str] = None,
@@ -164,10 +220,26 @@ def snapshot_all_user_balances(
         for b in active_bots:
             unrealized = _calc_bot_unrealized_pnl(db, b.bot_name, sr)
             total_unrealized += unrealized
-            bot_equity = round((b.balance or 0) + unrealized, 8)
+
+            # Binary options: cost basis of open trades (deducted from balance)
+            bo_open_locked = (
+                db.query(func.coalesce(func.sum(BinaryOption.amount), 0.0))
+                .filter(
+                    BinaryOption.bot_name == b.bot_name,
+                    BinaryOption.result == BOResult.PENDING,
+                )
+                .scalar()
+            ) or 0.0
+
+            # Futures: locked margin + unrealized PnL (margin already deducted from balance)
+            futures_locked, futures_unrealized = _calc_futures_locked_and_pnl(db, b.bot_name, sr)
+            total_unrealized += futures_unrealized
+
+            # Equity = cash + BO locked + futures locked margin
+            bot_equity = round((b.balance or 0) + bo_open_locked + futures_locked, 8)
             bot_equity_sum += bot_equity
 
-            # Record bot-level equity snapshot (balance + unrealized)
+            # Record bot-level equity snapshot (cash + locked)
             db.add(BalanceHistory(
                 bot_name=b.bot_name,
                 balance=bot_equity,

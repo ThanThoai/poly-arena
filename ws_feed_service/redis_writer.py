@@ -18,6 +18,7 @@ from ws_feed_service.config import (
     PRICE_CACHE_TTL_S,
     PRICE_HISTORY_INTERVAL_S,
     ORDERBOOK_KEY_PREFIX,
+    LAST_TRADE_KEY_PREFIX,
     STREAM_BRACKET_EXITS,
     STREAM_ORDER_CANCELS,
     STREAM_ORDER_FILLS,
@@ -358,6 +359,39 @@ class RedisWriter:
                         sym, tf, direction, best_ask, best_bid,
                         ob_bids, ob_asks, candle_ts,
                     )
+
+    async def update_last_trade(
+        self,
+        token_id: str,
+        price: str,
+        size: str,
+        side: str,
+    ) -> None:
+        """
+        Write last trade data for all (sym, tf, dir) combos mapped to this token_id.
+
+        Key format: last_trade:{SYM}:{TF}:{DIR}
+        Hash fields: price, size, side, token_id, updated_at
+        """
+        combos = self._token_map.get(token_id)
+        if not combos:
+            return
+
+        now_ts = str(time.time())
+        pipe = self._r.pipeline(transaction=False)
+
+        for sym, tf, direction in combos:
+            key = f"{LAST_TRADE_KEY_PREFIX}:{sym}:{tf}:{direction}"
+            pipe.hset(key, mapping={
+                "price": price,
+                "size": size,
+                "side": side,
+                "token_id": token_id,
+                "updated_at": now_ts,
+            })
+            pipe.expire(key, PRICE_CACHE_TTL_S)
+
+        await _retry_pipe(pipe, "RedisWriter.update_last_trade")
 
     async def clear_price_keys(self, combos: list[tuple[str, str, str]]) -> None:
         """

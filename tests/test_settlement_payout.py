@@ -13,7 +13,7 @@ using a real DB session, covering:
 
 import pytest
 from models import BalanceHistory, BinaryOption, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast
-from services.settlement import _settle_single_trade
+from services.settlement import _settle_single_trade, reconcile_bot_balances
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -125,48 +125,127 @@ def test_doji_candle_red_forecast_loss(db):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 2. Balance update verification
+# 2. Balance reconciliation verification
 # ═══════════════════════════════════════════════════════════════
 
 
-def test_balance_updated_on_win(db):
-    """Bot balance increases by (amount + profit) on WIN."""
+def test_reconcile_balance_on_win(db):
+    """Reconciliation: balance = initial + profit - locked - fees."""
     bot = _make_bot(db, balance=9900.0)  # 100 deducted at order creation
     bo = _make_bo(db, bot, forecast=BOForecast.GREEN, avg_price=0.50, num_shares=200.0, amount=100.0)
 
     _settle_single_trade(bo, open_price=100.0, close_price=110.0, db=db)
+    results = reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo.id]})
     db.commit()
 
     db.refresh(bot)
-    expected_payout = 100.0 + round((1 - 0.50) * 200.0, 8)  # amount + profit
-    assert round(bot.balance, 2) == round(9900.0 + expected_payout, 2)
+    profit = round((1 - 0.50) * 200.0, 8)
+    # balance = initial(10000) + profit - 0 locked - 0 fees
+    assert round(bot.balance, 2) == round(10000.0 + profit, 2)
+    assert results[bot.bot_name]["session_pnl"] == profit
 
 
-def test_balance_updated_on_loss(db):
-    """Bot balance increases by (amount + profit) on LOSS — profit is negative."""
+def test_reconcile_balance_on_loss(db):
+    """Reconciliation on LOSS: balance = initial + negative_profit."""
     bot = _make_bot(db, balance=9900.0)
     bo = _make_bo(db, bot, forecast=BOForecast.GREEN, avg_price=0.50, num_shares=200.0, amount=100.0)
 
     _settle_single_trade(bo, open_price=110.0, close_price=100.0, db=db)
+    results = reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo.id]})
     db.commit()
 
     db.refresh(bot)
     profit = round(-0.50 * 200.0, 8)
-    expected_payout = 100.0 + profit  # amount + negative profit
-    assert round(bot.balance, 2) == round(9900.0 + expected_payout, 2)
+    assert round(bot.balance, 2) == round(10000.0 + profit, 2)
+    assert results[bot.bot_name]["session_pnl"] == profit
 
 
-def test_balance_history_created(db):
-    """BalanceHistory row is created after settlement."""
+def test_reconcile_with_open_positions(db):
+    """Reconciliation subtracts amount locked in PENDING orders."""
+    bot = _make_bot(db, balance=9800.0)  # 200 deducted for 2 orders
+    bo1 = _make_bo(db, bot, forecast=BOForecast.GREEN, avg_price=0.50, num_shares=200.0, amount=100.0)
+    # Second order still PENDING (not settled)
+    bo2 = _make_bo(db, bot, forecast=BOForecast.RED, avg_price=0.50, num_shares=200.0, amount=100.0)
+
+    # Settle only bo1
+    _settle_single_trade(bo1, open_price=100.0, close_price=110.0, db=db)
+    results = reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo1.id]})
+    db.commit()
+
+    db.refresh(bot)
+    profit = round((1 - 0.50) * 200.0, 8)
+    # balance = initial(10000) + profit(100) - locked(100 for bo2) - fees(0)
+    assert round(bot.balance, 2) == round(10000.0 + profit - 100.0, 2)
+
+
+def test_reconcile_with_fees(db):
+    """Reconciliation subtracts net fees (taker positive, maker rebate negative)."""
+    bot = _make_bot(db, balance=9899.70)  # 100 deducted + 0.30 taker fee
+    bo = _make_bo(
+        db, bot,
+        forecast=BOForecast.GREEN, avg_price=0.50, num_shares=200.0,
+        amount=100.0, entry_fee=0.30,
+    )
+
+    _settle_single_trade(bo, open_price=100.0, close_price=110.0, db=db)
+    reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo.id]})
+    db.commit()
+
+    db.refresh(bot)
+    profit = round((1 - 0.50) * 200.0, 8)
+    # balance = initial(10000) + profit(100) - locked(0) - fees(0.30)
+    assert round(bot.balance, 2) == round(10000.0 + profit - 0.30, 2)
+
+
+def test_reconcile_detects_drift(db):
+    """Reconciliation corrects balance drift from incremental errors."""
+    bot = _make_bot(db, balance=9000.0)  # deliberately wrong balance
+    bo = _make_bo(db, bot, forecast=BOForecast.GREEN, avg_price=0.50, num_shares=200.0, amount=100.0)
+
+    _settle_single_trade(bo, open_price=100.0, close_price=110.0, db=db)
+    results = reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo.id]})
+    db.commit()
+
+    db.refresh(bot)
+    profit = round((1 - 0.50) * 200.0, 8)
+    expected = round(10000.0 + profit, 2)
+    assert round(bot.balance, 2) == expected
+    # drift should be detected
+    assert results[bot.bot_name]["drift"] != 0
+
+
+def test_reconcile_balance_history_created(db):
+    """BalanceHistory row is created by reconciliation."""
     bot = _make_bot(db, balance=9900.0)
     bo = _make_bo(db, bot, forecast=BOForecast.GREEN, avg_price=0.50, num_shares=200.0, amount=100.0)
 
     _settle_single_trade(bo, open_price=100.0, close_price=110.0, db=db)
+    reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo.id]})
     db.commit()
 
-    history = db.query(BalanceHistory).filter(BalanceHistory.trade_id == bo.id).first()
-    assert history is not None
-    assert history.bot_name == bot.bot_name
+    history = db.query(BalanceHistory).filter(BalanceHistory.bot_name == bot.bot_name).all()
+    assert len(history) >= 1
+
+
+def test_reconcile_auto_pause_on_bankruptcy(db):
+    """Bot auto-pauses when reconciled balance <= 0."""
+    bot = _make_bot(db, balance=50.0)
+    # avg_price=0.50, num_shares=20000 -> cost=10000, loss = -0.50 * 20000 = -10000
+    bo = _make_bo(
+        db, bot,
+        forecast=BOForecast.GREEN, avg_price=0.50, num_shares=20000.0,
+        amount=10000.0,
+    )
+
+    # RED candle -> LOSS, profit = -0.50 * 20000 = -10000
+    _settle_single_trade(bo, open_price=110.0, close_price=100.0, db=db)
+    reconcile_bot_balances(db, {bot.bot_name}, {bot.bot_name: [bo.id]})
+    db.commit()
+
+    db.refresh(bot)
+    # balance = 10000 + (-10000) - 0 - 0 = 0
+    assert bot.balance <= 0
+    assert bot.status == "PAUSED"
 
 
 # ═══════════════════════════════════════════════════════════════

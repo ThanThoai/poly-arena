@@ -44,6 +44,9 @@ async def orderbook_ws(ws: WebSocket):
     r = get_async_redis()
     queue = await broadcaster.subscribe()
 
+    # Volume pub/sub listener
+    volume_queue: asyncio.Queue = asyncio.Queue(maxsize=128)
+
     # Send initial snapshot
     try:
         entries = await snapshot_cache.get_snapshot(r, None, None)
@@ -117,9 +120,42 @@ async def orderbook_ws(ws: WebSocket):
         except asyncio.CancelledError:
             pass
 
+    async def _volume_listener():
+        """Subscribe to volume:updates pub/sub and queue messages."""
+        import redis.asyncio as aioredis
+        from services.redis_client import REDIS_URL
+        vol_redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+        vol_ps = vol_redis.pubsub()
+        try:
+            await vol_ps.subscribe("volume:updates")
+            async for raw_msg in vol_ps.listen():
+                if closed:
+                    break
+                if raw_msg["type"] != "message":
+                    continue
+                try:
+                    data = json.loads(raw_msg["data"])
+                    data["type"] = "volume"
+                    try:
+                        volume_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                await vol_ps.unsubscribe("volume:updates")
+                await vol_ps.close()
+                await vol_redis.aclose()
+            except Exception:
+                pass
+
     reader_task = asyncio.create_task(_read_client())
     ping_task = asyncio.create_task(_ping_loop())
     resync_task = asyncio.create_task(_snapshot_resync_loop())
+    volume_task = asyncio.create_task(_volume_listener())
 
     try:
         while not closed:
@@ -132,6 +168,20 @@ async def orderbook_ws(ws: WebSocket):
                     )
                     for entry in entries:
                         await ws.send_json(entry)
+                except Exception:
+                    break
+
+            # Drain volume queue (non-blocking)
+            while not volume_queue.empty():
+                try:
+                    vol_msg = volume_queue.get_nowait()
+                    if filter_symbol and vol_msg.get("symbol") != filter_symbol.upper():
+                        continue
+                    if filter_timeframe and vol_msg.get("timeframe") != filter_timeframe.upper():
+                        continue
+                    await ws.send_json(vol_msg)
+                except asyncio.QueueEmpty:
+                    break
                 except Exception:
                     break
 
@@ -166,4 +216,5 @@ async def orderbook_ws(ws: WebSocket):
         reader_task.cancel()
         ping_task.cancel()
         resync_task.cancel()
+        volume_task.cancel()
         await broadcaster.unsubscribe(queue)

@@ -1,21 +1,9 @@
 """
-Test bot — 5 users × 3-5 bots, mỗi bot mỗi tick chạy random vài test case.
+Test bot — creates bots directly (no user auth), each bot runs random trades + test cases.
 
 Mỗi tick (snipe trước candle boundary):
   1. Bot gửi batch lệnh bình thường theo profile (aggressive, conservative, ...)
   2. Xen kẽ random 2-5 test case từ CASE_POOL (boundary, invalid, edge, A+1, ...)
-
-CASE_POOL bao gồm:
-  - MARKET/LIMIT cơ bản (all symbols × timeframes × forecasts)
-  - Boundary prices: 0.01, 0.02, 0.49, 0.50, 0.51, 0.98, 0.99, invalid 0/1
-  - Boundary amounts: $0.01, $0.10, $1, $5, full balance, over balance, 0, negative
-  - LIMIT + TTL: 1s, 5s, 10s, 30s, 60s, 120s, 300s
-  - LIMIT immediate (at/above ask), LIMIT deferred (below ask)
-  - session_offset=0, session_offset=1 (A+1)
-  - Slippage tolerance: 0.01, 0.10, 0.50, 1.0, invalid 0/1.5
-  - Invalid payloads: bad symbol, bad tf, bad forecast, missing amount, bad TTL
-  - Timestamp edge: current open, next boundary, far past, far future
-  - Auth edge: bad API key
 
 Usage:
     python test_bot/bot.py                                    # defaults
@@ -41,23 +29,30 @@ NUM_USERS = int(os.environ.get("NUM_USERS", "5"))
 BOTS_PER_USER = int(os.environ.get("BOTS_PER_USER", "5"))
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
 CASES_PER_TICK = int(os.environ.get("CASES_PER_TICK", "4"))
-PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
 SNIPE_OFFSET_S = int(os.environ.get("SNIPE_OFFSET_S", "2"))
 
-BOT_BALANCE_MIN = int(os.environ.get("BOT_BALANCE_MIN", "2000"))
+BOT_BALANCE_MIN = int(os.environ.get("BOT_BALANCE_MIN", "10000"))
 BOT_BALANCE_MAX = int(os.environ.get("BOT_BALANCE_MAX", "10000"))
 
-USER_NAMES = os.environ.get("USER_NAMES", "").strip()
-if USER_NAMES:
-    USER_LIST = [n.strip() for n in USER_NAMES.split(",") if n.strip()]
+BOT_PREFIXES_STR = os.environ.get("BOT_PREFIXES", os.environ.get("USER_NAMES", "")).strip()
+if BOT_PREFIXES_STR:
+    BOT_PREFIX_LIST = [n.strip() for n in BOT_PREFIXES_STR.split(",") if n.strip()]
 else:
-    USER_LIST = [f"trader-{i+1}" for i in range(NUM_USERS)]
-while len(USER_LIST) < NUM_USERS:
-    USER_LIST.append(f"trader-{len(USER_LIST)+1}")
+    BOT_PREFIX_LIST = [f"trader-{i+1}" for i in range(NUM_USERS)]
+while len(BOT_PREFIX_LIST) < NUM_USERS:
+    BOT_PREFIX_LIST.append(f"trader-{len(BOT_PREFIX_LIST)+1}")
 
 SYMBOLS = ["BTC", "ETH"]
 TIMEFRAMES = ["M5", "M15"]
 FORECASTS = ["GREEN", "RED"]
+
+# ── Futures config ─────────────────────────────────────────────────────────
+FUTURES_ENABLED = os.environ.get("FUTURES_ENABLED", "1") == "1"
+FUTURES_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+FUTURES_SIDES = ["LONG", "SHORT"]
+FUTURES_NUM_BOTS = int(os.environ.get("FUTURES_NUM_BOTS", "4"))
+FUTURES_INTERVAL = int(os.environ.get("FUTURES_INTERVAL", "20"))  # seconds between cycles
+FUTURES_BOT_PREFIX = os.environ.get("FUTURES_BOT_PREFIX", "futures-trader")
 
 REASONS = [
     "RSI oversold bounce expected",
@@ -76,6 +71,271 @@ REASONS = [
     "Golden cross on 4h chart",
     "Whale accumulation detected",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Futures bot profiles
+# ---------------------------------------------------------------------------
+
+FUTURES_PROFILES = [
+    {
+        "suffix": "futures-scalper",
+        "leverage_range": (10, 25),
+        "margin_range": (20, 100),
+        "limit_pct": 0.20,
+        "close_pct": 0.40,
+        "tp_sl_pct": 0.80,
+        "preferred_symbols": ["BTC", "ETH"],
+    },
+    {
+        "suffix": "futures-whale",
+        "leverage_range": (3, 10),
+        "margin_range": (100, 500),
+        "limit_pct": 0.40,
+        "close_pct": 0.20,
+        "tp_sl_pct": 0.60,
+        "preferred_symbols": ["BTC", "ETH", "SOL"],
+    },
+    {
+        "suffix": "futures-degen",
+        "leverage_range": (20, 50),
+        "margin_range": (10, 80),
+        "limit_pct": 0.10,
+        "close_pct": 0.50,
+        "tp_sl_pct": 0.50,
+        "preferred_symbols": FUTURES_SYMBOLS,
+    },
+    {
+        "suffix": "futures-cautious",
+        "leverage_range": (2, 5),
+        "margin_range": (50, 200),
+        "limit_pct": 0.60,
+        "close_pct": 0.15,
+        "tp_sl_pct": 0.90,
+        "preferred_symbols": ["BTC"],
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Futures API helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_futures_prices() -> dict[str, float]:
+    """Fetch current mark prices from the futures API."""
+    try:
+        r = requests.get(f"{BASE}/futures/prices", timeout=10)
+        if r.ok:
+            data = r.json().get("prices", {})
+            return {sym: float(info["price"]) for sym, info in data.items()}
+    except Exception as exc:
+        log.debug("Futures price fetch failed: %s", exc)
+    return {}
+
+
+def fetch_futures_positions(api_key: str) -> list[dict]:
+    """Fetch open futures positions."""
+    try:
+        r = requests.get(
+            f"{BASE}/futures/positions?status=OPEN",
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+        if r.ok:
+            return r.json()
+    except Exception:
+        pass
+    return []
+
+
+def place_futures_order(api_key: str, payload: dict, bot_name: str) -> None:
+    """Place a futures order and log the result."""
+    r = requests.post(
+        f"{BASE}/futures/orders",
+        json=payload,
+        headers={"Content-Type": "application/json", "x-api-key": api_key},
+        timeout=15,
+    )
+    if r.ok:
+        data = r.json()
+        status = data.get("status", "?")
+        if status == "filled":
+            log.info(
+                "%s [futures] FILLED %s %s %dx $%.2f → pos#%d entry=$%.2f liq=$%.2f fee=$%.4f",
+                bot_name, payload["side"], payload["symbol"], payload["leverage"],
+                payload["amount"], data.get("position_id", 0),
+                data.get("entry_price", 0), data.get("liquidation_price", 0),
+                data.get("entry_fee", 0),
+            )
+        else:
+            log.info(
+                "%s [futures] PENDING %s %s %dx $%.2f limit=$%.2f → order#%d",
+                bot_name, payload["side"], payload["symbol"], payload["leverage"],
+                payload["amount"], payload.get("limit_price", 0),
+                data.get("order_id", 0),
+            )
+    else:
+        log.warning(
+            "%s [futures] Order failed (%d): %s",
+            bot_name, r.status_code, r.text[:200],
+        )
+
+
+def close_futures_position(api_key: str, position_id: int, bot_name: str) -> None:
+    """Close a futures position at market."""
+    r = requests.post(
+        f"{BASE}/futures/positions/{position_id}/close",
+        headers={"x-api-key": api_key},
+        timeout=15,
+    )
+    if r.ok:
+        data = r.json()
+        log.info(
+            "%s [futures] CLOSED pos#%d pnl=$%.2f exit=$%.2f fee=$%.4f",
+            bot_name, position_id, data.get("realized_pnl", 0),
+            data.get("exit_price", 0), data.get("exit_fee", 0),
+        )
+    else:
+        log.warning(
+            "%s [futures] Close failed pos#%d (%d): %s",
+            bot_name, position_id, r.status_code, r.text[:200],
+        )
+
+
+def update_futures_tp_sl(api_key: str, position_id: int, tp: float | None, sl: float | None, bot_name: str) -> None:
+    """Update TP/SL on an open position."""
+    body: dict = {}
+    if tp is not None:
+        body["tp_price"] = tp
+    if sl is not None:
+        body["sl_price"] = sl
+    if not body:
+        return
+    try:
+        r = requests.patch(
+            f"{BASE}/futures/positions/{position_id}",
+            json=body,
+            headers={"Content-Type": "application/json", "x-api-key": api_key},
+            timeout=10,
+        )
+        if r.ok:
+            log.info("%s [futures] Updated pos#%d TP=%s SL=%s", bot_name, position_id, tp, sl)
+        else:
+            log.warning("%s [futures] TP/SL update failed pos#%d: %s", bot_name, position_id, r.text[:200])
+    except Exception as exc:
+        log.error("%s [futures] TP/SL update error: %s", bot_name, exc)
+
+
+# ---------------------------------------------------------------------------
+# Futures trade builders
+# ---------------------------------------------------------------------------
+
+
+def build_futures_trade(profile: dict, prices: dict[str, float]) -> dict | None:
+    """Build a single futures order payload based on profile and current prices."""
+    symbols = [s for s in profile["preferred_symbols"] if s in prices]
+    if not symbols:
+        return None
+
+    sym = random.choice(symbols)
+    mark = prices[sym]
+    side = random.choice(FUTURES_SIDES)
+    leverage = random.randint(*profile["leverage_range"])
+    lo, hi = profile["margin_range"]
+    margin = round(random.uniform(lo, hi), 2)
+
+    is_limit = random.random() < profile["limit_pct"]
+    order_type = "LIMIT" if is_limit else "MARKET"
+
+    payload: dict = {
+        "symbol": sym,
+        "side": side,
+        "amount": margin,
+        "leverage": leverage,
+        "order_type": order_type,
+    }
+
+    if is_limit:
+        if side == "LONG":
+            payload["limit_price"] = round(mark * random.uniform(0.993, 0.999), 2)
+        else:
+            payload["limit_price"] = round(mark * random.uniform(1.001, 1.007), 2)
+        payload["ttl"] = random.choice([30, 60, 120, 300])
+
+    # Add TP/SL
+    if random.random() < profile["tp_sl_pct"]:
+        ref = payload.get("limit_price", mark)
+        tp_pct = random.uniform(0.005, 0.03)
+        sl_pct = random.uniform(0.003, 0.02)
+        if side == "LONG":
+            payload["tp_price"] = round(ref * (1 + tp_pct), 2)
+            payload["sl_price"] = round(ref * (1 - sl_pct), 2)
+        else:
+            payload["tp_price"] = round(ref * (1 - tp_pct), 2)
+            payload["sl_price"] = round(ref * (1 + sl_pct), 2)
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Futures trading loop
+# ---------------------------------------------------------------------------
+
+
+def futures_trader_loop(bot_name: str, api_key: str, profile: dict) -> None:
+    """Continuous futures trading loop — open/close positions every N seconds."""
+    interval = FUTURES_INTERVAL
+    log.info(
+        "%s [futures] started: style=%s interval=%ds leverage=%s margin=%s symbols=%s",
+        bot_name, profile["suffix"], interval,
+        profile["leverage_range"], profile["margin_range"],
+        profile["preferred_symbols"],
+    )
+
+    # Initial stagger
+    time.sleep(random.uniform(0, 10))
+
+    while True:
+        try:
+            prices = fetch_futures_prices()
+            if not prices:
+                log.warning("%s [futures] No prices available, retrying...", bot_name)
+                time.sleep(interval)
+                continue
+
+            # Maybe close some existing positions
+            positions = fetch_futures_positions(api_key)
+            for pos in positions:
+                if random.random() < profile["close_pct"]:
+                    close_futures_position(api_key, pos["id"], bot_name)
+                    time.sleep(random.uniform(0.3, 1.0))
+                elif random.random() < 0.15:
+                    # Randomly adjust TP/SL on some positions
+                    mark = prices.get(pos["symbol"])
+                    if mark:
+                        tp_pct = random.uniform(0.005, 0.04)
+                        sl_pct = random.uniform(0.003, 0.025)
+                        if pos["side"] == "LONG":
+                            new_tp = round(mark * (1 + tp_pct), 2)
+                            new_sl = round(mark * (1 - sl_pct), 2)
+                        else:
+                            new_tp = round(mark * (1 - tp_pct), 2)
+                            new_sl = round(mark * (1 + sl_pct), 2)
+                        update_futures_tp_sl(api_key, pos["id"], new_tp, new_sl, bot_name)
+
+            # Open 1-3 new positions
+            num_trades = random.randint(1, 3)
+            for _ in range(num_trades):
+                payload = build_futures_trade(profile, prices)
+                if payload:
+                    place_futures_order(api_key, payload, bot_name)
+                    time.sleep(random.uniform(0.5, 1.5))
+
+        except Exception as e:
+            log.error("%s [futures] Error: %s", bot_name, e)
+
+        time.sleep(interval + random.uniform(-5, 5))
 
 
 # ---------------------------------------------------------------------------
@@ -662,53 +922,17 @@ def wait_for_api() -> bool:
     return False
 
 
-def register_or_login_user(username: str, password: str) -> str:
-    r = requests.post(
-        f"{BASE}/auth/register",
-        json={"username": username, "password": password},
-        timeout=10,
-    )
-    if r.status_code == 201:
-        log.info("User registered: %s", username)
-        return r.json()["access_token"]
-
-    if r.status_code == 409:
-        r = requests.post(
-            f"{BASE}/auth/login",
-            json={"username": username, "password": password},
-            timeout=10,
-        )
-        r.raise_for_status()
-        log.info("User logged in: %s", username)
-        return r.json()["access_token"]
-
-    r.raise_for_status()
-    return ""
-
-
-def fetch_my_bots(jwt_token: str) -> list[dict]:
-    r = requests.get(
-        f"{BASE}/bots/my",
-        headers={"Authorization": f"Bearer {jwt_token}"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    bots = r.json()
-    log.info("Fetched %d existing bot(s) for user", len(bots))
-    return bots
-
-
-def create_bot(bot_name: str, jwt_token: str, initial_balance: float = 10000.0) -> str:
-    log.info("Creating bot '%s' (balance=$%.0f) ...", bot_name, initial_balance)
+def get_or_create_bot(bot_name: str, initial_balance: float = 10000.0) -> str:
+    """Create a bot or return existing one's api_key (no user auth needed)."""
+    log.info("Getting/creating bot '%s' (balance=$%.0f) ...", bot_name, initial_balance)
     r = requests.post(
         f"{BASE}/bots/",
-        json={"bot_name": bot_name, "initial_balance": initial_balance},
-        headers={"Authorization": f"Bearer {jwt_token}"},
+        json={"bot_name": bot_name, "initial_balance": initial_balance, "get_or_create": True},
         timeout=10,
     )
     r.raise_for_status()
     data = r.json()
-    log.info("Bot created: name=%s balance=$%.0f", data["bot_name"], data["balance"])
+    log.info("Bot ready: name=%s balance=$%.0f", data["bot_name"], data["balance"])
     return data["api_key"]
 
 
@@ -942,57 +1166,29 @@ def _match_profile(bot_name: str) -> dict:
     return random.choice(BOT_PROFILES)
 
 
-def setup_user(username: str, num_bots: int) -> list[tuple[str, str, dict]]:
-    """Setup 1 user: register/login → reuse or create bots.
+def setup_bots(prefix: str, num_bots: int) -> list[tuple[str, str, dict]]:
+    """Setup bots directly (no user auth needed).
 
     Args:
-        num_bots: number of bots for this user (3-5).
+        prefix: bot name prefix (e.g. "trader-1").
+        num_bots: number of bots to create (3-5).
     """
-    try:
-        jwt_token = register_or_login_user(username, PASSWORD)
-    except Exception as e:
-        log.error("Failed to register/login user '%s': %s", username, e)
-        return []
-
-    existing_bots: list[dict] = []
-    try:
-        existing_bots = fetch_my_bots(jwt_token)
-    except Exception as e:
-        log.warning("[%s] Failed to fetch bots: %s", username, e)
-
     bot_slots: list[tuple[str, str, dict]] = []
 
-    # Reuse active bots
-    for bot_data in existing_bots:
-        if len(bot_slots) >= num_bots:
-            break
-        if not bot_data.get("is_active", True):
-            continue
-        if bot_data.get("status") == "DELETED":
-            continue
-        name = bot_data["bot_name"]
-        profile = _match_profile(name)
-        bot_slots.append((name, bot_data["api_key"], profile))
-        log.info(
-            "[%s] Reusing bot: %s (style=%s, balance=$%.0f)",
-            username, name, profile["suffix"], bot_data.get("balance", 0),
-        )
-
-    # Create new bots
     all_profiles = BOT_PROFILES + [A1_PROFILE]
-    for i in range(len(bot_slots), num_bots):
+    for i in range(num_bots):
         profile = all_profiles[i % len(all_profiles)]
-        bot_name = f"{username}-{profile['suffix']}"
+        bot_name = f"{prefix}-{profile['suffix']}"
         balance = random.randint(BOT_BALANCE_MIN, BOT_BALANCE_MAX)
         balance = round(balance / 50) * 50
         balance = max(BOT_BALANCE_MIN, balance)
         try:
-            api_key = create_bot(bot_name, jwt_token, initial_balance=balance)
+            api_key = get_or_create_bot(bot_name, initial_balance=balance)
             bot_slots.append((bot_name, api_key, profile))
         except Exception as e:
-            log.error("[%s] Failed to create bot '%s': %s", username, bot_name, e)
+            log.error("[%s] Failed to create bot '%s': %s", prefix, bot_name, e)
 
-    log.info("[%s] Setup complete: %d bot(s)", username, len(bot_slots))
+    log.info("[%s] Setup complete: %d bot(s)", prefix, len(bot_slots))
     return bot_slots
 
 
@@ -1008,78 +1204,70 @@ def main():
     all_bot_slots: list[tuple[str, str, dict]] = []
 
     for i in range(NUM_USERS):
-        username = USER_LIST[i]
+        prefix = BOT_PREFIX_LIST[i]
         num_bots = random.randint(3, min(BOTS_PER_USER, 5))
         log.info("=" * 60)
-        log.info("Setting up user %d/%d: %s (%d bots)", i + 1, NUM_USERS, username, num_bots)
-        slots = setup_user(username, num_bots)
+        log.info("Setting up group %d/%d: %s (%d bots)", i + 1, NUM_USERS, prefix, num_bots)
+        slots = setup_bots(prefix, num_bots)
         all_bot_slots.extend(slots)
 
     if not all_bot_slots:
         log.error("No bots available, exiting")
         return
 
-    # ── Setup random BTC-M5 trader ────────────────────────────────────────
+    # ── Setup random BTC-M5 trader bots ───────────────────────────────────
     random_bot_slots: list[tuple[str, str, dict]] = []
     log.info("=" * 60)
     log.info(
-        "Setting up random-trader: %s (%d bots)",
+        "Setting up random-trader bots: prefix=%s (%d bots)",
         RANDOM_TRADER_USER, RANDOM_TRADER_NUM_BOTS,
     )
-    try:
-        rt_jwt = register_or_login_user(RANDOM_TRADER_USER, PASSWORD)
-        existing_rt = []
+    for i in range(RANDOM_TRADER_NUM_BOTS):
+        profile = RANDOM_BTC_PROFILES[i % len(RANDOM_BTC_PROFILES)]
+        bot_name = f"{RANDOM_TRADER_USER}-{profile['suffix']}"
+        balance = random.randint(BOT_BALANCE_MIN, BOT_BALANCE_MAX)
+        balance = round(balance / 50) * 50
+        balance = max(BOT_BALANCE_MIN, balance)
         try:
-            existing_rt = fetch_my_bots(rt_jwt)
-        except Exception:
-            pass
-
-        # Reuse existing bots
-        for bot_data in existing_rt:
-            if len(random_bot_slots) >= RANDOM_TRADER_NUM_BOTS:
-                break
-            if not bot_data.get("is_active", True):
-                continue
-            if bot_data.get("status") == "DELETED":
-                continue
-            name = bot_data["bot_name"]
-            # Match to a random profile
-            matched = None
-            for rp in RANDOM_BTC_PROFILES:
-                if rp["suffix"] in name:
-                    matched = rp
-                    break
-            if matched is None:
-                matched = RANDOM_BTC_PROFILES[len(random_bot_slots) % len(RANDOM_BTC_PROFILES)]
-            random_bot_slots.append((name, bot_data["api_key"], matched))
-            log.info(
-                "[%s] Reusing bot: %s (style=%s, balance=$%.0f)",
-                RANDOM_TRADER_USER, name, matched["suffix"],
-                bot_data.get("balance", 0),
+            api_key = get_or_create_bot(bot_name, initial_balance=balance)
+            random_bot_slots.append((bot_name, api_key, profile))
+        except Exception as e:
+            log.error(
+                "[%s] Failed to create bot '%s': %s",
+                RANDOM_TRADER_USER, bot_name, e,
             )
-
-        # Create new bots if needed
-        for i in range(len(random_bot_slots), RANDOM_TRADER_NUM_BOTS):
-            profile = RANDOM_BTC_PROFILES[i % len(RANDOM_BTC_PROFILES)]
-            bot_name = f"{RANDOM_TRADER_USER}-{profile['suffix']}"
-            balance = random.randint(BOT_BALANCE_MIN, BOT_BALANCE_MAX)
-            balance = round(balance / 50) * 50
-            balance = max(BOT_BALANCE_MIN, balance)
-            try:
-                api_key = create_bot(bot_name, rt_jwt, initial_balance=balance)
-                random_bot_slots.append((bot_name, api_key, profile))
-            except Exception as e:
-                log.error(
-                    "[%s] Failed to create bot '%s': %s",
-                    RANDOM_TRADER_USER, bot_name, e,
-                )
-    except Exception as e:
-        log.error("Failed to setup random-trader '%s': %s", RANDOM_TRADER_USER, e)
 
     log.info(
         "[%s] Setup complete: %d random BTC-M5 bot(s)",
         RANDOM_TRADER_USER, len(random_bot_slots),
     )
+
+    # ── Setup futures trader bots ──────────────────────────────────────────
+    futures_bot_slots: list[tuple[str, str, dict]] = []
+    if FUTURES_ENABLED:
+        log.info("=" * 60)
+        log.info(
+            "Setting up futures trader bots: prefix=%s (%d bots)",
+            FUTURES_BOT_PREFIX, FUTURES_NUM_BOTS,
+        )
+        for i in range(FUTURES_NUM_BOTS):
+            profile = FUTURES_PROFILES[i % len(FUTURES_PROFILES)]
+            bot_name = f"{FUTURES_BOT_PREFIX}-{profile['suffix']}"
+            balance = random.randint(BOT_BALANCE_MIN, BOT_BALANCE_MAX)
+            balance = round(balance / 50) * 50
+            balance = max(BOT_BALANCE_MIN, balance)
+            try:
+                api_key = get_or_create_bot(bot_name, initial_balance=balance)
+                futures_bot_slots.append((bot_name, api_key, profile))
+            except Exception as e:
+                log.error(
+                    "[%s] Failed to create futures bot '%s': %s",
+                    FUTURES_BOT_PREFIX, bot_name, e,
+                )
+        log.info(
+            "[%s] Setup complete: %d futures bot(s)",
+            FUTURES_BOT_PREFIX, len(futures_bot_slots),
+        )
 
     # Summary
     log.info("=" * 60)
@@ -1091,6 +1279,11 @@ def main():
         "  + %d random BTC-M5 bots (user=%s, interval=%ds)",
         len(random_bot_slots), RANDOM_TRADER_USER, RANDOM_TRADER_INTERVAL,
     )
+    if FUTURES_ENABLED:
+        log.info(
+            "  + %d futures bots (prefix=%s, interval=%ds)",
+            len(futures_bot_slots), FUTURES_BOT_PREFIX, FUTURES_INTERVAL,
+        )
     log.info("=" * 60)
 
     threads = []
@@ -1120,6 +1313,21 @@ def main():
         log.info(
             "Thread started for %s (%s) [random-trader, %ds interval]",
             bot_name, profile["suffix"], RANDOM_TRADER_INTERVAL,
+        )
+
+    # Futures trader threads (continuous, every N seconds)
+    for bot_name, api_key, profile in futures_bot_slots:
+        t = threading.Thread(
+            target=futures_trader_loop,
+            args=(bot_name, api_key, profile),
+            name=bot_name,
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info(
+            "Thread started for %s (%s) [futures, %ds interval]",
+            bot_name, profile["suffix"], FUTURES_INTERVAL,
         )
 
     log.info(
