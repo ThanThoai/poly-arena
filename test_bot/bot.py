@@ -926,7 +926,7 @@ def get_or_create_bot(bot_name: str, initial_balance: float = 10000.0) -> str:
     """Create a bot or return existing one's api_key (no user auth needed)."""
     log.info("Getting/creating bot '%s' (balance=$%.0f) ...", bot_name, initial_balance)
     r = requests.post(
-        f"{BASE}/bots/",
+        f"{BASE}/bots",
         json={"bot_name": bot_name, "initial_balance": initial_balance, "get_or_create": True},
         timeout=10,
     )
@@ -938,7 +938,7 @@ def get_or_create_bot(bot_name: str, initial_balance: float = 10000.0) -> str:
 
 def place_trade(api_key: str, payload: dict, bot_name: str) -> None:
     r = requests.post(
-        f"{BASE}/binary-options/",
+        f"{BASE}/binary-options",
         json=payload,
         headers={"Content-Type": "application/json", "x-api-key": api_key},
         timeout=15,
@@ -973,7 +973,7 @@ def place_case(api_key: str, tag: str, payload: dict, bot_name: str,
                expect_fail: bool = False) -> None:
     """Place a test case order with tag logging."""
     r = requests.post(
-        f"{BASE}/binary-options/",
+        f"{BASE}/binary-options",
         json=payload,
         headers={"Content-Type": "application/json", "x-api-key": api_key},
         timeout=15,

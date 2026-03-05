@@ -19,7 +19,7 @@ from schemas import (
 router = APIRouter()
 
 
-@router.post("/", response_model=BotResponse, status_code=201)
+@router.post("", response_model=BotResponse, status_code=201)
 def create_bot(
     payload: BotCreate,
     db: Session = Depends(get_db),
@@ -47,7 +47,7 @@ def create_bot(
     return bot
 
 
-@router.get("/", response_model=List[BotPublic])
+@router.get("", response_model=List[BotPublic])
 def list_bots(db: Session = Depends(get_db)):
     bots = db.query(Bot).order_by(Bot.created_at.desc()).all()
     user_ids = {b.user_id for b in bots if b.user_id}

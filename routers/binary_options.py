@@ -551,7 +551,7 @@ def _queue_prefilled_to_me(
         )
 
 
-@router.post("/", response_model=BOResponse, status_code=201)
+@router.post("", response_model=BOResponse, status_code=201)
 def create_bo(
     payload: BOCreate,
     x_api_key: str = Header(..., alias="x-api-key", description="Bot API key"),
@@ -1086,7 +1086,7 @@ def create_bo(
 
 # ─── Danh sách lệnh ───────────────────────────────────────────────────────────
 
-@router.get("/", response_model=List[BOResponse])
+@router.get("", response_model=List[BOResponse])
 def list_bo(
     bot_name:  Optional[str]          = Query(None),
     symbol:    Optional[BOSymbol]     = Query(None),

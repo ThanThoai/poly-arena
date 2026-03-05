@@ -25,7 +25,7 @@ def _enrich(ba: BotAchievement, bot: Bot, defn: AchievementDefinition) -> dict:
     }
 
 
-@router.get("/", response_model=list[AchievementDefinitionResponse])
+@router.get("", response_model=list[AchievementDefinitionResponse])
 def list_achievements(db: Session = Depends(get_db)):
     """List all achievement definitions."""
     return db.query(AchievementDefinition).order_by(AchievementDefinition.id).all()

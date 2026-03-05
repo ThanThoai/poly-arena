@@ -834,6 +834,7 @@ app = FastAPI(
     description="Binary Options trading dashboard — order tracking, P&L, and bot analytics.",
     version="2.0.0",
     lifespan=lifespan,
+    redirect_slashes=False,
     docs_url=None if _disable_docs else "/docs",
     redoc_url=None if _disable_docs else "/redoc",
     openapi_url=None if _disable_docs else "/openapi.json",

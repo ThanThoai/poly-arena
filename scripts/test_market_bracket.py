@@ -62,7 +62,7 @@ def _get_or_create_bot(api: str, jwt: str, bot_name: str) -> str:
             return bot["api_key"]
 
     # Not found — create
-    r = requests.post(f"{api}/bots/", json={"bot_name": bot_name}, headers={"Authorization": f"Bearer {jwt}"}, timeout=10)
+    r = requests.post(f"{api}/bots", json={"bot_name": bot_name}, headers={"Authorization": f"Bearer {jwt}"}, timeout=10)
     r.raise_for_status()
     data = r.json()
     print(f"[+] Created bot: {bot_name} (balance=${data['balance']:.2f})")
@@ -79,7 +79,7 @@ def _resolve_bot_api_key(api: str) -> str:
 
 def create_order(api: str, payload: dict) -> dict:
     resp = requests.post(
-        f"{api}/binary-options/",
+        f"{api}/binary-options",
         json=payload,
         headers={"X-API-Key": _BOT_API_KEY},
     )

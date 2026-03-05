@@ -43,7 +43,7 @@ SIDES = ["LONG", "SHORT"]
 def get_or_create_bot(bot_name: str) -> str:
     """Create bot or return existing one's api_key (no user auth needed)."""
     r = requests.post(
-        f"{BASE}/bots/",
+        f"{BASE}/bots",
         json={"bot_name": bot_name, "get_or_create": True},
         timeout=10,
     )

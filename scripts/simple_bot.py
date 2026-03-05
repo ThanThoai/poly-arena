@@ -78,7 +78,7 @@ def get_or_create_bot(jwt: str, bot_name: str) -> str:
             return bot["api_key"]
 
     r = requests.post(
-        f"{BASE}/bots/",
+        f"{BASE}/bots",
         json={"bot_name": bot_name},
         headers={"Authorization": f"Bearer {jwt}"},
         timeout=10,
@@ -95,7 +95,7 @@ def get_or_create_bot(jwt: str, bot_name: str) -> str:
 def place_trade(api_key: str, payload: dict) -> dict | None:
     """Place a single trade, return response dict or None on failure."""
     r = requests.post(
-        f"{BASE}/binary-options/",
+        f"{BASE}/binary-options",
         json=payload,
         headers={"Content-Type": "application/json", "x-api-key": api_key},
         timeout=15,

@@ -89,7 +89,7 @@ def run_bot(bot_cfg: dict, api_base: str, api_key: str) -> None:
             forecast = rnd.choice(FORECASTS)
             try:
                 resp = httpx.post(
-                    f"{api_base}/binary-options/",
+                    f"{api_base}/binary-options",
                     json={
                         "symbol": symbol,
                         "timeframe": timeframe,
@@ -182,7 +182,7 @@ def ensure_bots(api_base: str) -> dict:
         name = cfg["name"]
         try:
             resp = httpx.post(
-                f"{api_base}/bots/",
+                f"{api_base}/bots",
                 json={"bot_name": name},
                 headers={"Authorization": f"Bearer {jwt_token}"},
                 timeout=10.0,

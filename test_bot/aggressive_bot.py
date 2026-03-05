@@ -95,7 +95,7 @@ def build_trade(target_ts: int | None = None, best_ask: float | None = None) -> 
 
 def place_trade(api_key: str, payload: dict) -> None:
     r = requests.post(
-        f"{BASE}/binary-options/",
+        f"{BASE}/binary-options",
         json=payload,
         headers={"Content-Type": "application/json", "x-api-key": api_key},
         timeout=15,
@@ -131,7 +131,7 @@ def get_or_create_bot() -> str:
     """Create bot or return existing one's api_key (no user auth needed)."""
     log.info("Getting/creating bot '%s' (balance=$%.0f)", BOT_NAME, BOT_BALANCE)
     r = requests.post(
-        f"{BASE}/bots/",
+        f"{BASE}/bots",
         json={"bot_name": BOT_NAME, "initial_balance": BOT_BALANCE, "get_or_create": True},
         timeout=10,
     )

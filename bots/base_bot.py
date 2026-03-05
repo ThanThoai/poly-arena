@@ -207,7 +207,7 @@ class BaseBot(ABC):
         trade_amount = amount if amount is not None else self.amount
         try:
             resp = httpx.post(
-                f"{self.api_base}/binary-options/",
+                f"{self.api_base}/binary-options",
                 json={
                     "symbol": symbol,
                     "timeframe": self.timeframe,
