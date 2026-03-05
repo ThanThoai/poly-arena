@@ -175,6 +175,8 @@ def test_bot(db):
         bot_name="test-bot",
         api_key=secrets.token_urlsafe(32),
         is_active=True,
+        initial_balance=10000.0,
+        balance=10000.0,
     )
     db.add(bot)
     db.commit()

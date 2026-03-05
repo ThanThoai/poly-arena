@@ -3,9 +3,8 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
 from database import get_db
-from models import AchievementDefinition, Bot, BotAchievement, User
+from models import AchievementDefinition, Bot, BotAchievement
 from schemas import AchievementDefinitionResponse, BotAchievementResponse
 
 router = APIRouter()
@@ -60,20 +59,3 @@ def all_bot_achievements(db: Session = Depends(get_db)):
     for ba, bot, defn in rows:
         grouped.setdefault(ba.bot_id, []).append(_enrich(ba, bot, defn))
     return grouped
-
-
-@router.get("/my", response_model=list[BotAchievementResponse])
-def my_achievements(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """List all achievements across all bots owned by the current user."""
-    rows = (
-        db.query(BotAchievement, Bot, AchievementDefinition)
-        .join(Bot, Bot.id == BotAchievement.bot_id)
-        .join(AchievementDefinition, AchievementDefinition.id == BotAchievement.achievement_id)
-        .filter(Bot.user_id == user.id)
-        .order_by(BotAchievement.earned_at.desc())
-        .all()
-    )
-    return [_enrich(ba, bot, defn) for ba, bot, defn in rows]

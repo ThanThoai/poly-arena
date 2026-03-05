@@ -259,6 +259,7 @@ class UserBalanceSnapshotResponse(BaseModel):
     session_pnl:  Optional[float] = None
     prev_balance: Optional[float] = None
     bot_pnl:      Optional[float] = None
+    unrealized_pnl: Optional[float] = None
     recorded_at:  Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -266,7 +267,7 @@ class UserBalanceSnapshotResponse(BaseModel):
 
 class BotCreate(BaseModel):
     bot_name: str
-    initial_balance: float = 1000.0
+    initial_balance: float = 10000.0
 
 
 class BotRename(BaseModel):

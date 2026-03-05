@@ -6,8 +6,8 @@ Thực hiện:
   1. Xoá toàn bộ binary_options (lịch sử lệnh)
   2. Xoá toàn bộ balance_history (snapshot balance bot)
   3. Xoá toàn bộ user_balance_history (snapshot balance user)
-  4. Reset mỗi bot: balance = initial_balance = 1000, status = ACTIVE
-  5. Reset mỗi user: initial_balance = 5000 - tổng initial_balance các bot sở hữu
+  4. Reset mỗi bot: balance = initial_balance = 10000, status = ACTIVE
+  5. Reset mỗi user: initial_balance = 50000 - tổng initial_balance các bot sở hữu
 
 Usage:
     python scripts/reset_balances.py          # dry-run (chỉ hiển thị)
@@ -25,8 +25,8 @@ from database import SessionLocal, engine, Base
 from datetime import datetime, timezone
 from models import Bot, User, UserBalanceSnapshot
 
-BOT_BALANCE = 1000.0
-USER_TOTAL = 5000.0
+BOT_BALANCE = 10000.0
+USER_TOTAL = 50000.0
 
 
 def reset(apply: bool = False) -> None:

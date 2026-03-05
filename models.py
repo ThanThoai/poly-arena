@@ -10,8 +10,8 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-USER_INITIAL_BALANCE = 5_000.0
-INITIAL_BALANCE = 1_000.0
+USER_INITIAL_BALANCE = 50_000.0
+INITIAL_BALANCE = 10_000.0
 
 
 class BotStatus(str, enum.Enum):
@@ -113,6 +113,7 @@ class UserBalanceSnapshot(Base):
     session_pnl   = Column(Numeric(18, 8, asdecimal=False), nullable=True)
     prev_balance  = Column(Numeric(18, 8, asdecimal=False), nullable=True)
     bot_pnl       = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+    unrealized_pnl = Column(Numeric(18, 8, asdecimal=False), nullable=True)
     recorded_at   = Column(DateTime(timezone=True), default=_now)
 
 

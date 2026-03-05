@@ -44,8 +44,8 @@ CASES_PER_TICK = int(os.environ.get("CASES_PER_TICK", "4"))
 PASSWORD = os.environ.get("TEST_PASSWORD", "testpass123")
 SNIPE_OFFSET_S = int(os.environ.get("SNIPE_OFFSET_S", "2"))
 
-BOT_BALANCE_MIN = int(os.environ.get("BOT_BALANCE_MIN", "200"))
-BOT_BALANCE_MAX = int(os.environ.get("BOT_BALANCE_MAX", "2000"))
+BOT_BALANCE_MIN = int(os.environ.get("BOT_BALANCE_MIN", "2000"))
+BOT_BALANCE_MAX = int(os.environ.get("BOT_BALANCE_MAX", "10000"))
 
 USER_NAMES = os.environ.get("USER_NAMES", "").strip()
 if USER_NAMES:
@@ -698,7 +698,7 @@ def fetch_my_bots(jwt_token: str) -> list[dict]:
     return bots
 
 
-def create_bot(bot_name: str, jwt_token: str, initial_balance: float = 1000.0) -> str:
+def create_bot(bot_name: str, jwt_token: str, initial_balance: float = 10000.0) -> str:
     log.info("Creating bot '%s' (balance=$%.0f) ...", bot_name, initial_balance)
     r = requests.post(
         f"{BASE}/bots/",

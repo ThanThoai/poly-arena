@@ -1,10 +1,10 @@
 import secrets
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from auth import get_current_user
 from database import get_db
 from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory, UserBalanceSnapshot
 from schemas import (
@@ -16,10 +16,9 @@ from schemas import (
 router = APIRouter()
 
 
-@router.post("/", response_model=BotResponse, status_code=201)
+@router.post("", response_model=BotResponse, status_code=201)
 def create_bot(
     payload: BotCreate,
-    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     name = payload.bot_name.strip()
@@ -29,26 +28,12 @@ def create_bot(
     if db.query(Bot).filter(Bot.bot_name == name).first():
         raise HTTPException(status_code=409, detail=f"Bot '{name}' already exists")
 
-    # Validate balance pool
-    allocated = sum(
-        row[0] or 0
-        for row in db.query(Bot.initial_balance).filter(
-            Bot.user_id == user.id, Bot.is_active == True
-        ).all()
-    )
-    available = (user.initial_balance or 0) - allocated
-    if payload.initial_balance > available:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient balance pool. Available: ${available:,.2f}, Requested: ${payload.initial_balance:,.2f}",
-        )
-
     bot = Bot(
         bot_name=name,
         api_key=secrets.token_urlsafe(32),
         initial_balance=payload.initial_balance,
         balance=payload.initial_balance,
-        user_id=user.id,
+        user_id=None,
     )
     db.add(bot)
     db.commit()
@@ -56,7 +41,7 @@ def create_bot(
     return bot
 
 
-@router.get("/", response_model=List[BotPublic])
+@router.get("", response_model=List[BotPublic])
 def list_bots(db: Session = Depends(get_db)):
     bots = db.query(Bot).order_by(Bot.created_at.desc()).all()
     user_ids = {b.user_id for b in bots if b.user_id}
@@ -72,31 +57,17 @@ def list_bots(db: Session = Depends(get_db)):
     return bots
 
 
-@router.get("/my", response_model=List[BotResponse])
-def list_my_bots(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """List only bots owned by the authenticated user."""
-    return db.query(Bot).filter(Bot.user_id == user.id).order_by(Bot.created_at.desc()).all()
-
-
 @router.patch("/{bot_id}/rename", response_model=BotPublic)
 def rename_bot(
     bot_id: int,
     payload: BotRename,
-    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
 
-    if bot.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your bot")
-
-    # api_key check is optional — skip if not provided (owner already verified via JWT)
-    if payload.api_key and bot.api_key != payload.api_key:
+    if not payload.api_key or bot.api_key != payload.api_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     new_name = payload.new_bot_name.strip()
@@ -127,15 +98,15 @@ def rename_bot(
 @router.delete("/{bot_id}", status_code=200)
 def delete_bot(
     bot_id: int,
-    user: User = Depends(get_current_user),
+    api_key: str = Query(..., description="Bot API key for verification"),
     db: Session = Depends(get_db),
 ):
-    """Delete (deactivate) a bot and refund its current balance back to the user's available pool."""
+    """Delete (deactivate) a bot."""
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
-    if bot.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your bot")
+    if bot.api_key != api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     if not bot.is_active:
         raise HTTPException(status_code=400, detail="Bot is already deactivated")
 
@@ -151,23 +122,13 @@ def delete_bot(
             detail=f"Bot has {pending_count} pending trade(s). Cancel or wait for settlement first.",
         )
 
-    refund = bot.balance or 0
     bot.is_active = False
     bot.status = "DELETED"
     bot.balance = 0
 
-    # Refund bot's current balance back to user's pool by increasing initial_balance.
-    # Since available = user.initial_balance - sum(active bots initial_balance),
-    # and this bot is now deactivated, its initial_balance no longer counts as allocated.
-    # The bot's P&L (balance - initial_balance) needs to be added to user's pool.
-    pnl = refund - (bot.initial_balance or 0)
-    if pnl != 0:
-        user.initial_balance = round((user.initial_balance or 0) + pnl, 8)
-
     db.commit()
     return {
-        "detail": f"Bot '{bot.bot_name}' deactivated. ${refund:,.2f} returned to your balance pool.",
-        "refunded": refund,
+        "detail": f"Bot '{bot.bot_name}' deactivated.",
     }
 
 
@@ -175,36 +136,18 @@ def delete_bot(
 def adjust_bot_balance(
     bot_id: int,
     payload: BotBalanceAdjust,
-    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Adjust a bot's balance (initial_balance and current balance). Validates against user's available pool."""
+    """Adjust a bot's balance (initial_balance and current balance)."""
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
-    if bot.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your bot")
     if not bot.is_active:
         raise HTTPException(status_code=400, detail="Bot is deactivated")
 
     new_balance = payload.balance
     old_initial = bot.initial_balance or 0
     delta = new_balance - old_initial
-
-    # Check user has enough available balance for increases
-    if delta > 0:
-        allocated = sum(
-            row[0] or 0
-            for row in db.query(Bot.initial_balance).filter(
-                Bot.user_id == user.id, Bot.is_active == True
-            ).all()
-        )
-        available = (user.initial_balance or 0) - allocated
-        if delta > available:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Insufficient balance pool. Available: ${available:,.2f}, Increase requested: ${delta:,.2f}",
-            )
 
     # Adjust both initial_balance and current balance by the same delta
     bot.initial_balance = new_balance
@@ -232,6 +175,8 @@ def get_balance_history(
         bots_q = bots_q.filter(Bot.bot_name == bot_name)
     bots = bots_q.all()
 
+    now = datetime.now(timezone.utc)
+
     seed_records = [
         BalanceHistory(
             id=0,
@@ -243,39 +188,54 @@ def get_balance_history(
         for b in bots
     ]
 
+    # Current bot balance as the latest data point
+    current_records = [
+        BalanceHistory(
+            id=0,
+            bot_name=b.bot_name,
+            balance=b.balance,
+            trade_id=None,
+            recorded_at=now,
+        )
+        for b in bots
+    ]
+
     q = db.query(BalanceHistory)
     if bot_name:
         q = q.filter(BalanceHistory.bot_name == bot_name)
     history = q.order_by(BalanceHistory.recorded_at.asc()).limit(limit).all()
 
-    return sorted(seed_records + history, key=lambda r: (r.recorded_at or ""))
+    return sorted(seed_records + history + current_records, key=lambda r: (r.recorded_at or ""))
 
 
 @router.get("/user-balance-history", response_model=List[UserBalanceHistoryResponse])
 def get_user_balance_history(
-    user: User = Depends(get_current_user),
+    user_id: Optional[int] = Query(None),
     limit: int = Query(500, ge=1, le=50000),
     db: Session = Depends(get_db),
 ):
-    """Get balance history for the authenticated user based on Realized P&L."""
-    # Seed record: user's initial balance at account creation
-    seed = UserBalanceHistory(
-        id=0,
-        user_id=user.id,
-        balance=user.initial_balance or 0,
-        trade_id=None,
-        recorded_at=user.created_at,
-    )
+    """Get balance history (public). Optional user_id filter."""
+    if user_id is not None:
+        target_users = db.query(User).filter(User.id == user_id).all()
+    else:
+        target_users = db.query(User).filter(User.is_active == True).all()
 
-    history = (
-        db.query(UserBalanceHistory)
-        .filter(UserBalanceHistory.user_id == user.id)
-        .order_by(UserBalanceHistory.recorded_at.asc())
-        .limit(limit)
-        .all()
-    )
+    seeds = []
+    for u in target_users:
+        seeds.append(UserBalanceHistory(
+            id=0,
+            user_id=u.id,
+            balance=u.initial_balance or 0,
+            trade_id=None,
+            recorded_at=u.created_at,
+        ))
 
-    return sorted([seed] + history, key=lambda r: (r.recorded_at or ""))
+    q = db.query(UserBalanceHistory)
+    if user_id is not None:
+        q = q.filter(UserBalanceHistory.user_id == user_id)
+    history = q.order_by(UserBalanceHistory.recorded_at.asc()).limit(limit).all()
+
+    return sorted(seeds + history, key=lambda r: (r.recorded_at or ""))
 
 
 @router.get("/user-balance-snapshots", response_model=List[UserBalanceSnapshotResponse])
@@ -324,15 +284,15 @@ def get_user_balance_snapshots(
 @router.patch("/{bot_id}/pause", response_model=BotResponse)
 def pause_bot(
     bot_id: int,
-    user: User = Depends(get_current_user),
+    api_key: str = Query(..., description="Bot API key for verification"),
     db: Session = Depends(get_db),
 ):
     """Pause an ACTIVE bot. Bot must have no pending trades."""
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
-    if bot.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your bot")
+    if bot.api_key != api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     if getattr(bot, "status", "ACTIVE") != "ACTIVE":
         raise HTTPException(status_code=400, detail=f"Bot is {bot.status}. Only ACTIVE bots can be paused.")
 
@@ -356,15 +316,15 @@ def pause_bot(
 @router.patch("/{bot_id}/resume", response_model=BotResponse)
 def resume_bot(
     bot_id: int,
-    user: User = Depends(get_current_user),
+    api_key: str = Query(..., description="Bot API key for verification"),
     db: Session = Depends(get_db),
 ):
     """Resume a PAUSED bot. Bot must have balance > 0."""
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
-    if bot.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your bot")
+    if bot.api_key != api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     if getattr(bot, "status", "ACTIVE") != "PAUSED":
         raise HTTPException(status_code=400, detail=f"Bot is {bot.status}. Only PAUSED bots can be resumed.")
     if (bot.balance or 0) <= 0:
@@ -380,33 +340,26 @@ def resume_bot(
 
 @router.get("/equity-curve")
 def equity_curve(
-    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return the user's balance history as an equity curve for charting."""
+    """Return aggregate balance history as an equity curve for charting."""
     rows = (
         db.query(UserBalanceHistory)
-        .filter(UserBalanceHistory.user_id == user.id)
         .order_by(UserBalanceHistory.recorded_at.asc())
         .all()
     )
-    # Seed record: initial balance at account creation (consistent with user-balance-history)
-    seed = {"t": user.created_at.isoformat() if user.created_at else None, "v": user.initial_balance or 0}
-    return [seed] + [{"t": r.recorded_at.isoformat() if r.recorded_at else None, "v": r.balance} for r in rows]
+    return [{"t": r.recorded_at.isoformat() if r.recorded_at else None, "v": r.balance} for r in rows]
 
 
 @router.get("/{bot_id}/performance", response_model=BotPerformanceResponse)
 def bot_performance(
     bot_id: int,
-    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Consolidated performance view for a single bot."""
     bot = db.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found")
-    if bot.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not your bot")
 
     trades = db.query(BinaryOption).filter(BinaryOption.bot_name == bot.bot_name).all()
     wins = sum(1 for t in trades if t.result == BOResult.WIN)
@@ -545,24 +498,41 @@ def _user_pnl(user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> Us
     )
 
 
-@router.get("/user-pnl", response_model=UserPnlResponse)
+@router.get("/user-pnl", response_model=List[UserPnlResponse])
 def user_pnl(
-    user: User = Depends(get_current_user),
+    user_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """P&L for the authenticated user, aggregated across all bots."""
-    bots = db.query(Bot).filter(Bot.user_id == user.id).all()
-    bot_names = [b.bot_name for b in bots]
+    """P&L for users (public). Optional user_id filter."""
+    if user_id is not None:
+        users = db.query(User).filter(User.id == user_id).all()
+    else:
+        users = db.query(User).filter(User.is_active == True).all()
 
-    trades = (
+    all_bots = db.query(Bot).all()
+    bot_names = [b.bot_name for b in all_bots]
+
+    all_trades = (
         db.query(BinaryOption).filter(BinaryOption.bot_name.in_(bot_names)).all()
         if bot_names else []
     )
-    trades_by_bot: dict[str, list] = {name: [] for name in bot_names}
-    for t in trades:
+    trades_by_bot: dict[str, list] = {}
+    for t in all_trades:
         trades_by_bot.setdefault(t.bot_name, []).append(t)
 
-    return _user_pnl(user, bots, trades_by_bot)
+    bots_by_user: dict[int, list[Bot]] = {}
+    for b in all_bots:
+        if b.user_id:
+            bots_by_user.setdefault(b.user_id, []).append(b)
+
+    result = []
+    for u in users:
+        user_bots = bots_by_user.get(u.id, [])
+        if not user_bots:
+            continue
+        result.append(_user_pnl(u, user_bots, trades_by_bot))
+
+    return sorted(result, key=lambda x: x.realized_pnl, reverse=True)
 
 
 @router.get("/user-pnl-all", response_model=List[UserPnlResponse])
