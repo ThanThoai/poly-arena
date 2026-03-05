@@ -77,10 +77,8 @@ class RestPoller:
         self._poll_count += 1
         matching_tokens = self._get_matching_tokens()
 
-        # Try batch fetch first, fall back to individual fetches
-        book_map = await self._fetch_books_batch(all_tokens)
-        if book_map is None:
-            book_map = await self._fetch_books_individual(all_tokens)
+        # Fetch orderbooks individually via GET /book
+        book_map = await self._fetch_books_individual(all_tokens)
 
         # Process results
         applied = 0
@@ -98,17 +96,6 @@ class RestPoller:
                 "RestPoller: cycle #%d — polled %d token(s), matched %d",
                 self._poll_count, len(all_tokens), applied,
             )
-
-    async def _fetch_books_batch(self, token_ids: list[str]) -> dict[str, tuple[list[dict], list[dict]]] | None:
-        """Batch-fetch all orderbooks in a single POST /books call. Returns None on failure."""
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                None, self._pm.fetch_books_batch, token_ids
-            )
-        except Exception as exc:
-            logger.warning("RestPoller: batch fetch failed, falling back to individual: %s", exc)
-            return None
 
     async def _fetch_books_individual(self, token_ids: list[str]) -> dict[str, tuple[list[dict], list[dict]]]:
         """Fallback: fetch orderbooks individually with concurrency limit."""

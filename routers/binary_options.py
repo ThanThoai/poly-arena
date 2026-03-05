@@ -238,15 +238,20 @@ def _fetch_orderbook_rest(
     symbol: str, timeframe: str, direction: str,
     candle_open: int = 0,
 ) -> list[list]:
-    """Fetch asks from Polymarket REST API, with Redis fallback.
+    """Fetch asks from Redis orderbook (populated by WS Feed / RestPoller).
 
-    Primary: resolve token_id → call Polymarket CLOB /book endpoint.
-    Fallback: read from Redis orderbook snapshot (populated by RestPoller).
+    Primary: read from Redis session-keyed orderbook snapshot.
+    Fallback: resolve token_id → call Polymarket CLOB /book REST API.
 
     Returns sorted asks list (ascending by price) as [[price, size], ...].
     Raises HTTPException(503) if both sources are unavailable.
     """
-    # 1. Try Polymarket REST API
+    # 1. Primary: Redis orderbook snapshot (written by WS Feed / RestPoller every 200ms)
+    redis_asks = _fetch_orderbook_from_redis(symbol, timeframe, direction, candle_open)
+    if redis_asks:
+        return redis_asks
+
+    # 2. Fallback: Polymarket REST API (only if Redis has no data)
     token_id = _resolve_token_id(symbol, timeframe, direction, candle_open)
     if token_id:
         try:
@@ -256,16 +261,11 @@ def _fetch_orderbook_rest(
                 sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
                 return [[float(a["price"]), float(a["size"])] for a in sorted_asks]
         except Exception as exc:
-            logger.warning("REST orderbook fetch failed for %s: %s", token_id[:16], exc)
-
-    # 2. Fallback to Redis orderbook snapshot
-    redis_asks = _fetch_orderbook_from_redis(symbol, timeframe, direction, candle_open)
-    if redis_asks:
-        return redis_asks
+            logger.warning("REST orderbook fallback failed for %s: %s", token_id[:16], exc)
 
     raise HTTPException(
         status_code=503,
-        detail="Orderbook unavailable — both REST API and cache failed",
+        detail="Orderbook unavailable — Redis empty and REST API fallback failed",
     )
 
 
@@ -1340,30 +1340,68 @@ _price_cache: dict = {"prices": [], "fetched_at": 0.0}
 def _fetch_all_prices() -> list[dict]:
     """
     Fetch best_ask / best_bid for every symbol × timeframe × direction
-    directly from Polymarket REST API.
+    from Redis orderbook snapshots (populated by WS Feed / RestPoller).
 
-    Each call does:  Gamma API (slug → token_ids) → CLOB API (book → prices)
-    Errors on individual combos are silently skipped.
+    Falls back to legacy price:{SYM}:{TF}:{DIR} keys if session-keyed
+    orderbook is not available.
     """
+    from services.redis_client import get_sync_redis
+
     results: list[dict] = []
     try:
-        with PolymarketClient(timeout=HTTP_TIMEOUT_FAST) as pm:
-            for sym in _PRICE_SYMBOLS:
-                for tf in _PRICE_TIMEFRAMES:
-                    for direction in _PRICE_DIRECTIONS:
+        sr = get_sync_redis()
+        now_ts = int(time.time())
+
+        for sym in _PRICE_SYMBOLS:
+            for tf in _PRICE_TIMEFRAMES:
+                tf_seconds = {"M5": 300, "M15": 900}.get(tf, 300)
+                candle_open = now_ts - (now_ts % tf_seconds)
+
+                for direction in _PRICE_DIRECTIONS:
+                    best_ask = None
+                    best_bid = None
+
+                    # 1. Try session-keyed orderbook (primary)
+                    ob_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}"
+                    try:
+                        ob_data = sr.hgetall(ob_key)
+                        if ob_data:
+                            asks_raw = ob_data.get("asks")
+                            bids_raw = ob_data.get("bids")
+                            if asks_raw:
+                                asks = json.loads(asks_raw)
+                                if asks:
+                                    best_ask = float(asks[0][0])
+                            if bids_raw:
+                                bids = json.loads(bids_raw)
+                                if bids:
+                                    best_bid = float(bids[0][0])
+                    except Exception:
+                        pass
+
+                    # 2. Fallback: legacy price key
+                    if best_ask is None and best_bid is None:
                         try:
-                            ob = pm.get_orderbook(sym, tf, direction)
-                            results.append({
-                                "symbol": sym,
-                                "timeframe": tf,
-                                "direction": direction,
-                                "best_ask": ob.min_ask,
-                                "best_bid": ob.max_bid,
-                                "age_s": 0.0,
-                                "stale": False,
-                            })
+                            price_key = f"{PRICE_KEY_PREFIX}:{sym}:{tf}:{direction}"
+                            price_data = sr.hgetall(price_key)
+                            if price_data:
+                                if price_data.get("best_ask"):
+                                    best_ask = float(price_data["best_ask"])
+                                if price_data.get("best_bid"):
+                                    best_bid = float(price_data["best_bid"])
                         except Exception:
                             pass
+
+                    if best_ask is not None or best_bid is not None:
+                        results.append({
+                            "symbol": sym,
+                            "timeframe": tf,
+                            "direction": direction,
+                            "best_ask": best_ask,
+                            "best_bid": best_bid,
+                            "age_s": 0.0,
+                            "stale": False,
+                        })
     except Exception as exc:
         logger.warning("_fetch_all_prices failed: %s", exc)
     return results
@@ -1374,10 +1412,8 @@ def engine_prices():
     """
     Return best_ask and best_bid for all active symbol/timeframe/direction combos.
 
-    Fetches directly from Polymarket REST API with a 5-second in-memory cache.
-    This is simpler and more reliable than the Redis-based approach because it
-    automatically gets prices for the current session — no dependency on WS feed,
-    token rotation, or Redis state.
+    Reads from Redis orderbook snapshots (populated by WS Feed / RestPoller
+    every 200ms) with a short in-memory cache.
 
     Response format:
     {
@@ -1483,10 +1519,9 @@ def inspect_trade_public(
         .all()
     )
     if not price_rows:
-        # Fallback: legacy rows without candle_ts.
-        # For future-session orders (offset >= 1), price snapshots were
-        # recorded *before* the target session started, so we expand the
-        # query window back to order creation time.
+        # Fallback: legacy rows that have NO candle_ts tag.
+        # Only include rows where candle_ts IS NULL to avoid pulling in
+        # snapshots that belong to a different session.
         if trade_offset >= 1 and created_ts:
             fallback_start = created_ts
         else:
@@ -1497,6 +1532,7 @@ def inspect_trade_public(
                 PriceHistory.symbol == symbol_val,
                 PriceHistory.timeframe == tf_val,
                 PriceHistory.direction == direction,
+                PriceHistory.candle_ts.is_(None),
                 PriceHistory.recorded_at >= fallback_start,
                 PriceHistory.recorded_at <= session_end_dt,
             )

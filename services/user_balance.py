@@ -87,9 +87,12 @@ def _calc_bot_unrealized_pnl(db: Session, bot_name: str, sr) -> float:
       open_qty = num_shares - (exit_filled or 0)
       unrealized += open_qty * (best_bid - avg_price)
 
-    best_bid is fetched from Redis key price:{SYM}:{TF}:{DIR}
-    where DIR = UP if forecast == GREEN, DOWN if forecast == RED.
+    best_bid is derived from the session-specific orderbook in Redis:
+      orderbook:{SYM}:{TF}:{DIR}:{candle_open}
+    Each order uses its own session's orderbook to get the correct price.
     """
+    import json
+
     pending_trades = (
         db.query(BinaryOption)
         .filter(
@@ -104,14 +107,26 @@ def _calc_bot_unrealized_pnl(db: Session, bot_name: str, sr) -> float:
     total_unrealized = 0.0
     for bo in pending_trades:
         direction = "UP" if bo.forecast.value == "GREEN" else "DOWN"
-        price_key = f"price:{bo.symbol.value}:{bo.timeframe.value}:{direction}"
+        candle_open = bo.candle_open or 0
+
+        # Session-specific orderbook key
+        ob_key = f"orderbook:{bo.symbol.value}:{bo.timeframe.value}:{direction}:{candle_open}"
 
         try:
-            price_data = sr.hgetall(price_key)
-            best_bid_str = price_data.get("best_bid")
-            if not best_bid_str:
-                continue
-            best_bid = float(best_bid_str)
+            ob_data = sr.hgetall(ob_key)
+            bids_raw = ob_data.get("bids")
+            if not bids_raw:
+                # Fallback: legacy price key (current session only)
+                price_data = sr.hgetall(f"price:{bo.symbol.value}:{bo.timeframe.value}:{direction}")
+                best_bid_str = price_data.get("best_bid")
+                if not best_bid_str:
+                    continue
+                best_bid = float(best_bid_str)
+            else:
+                bids = json.loads(bids_raw)
+                if not bids:
+                    continue
+                best_bid = float(bids[0][0])  # top of book
         except Exception:
             continue
 

@@ -261,38 +261,10 @@ class SnapshotCache:
 
         entries: list[dict] = []
 
-        # Legacy keys (current session)
-        pipe = r.pipeline(transaction=False)
-        for sym, tf, dir_ in combos:
-            pipe.hgetall(f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{dir_}")
-
-        try:
-            results = await pipe.execute()
-        except Exception as exc:
-            logger.warning("Snapshot cache Redis read failed: %s", exc)
-            return []
-
-        for (sym, tf, dir_), data in zip(combos, results):
-            if not data:
-                continue
-            try:
-                bids = json.loads(data.get("bids", "[]"))
-                asks = json.loads(data.get("asks", "[]"))
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not bids and not asks:
-                continue
-            entries.append({
-                "type": "snapshot",
-                "symbol": sym,
-                "timeframe": tf,
-                "direction": dir_,
-                "bids": bids,
-                "asks": asks,
-                "updated_at": data.get("updated_at"),
-            })
-
-        # Future session keys (scan orderbook:{sym}:{tf}:{dir}:{ts})
+        # Read session-keyed orderbook keys only (orderbook:{sym}:{tf}:{dir}:{ts}).
+        # Legacy keys (without timestamp suffix) are NOT used here because they
+        # don't carry an explicit session timestamp — guessing from wall clock
+        # causes wrong session tagging at candle boundaries.
         for sym, tf, dir_ in combos:
             pattern = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{dir_}:*"
             try:

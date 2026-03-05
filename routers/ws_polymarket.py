@@ -64,6 +64,8 @@ def _book_event_from_snapshot(
     direction = entry.get("direction")
     session = entry.get("session")
     if session is None:
+        # Should not happen — snapshot entries now always include session.
+        logger.warning("Snapshot entry missing session: %s", entry.get("direction"))
         now = int(time.time())
         session = now - (now % period)
 
@@ -267,6 +269,10 @@ async def polymarket_proxy_ws(ws: WebSocket):
                 direction = msg.direction
                 session = msg.session
                 if session is None:
+                    # Should not happen — all pub/sub messages now include session.
+                    # Fallback: derive from current time (may be wrong at boundary).
+                    logger.warning("Broadcaster message missing session: %s/%s/%s",
+                                   msg.symbol, msg.timeframe, direction)
                     p = TF_SECONDS.get(timeframe, 300)
                     now = int(time.time())
                     session = now - (now % p)

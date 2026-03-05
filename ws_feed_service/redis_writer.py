@@ -501,13 +501,15 @@ class RedisWriter:
                 self._last_ob_by_combo[f"{sym}:{tf}:{direction}:{candle_ts}"] = (bids_parsed, asks_parsed)
 
         # Publish change notifications for WebSocket subscribers
-        # Legacy combos: publish without session (backward compat)
+        # Legacy combos (current session): include session field for correct routing
         if legacy_combos:
             for sym, tf, direction in legacy_combos:
+                current_ts = self._current_sessions.get(tf, 0)
                 payload = json.dumps({
                     "symbol": sym,
                     "timeframe": tf,
                     "direction": direction,
+                    "session": current_ts,
                     "bids": bids_json,
                     "asks": asks_json,
                     "updated_at": now_ts,
@@ -522,7 +524,7 @@ class RedisWriter:
             for sym, tf, direction, candle_ts in session_combos:
                 current_ts = self._current_sessions.get(tf, 0)
                 if candle_ts == current_ts:
-                    continue  # already published via legacy path
+                    continue  # already published via legacy path (with session field)
                 payload = json.dumps({
                     "symbol": sym,
                     "timeframe": tf,
