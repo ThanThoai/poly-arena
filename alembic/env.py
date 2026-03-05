@@ -16,6 +16,7 @@ if config.config_file_name is not None:
 # Import models so Base.metadata has all tables registered
 from database import Base
 import models  # noqa: F401 — registers tables on Base.metadata
+import models_futures  # noqa: F401 — registers futures tables
 
 target_metadata = Base.metadata
 
