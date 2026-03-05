@@ -39,6 +39,12 @@ def upgrade() -> None:
             END $$;
         """))
 
+    # Reuse the enum types created above via sa.Enum with create_type=False
+    side_enum = sa.Enum("LONG", "SHORT", name="futures_side_enum", create_type=False)
+    position_status_enum = sa.Enum("OPEN", "CLOSED", "LIQUIDATED", name="futures_position_status_enum", create_type=False)
+    order_type_enum = sa.Enum("MARKET", "LIMIT", name="futures_order_type_enum", create_type=False)
+    order_status_enum = sa.Enum("PENDING", "FILLED", "CANCELLED", "EXPIRED", name="futures_order_status_enum", create_type=False)
+
     if "futures_positions" not in existing:
         op.create_table(
             "futures_positions",
@@ -46,8 +52,8 @@ def upgrade() -> None:
             sa.Column("bot_name", sa.String(100), nullable=False, index=True),
             sa.Column("symbol", sa.String(20), nullable=False),
             sa.Column("exchange", sa.String(20), nullable=False, server_default="binance"),
-            sa.Column("side", sa.Enum("LONG", "SHORT", name="futures_side_enum", create_type=False), nullable=False),
-            sa.Column("status", sa.Enum("OPEN", "CLOSED", "LIQUIDATED", name="futures_position_status_enum", create_type=False), nullable=False, server_default="OPEN"),
+            sa.Column("side", side_enum, nullable=False),
+            sa.Column("status", position_status_enum, nullable=False, server_default="OPEN"),
             sa.Column("size", sa.Numeric(18, 8, asdecimal=False), nullable=False),
             sa.Column("entry_price", sa.Numeric(18, 8, asdecimal=False), nullable=False),
             sa.Column("exit_price", sa.Numeric(18, 8, asdecimal=False), nullable=True),
@@ -76,9 +82,9 @@ def upgrade() -> None:
             sa.Column("bot_name", sa.String(100), nullable=False, index=True),
             sa.Column("symbol", sa.String(20), nullable=False),
             sa.Column("exchange", sa.String(20), nullable=False, server_default="binance"),
-            sa.Column("side", sa.Enum("LONG", "SHORT", name="futures_side_enum", create_type=False), nullable=False),
-            sa.Column("order_type", sa.Enum("MARKET", "LIMIT", name="futures_order_type_enum", create_type=False), nullable=False),
-            sa.Column("status", sa.Enum("PENDING", "FILLED", "CANCELLED", "EXPIRED", name="futures_order_status_enum", create_type=False), nullable=False, server_default="PENDING"),
+            sa.Column("side", side_enum, nullable=False),
+            sa.Column("order_type", order_type_enum, nullable=False),
+            sa.Column("status", order_status_enum, nullable=False, server_default="PENDING"),
             sa.Column("size", sa.Numeric(18, 8, asdecimal=False), nullable=False),
             sa.Column("limit_price", sa.Numeric(18, 8, asdecimal=False), nullable=True),
             sa.Column("leverage", sa.Integer, nullable=False, server_default="10"),
