@@ -60,7 +60,7 @@ STUCK_ORDER_THRESHOLD_MIN = 10  # settlement_at + N min → stuck
 NULL_SETTLE_THRESHOLD_HOURS = 2  # created_at + N hours (no settlement_at) → stuck
 HEARTBEAT_INTERVAL_S = 30       # publish heartbeat every N seconds
 HEARTBEAT_TTL_S = 60            # Redis TTL for heartbeat key
-BALANCE_SNAPSHOT_CRON_SECOND = 10  # balance snapshot at :10s (after settlement at :05s)
+BALANCE_SNAPSHOT_CRON_SECOND = 15  # balance snapshot at :15s (10s buffer after settlement at :05s)
 
 # ── Queue & Stream ───────────────────────────────────────────────────────────
 

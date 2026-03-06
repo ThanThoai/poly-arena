@@ -106,15 +106,38 @@ class UserBalanceSnapshot(Base):
 
     id          = Column(Integer, primary_key=True, index=True)
     user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    balance     = Column(Numeric(18, 8, asdecimal=False), nullable=False)
-    bot_balance = Column(Numeric(18, 8, asdecimal=False), nullable=False)
-    available   = Column(Numeric(18, 8, asdecimal=False), nullable=False)
-    session_id    = Column(String(50), nullable=True)
-    session_pnl   = Column(Numeric(18, 8, asdecimal=False), nullable=True)
-    prev_balance  = Column(Numeric(18, 8, asdecimal=False), nullable=True)
-    bot_pnl       = Column(Numeric(18, 8, asdecimal=False), nullable=True)
-    unrealized_pnl = Column(Numeric(18, 8, asdecimal=False), nullable=True)
-    recorded_at   = Column(DateTime(timezone=True), default=_now)
+    recorded_at = Column(DateTime(timezone=True), default=_now)
+
+    # Session context
+    session_id  = Column(String(50), nullable=True)
+    candle_open = Column(Integer, nullable=True)
+
+    # Capital breakdown
+    unallocated    = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+    bot_cash       = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+    bo_locked      = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+    futures_locked = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+
+    # Equity = unallocated + bot_cash + bo_locked + futures_locked
+    equity = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+
+    # Mark-to-market
+    bo_unrealized_pnl      = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)
+    futures_unrealized_pnl = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)
+    unrealized_pnl         = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)
+
+    # Net liquidation = equity + unrealized_pnl
+    net_liquidation = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+
+    # P&L tracking
+    cumulative_realized_pnl = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)
+    session_realized_pnl    = Column(Numeric(18, 8, asdecimal=False), nullable=True, default=0)
+    snapshot_delta          = Column(Numeric(18, 8, asdecimal=False), nullable=True)
+
+    # Metadata
+    active_bot_count   = Column(Integer, nullable=True, default=0)
+    open_bo_count      = Column(Integer, nullable=True, default=0)
+    open_futures_count = Column(Integer, nullable=True, default=0)
 
 
 class BinaryOption(Base):

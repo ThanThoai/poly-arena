@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Bot
+from models import BalanceHistory, Bot
 from models_futures import (
     FuturesPosition, FuturesPositionStatus, FuturesSide,
     FuturesOrder, FuturesOrderType, FuturesOrderStatus,
@@ -41,6 +41,14 @@ REDIS_PRICE_PREFIX = "futures:price"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _record_balance(db: Session, bot: Bot) -> None:
+    """Record bot equity (cash + locked) in BalanceHistory after futures changes."""
+    from routers.bots import _bot_locked_margin
+    locked = _bot_locked_margin(db, bot.bot_name)
+    equity = round((bot.balance or 0) + locked, 8)
+    db.add(BalanceHistory(bot_name=bot.bot_name, balance=equity))
 
 
 def _auth_bot(api_key: str, db: Session) -> Bot:
@@ -189,6 +197,7 @@ def place_order(
             reason=req.reason,
         )
         db.add(pos)
+        _record_balance(db, bot)
         db.commit()
         db.refresh(pos)
 
@@ -246,6 +255,7 @@ def place_order(
             reason=req.reason,
         )
         db.add(order)
+        _record_balance(db, bot)
         db.commit()
         db.refresh(order)
 
@@ -346,6 +356,7 @@ def close_position(
     refund = round(max(0, pos.margin + realized_pnl), 8)
     bot.balance = round(bot.balance + refund, 8)
 
+    _record_balance(db, bot)
     db.commit()
 
     # Remove from engine monitoring
@@ -459,6 +470,7 @@ def cancel_order(
     margin = round(notional / order.leverage, 8)
     bot.balance = round(bot.balance + margin, 8)
 
+    _record_balance(db, bot)
     db.commit()
 
     # Remove from engine

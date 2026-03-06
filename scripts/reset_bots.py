@@ -180,10 +180,23 @@ def reset(
             # Seed fresh snapshot
             db.add(UserBalanceSnapshot(
                 user_id=uid,
-                balance=total_allocated,
-                bot_balance=total_allocated,
-                available=0.0,
                 session_id=None,
+                candle_open=None,
+                unallocated=0.0,
+                bot_cash=total_allocated,
+                bo_locked=0,
+                futures_locked=0,
+                equity=total_allocated,
+                bo_unrealized_pnl=0,
+                futures_unrealized_pnl=0,
+                unrealized_pnl=0,
+                net_liquidation=total_allocated,
+                cumulative_realized_pnl=0,
+                session_realized_pnl=0,
+                snapshot_delta=None,
+                active_bot_count=len(all_user_bots),
+                open_bo_count=0,
+                open_futures_count=0,
                 recorded_at=datetime.now(timezone.utc),
             ))
             print(f"  User '{user.username}': initial={total_allocated:,.0f} ({len(all_user_bots)} bots x balance)")

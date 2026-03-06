@@ -17,7 +17,7 @@ from services.binance_ws import BinanceFuturesWs, FUTURES_SYMBOLS
 from services.futures_engine import futures_engine
 from services.redis_client import get_sync_redis
 from database import SessionLocal
-from models import Bot
+from models import BalanceHistory, BinaryOption, Bot
 from models_futures import (
     FuturesPosition, FuturesPositionStatus, FuturesSide,
     FuturesOrder, FuturesOrderStatus,
@@ -77,6 +77,35 @@ def _process_events(events: list[dict]) -> None:
         db.rollback()
     finally:
         db.close()
+
+
+def _record_bot_equity(db, bot_name: str) -> None:
+    """Record bot equity (cash + locked) in BalanceHistory."""
+    from sqlalchemy import func as sa_func
+    bot = db.query(Bot).filter(Bot.bot_name == bot_name).first()
+    if not bot:
+        return
+    # BO locked
+    bo_locked = (
+        db.query(sa_func.coalesce(sa_func.sum(BinaryOption.amount), 0.0))
+        .filter(BinaryOption.bot_name == bot_name, BinaryOption.result == "PENDING")
+        .scalar()
+    ) or 0.0
+    # Futures locked
+    fut_pos = (
+        db.query(sa_func.coalesce(sa_func.sum(FuturesPosition.margin), 0.0))
+        .filter(FuturesPosition.bot_name == bot_name, FuturesPosition.status == FuturesPositionStatus.OPEN)
+        .scalar()
+    ) or 0.0
+    fut_ord = (
+        db.query(sa_func.coalesce(
+            sa_func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0
+        ))
+        .filter(FuturesOrder.bot_name == bot_name, FuturesOrder.status == FuturesOrderStatus.PENDING)
+        .scalar()
+    ) or 0.0
+    equity = round((bot.balance or 0) + bo_locked + fut_pos + fut_ord, 8)
+    db.add(BalanceHistory(bot_name=bot_name, balance=equity))
 
 
 def _handle_order_fill(evt: dict, db, r) -> None:
@@ -157,6 +186,8 @@ def _handle_order_fill(evt: dict, db, r) -> None:
     except Exception as exc:
         log.debug("Failed to publish futures fill: %s", exc)
 
+    _record_bot_equity(db, order.bot_name)
+
     log.info("Futures limit order #%d filled → position #%d: %s %s %.4f @ %.2f",
              order.id, pos.id, side, symbol, size, fill_price)
 
@@ -208,6 +239,8 @@ def _handle_position_close(evt: dict, db, r) -> None:
         }, maxlen=STREAM_MAXLEN)
     except Exception as exc:
         log.debug("Failed to publish futures close: %s", exc)
+
+    _record_bot_equity(db, pos.bot_name)
 
     log.info("Futures position #%d closed (%s): %s %s PnL=%.2f",
              pos.id, trigger, evt["side"], pos.symbol, realized_pnl)

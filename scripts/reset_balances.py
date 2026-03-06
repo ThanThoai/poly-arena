@@ -102,13 +102,26 @@ def reset(apply: bool = False) -> None:
             available = USER_TOTAL - total_allocated
             db.add(UserBalanceSnapshot(
                 user_id=user.id,
-                balance=USER_TOTAL,
-                bot_balance=total_allocated,
-                available=available,
                 session_id=None,
+                candle_open=None,
+                unallocated=available,
+                bot_cash=total_allocated,
+                bo_locked=0,
+                futures_locked=0,
+                equity=USER_TOTAL,
+                bo_unrealized_pnl=0,
+                futures_unrealized_pnl=0,
+                unrealized_pnl=0,
+                net_liquidation=USER_TOTAL,
+                cumulative_realized_pnl=0,
+                session_realized_pnl=0,
+                snapshot_delta=None,
+                active_bot_count=len(user_bots),
+                open_bo_count=0,
+                open_futures_count=0,
                 recorded_at=datetime.now(timezone.utc),
             ))
-            print(f"  User '{user.username}': initial={USER_TOTAL:.0f}, bot_balance={total_allocated:.0f}, available={available:.0f}")
+            print(f"  User '{user.username}': equity={USER_TOTAL:.0f}, bot_cash={total_allocated:.0f}, unallocated={available:.0f}")
         print(f"  Reset {len(users)} users → initial_balance={USER_TOTAL:.0f} + snapshot saved")
 
         db.commit()

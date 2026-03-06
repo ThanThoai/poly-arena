@@ -252,15 +252,38 @@ class UserBalanceHistoryResponse(BaseModel):
 class UserBalanceSnapshotResponse(BaseModel):
     id:          int
     user_id:     int
-    balance:      float
-    bot_balance:  float
-    available:    float
-    session_id:   Optional[str] = None
-    session_pnl:  Optional[float] = None
-    prev_balance: Optional[float] = None
-    bot_pnl:      Optional[float] = None
-    unrealized_pnl: Optional[float] = None
-    recorded_at:  Optional[datetime] = None
+    recorded_at: Optional[datetime] = None
+
+    # Session context
+    session_id:  Optional[str] = None
+    candle_open: Optional[int] = None
+
+    # Capital breakdown
+    unallocated:    float = 0
+    bot_cash:       float = 0
+    bo_locked:      float = 0
+    futures_locked: float = 0
+
+    # Equity
+    equity:         float = 0
+
+    # Mark-to-market
+    bo_unrealized_pnl:      Optional[float] = 0
+    futures_unrealized_pnl: Optional[float] = 0
+    unrealized_pnl:         Optional[float] = 0
+
+    # Net liquidation
+    net_liquidation: float = 0
+
+    # P&L tracking
+    cumulative_realized_pnl: Optional[float] = 0
+    session_realized_pnl:    Optional[float] = 0
+    snapshot_delta:          Optional[float] = None
+
+    # Metadata
+    active_bot_count:   Optional[int] = 0
+    open_bo_count:      Optional[int] = 0
+    open_futures_count: Optional[int] = 0
 
     model_config = {"from_attributes": True}
 

@@ -6,6 +6,7 @@ User realized balance = user.initial_balance + sum(profit) for all settled trade
 across all of the user's bots.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -80,20 +81,16 @@ def record_user_balance(
     )
 
 
-def _calc_bot_unrealized_pnl(db: Session, bot_name: str, sr) -> float:
+# ---------------------------------------------------------------------------
+# Per-bot helpers
+# ---------------------------------------------------------------------------
+
+def _calc_bot_bo(db: Session, bot_name: str, sr) -> tuple[float, float, int]:
     """
-    Calculate unrealized P&L for all PENDING trades of a bot.
+    Calculate BO locked amount and unrealized PnL for a bot.
 
-    For each open position:
-      open_qty = num_shares - (exit_filled or 0)
-      unrealized += open_qty * (best_bid - avg_price)
-
-    best_bid is derived from the session-specific orderbook in Redis:
-      orderbook:{SYM}:{TF}:{DIR}:{candle_open}
-    Each order uses its own session's orderbook to get the correct price.
+    Returns (bo_locked, bo_unrealized_pnl, open_count).
     """
-    import json
-
     pending_trades = (
         db.query(BinaryOption)
         .filter(
@@ -105,8 +102,14 @@ def _calc_bot_unrealized_pnl(db: Session, bot_name: str, sr) -> float:
         .all()
     )
 
-    total_unrealized = 0.0
+    bo_locked = 0.0
+    bo_unrealized = 0.0
+    count = 0
+
     for bo in pending_trades:
+        bo_locked += bo.amount or 0
+        count += 1
+
         direction = "UP" if bo.forecast.value == "GREEN" else "DOWN"
         candle_open = bo.candle_open or 0
 
@@ -135,22 +138,18 @@ def _calc_bot_unrealized_pnl(db: Session, bot_name: str, sr) -> float:
         if open_qty <= 0:
             continue
 
-        unrealized = open_qty * (best_bid - (bo.avg_price or 0))
-        total_unrealized += unrealized
+        bo_unrealized += open_qty * (best_bid - (bo.avg_price or 0))
 
-    return round(total_unrealized, 8)
+    return round(bo_locked, 8), round(bo_unrealized, 8), count
 
 
-def _calc_futures_locked_and_pnl(db: Session, bot_name: str, sr) -> tuple[float, float]:
+def _calc_bot_futures(db: Session, bot_name: str, sr) -> tuple[float, float, int]:
     """
     Calculate futures locked margin and unrealized PnL for a bot.
 
-    Returns (locked_margin, unrealized_pnl):
-      - locked_margin: sum of margin from OPEN positions + PENDING limit orders
-        (already deducted from bot.balance, must be added back for equity)
-      - unrealized_pnl: mark-to-market P&L of open positions
+    Returns (futures_locked, futures_unrealized_pnl, open_count).
     """
-    # Open positions — margin already deducted from balance
+    # Open positions
     open_positions = (
         db.query(FuturesPosition)
         .filter(
@@ -160,14 +159,13 @@ def _calc_futures_locked_and_pnl(db: Session, bot_name: str, sr) -> tuple[float,
         .all()
     )
 
-    locked_margin = 0.0
+    locked = 0.0
     unrealized = 0.0
-    for pos in open_positions:
-        locked_margin += pos.margin or 0
-        # entry_fee is a sunk cost — not returned on close (refund = margin + realized_pnl)
-        # so it should NOT be counted as locked equity
+    count = len(open_positions)
 
-        # Unrealized P&L from Redis mark price
+    for pos in open_positions:
+        locked += pos.margin or 0
+
         mark = None
         try:
             data = sr.hgetall(f"futures:price:{pos.symbol}")
@@ -182,7 +180,7 @@ def _calc_futures_locked_and_pnl(db: Session, bot_name: str, sr) -> tuple[float,
             else:
                 unrealized += (pos.entry_price - mark) * pos.size
 
-    # Pending LIMIT orders — margin reserved (deducted from balance)
+    # Pending LIMIT orders — margin reserved
     pending_margin = (
         db.query(func.coalesce(func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0))
         .filter(
@@ -191,10 +189,14 @@ def _calc_futures_locked_and_pnl(db: Session, bot_name: str, sr) -> tuple[float,
         )
         .scalar()
     ) or 0.0
-    locked_margin += pending_margin
+    locked += pending_margin
 
-    return round(locked_margin, 8), round(unrealized, 8)
+    return round(locked, 8), round(unrealized, 8), count
 
+
+# ---------------------------------------------------------------------------
+# Main snapshot function
+# ---------------------------------------------------------------------------
 
 def snapshot_all_user_balances(
     db: Session,
@@ -214,83 +216,147 @@ def snapshot_all_user_balances(
             Bot.is_active == True,
         ).all()
 
-        # Calculate unrealized P&L and equity per bot
-        total_unrealized = 0.0
-        bot_equity_sum = 0.0
-        for b in active_bots:
-            unrealized = _calc_bot_unrealized_pnl(db, b.bot_name, sr)
-            total_unrealized += unrealized
+        bot_names = [b.bot_name for b in active_bots]
 
-            # Binary options: cost basis of open trades (deducted from balance)
-            bo_open_locked = (
-                db.query(func.coalesce(func.sum(BinaryOption.amount), 0.0))
+        # ── Per-bot aggregation ──
+        total_bot_cash = 0.0
+        total_bo_locked = 0.0
+        total_bo_unrealized = 0.0
+        total_futures_locked = 0.0
+        total_futures_unrealized = 0.0
+        total_open_bo = 0
+        total_open_futures = 0
+
+        for b in active_bots:
+            total_bot_cash += b.balance or 0
+
+            bo_locked, bo_unrealized, bo_count = _calc_bot_bo(db, b.bot_name, sr)
+            total_bo_locked += bo_locked
+            total_bo_unrealized += bo_unrealized
+            total_open_bo += bo_count
+
+            fut_locked, fut_unrealized, fut_count = _calc_bot_futures(db, b.bot_name, sr)
+            total_futures_locked += fut_locked
+            total_futures_unrealized += fut_unrealized
+            total_open_futures += fut_count
+
+            # Record bot-level equity snapshot (cash + locked)
+            bot_equity = round((b.balance or 0) + bo_locked + fut_locked, 8)
+            db.add(BalanceHistory(bot_name=b.bot_name, balance=bot_equity))
+
+        # ── User-level calculations ──
+        allocated = sum(b.initial_balance or 0 for b in active_bots)
+        unallocated = round((user.initial_balance or 0) - allocated, 8)
+        bot_cash = round(total_bot_cash, 8)
+        bo_locked = round(total_bo_locked, 8)
+        futures_locked = round(total_futures_locked, 8)
+
+        equity = round(unallocated + bot_cash + bo_locked + futures_locked, 8)
+
+        bo_unrealized_pnl = round(total_bo_unrealized, 8)
+        futures_unrealized_pnl = round(total_futures_unrealized, 8)
+        unrealized_pnl = round(bo_unrealized_pnl + futures_unrealized_pnl, 8)
+
+        net_liquidation = round(equity + unrealized_pnl, 8)
+
+        # ── Cumulative realized P&L (all-time, BO + futures) ──
+        bo_realized = 0.0
+        futures_realized = 0.0
+        if bot_names:
+            bo_realized = (
+                db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
                 .filter(
-                    BinaryOption.bot_name == b.bot_name,
-                    BinaryOption.result == BOResult.PENDING,
+                    BinaryOption.bot_name.in_(bot_names),
+                    BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
                 )
                 .scalar()
             ) or 0.0
 
-            # Futures: locked margin + unrealized PnL (margin already deducted from balance)
-            futures_locked, futures_unrealized = _calc_futures_locked_and_pnl(db, b.bot_name, sr)
-            total_unrealized += futures_unrealized
+            futures_realized = (
+                db.query(func.coalesce(func.sum(FuturesPosition.realized_pnl), 0.0))
+                .filter(
+                    FuturesPosition.bot_name.in_(bot_names),
+                    FuturesPosition.status.in_([
+                        FuturesPositionStatus.CLOSED,
+                        FuturesPositionStatus.LIQUIDATED,
+                    ]),
+                )
+                .scalar()
+            ) or 0.0
 
-            # Equity = cash + BO locked + futures locked margin
-            bot_equity = round((b.balance or 0) + bo_open_locked + futures_locked, 8)
-            bot_equity_sum += bot_equity
+        cumulative_realized_pnl = round(bo_realized + futures_realized, 8)
 
-            # Record bot-level equity snapshot (cash + locked)
-            db.add(BalanceHistory(
-                bot_name=b.bot_name,
-                balance=bot_equity,
-            ))
+        # ── Session realized P&L (this candle only, BO + futures) ──
+        session_realized_pnl = 0.0
+        if candle_open is not None and bot_names:
+            session_bo = (
+                db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
+                .filter(
+                    BinaryOption.bot_name.in_(bot_names),
+                    BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
+                    BinaryOption.candle_open == candle_open,
+                )
+                .scalar()
+            ) or 0.0
 
-        total_unrealized = round(total_unrealized, 8)
-        bot_balance = round(bot_equity_sum, 8)
-        allocated = sum(b.initial_balance or 0 for b in active_bots)
-        available = round((user.initial_balance or 0) - allocated, 8)
-        balance = round(bot_balance + available, 8)
+            candle_start = datetime.fromtimestamp(candle_open, tz=timezone.utc)
+            candle_end = datetime.fromtimestamp(candle_open + 300, tz=timezone.utc)
+            session_fut = (
+                db.query(func.coalesce(func.sum(FuturesPosition.realized_pnl), 0.0))
+                .filter(
+                    FuturesPosition.bot_name.in_(bot_names),
+                    FuturesPosition.status.in_([
+                        FuturesPositionStatus.CLOSED,
+                        FuturesPositionStatus.LIQUIDATED,
+                    ]),
+                    FuturesPosition.closed_at >= candle_start,
+                    FuturesPosition.closed_at < candle_end,
+                )
+                .scalar()
+            ) or 0.0
 
-        # Previous balance from most recent snapshot
+            session_realized_pnl = round(session_bo + session_fut, 8)
+
+        # ── Delta vs previous snapshot ──
         prev_snap = (
             db.query(UserBalanceSnapshot)
             .filter(UserBalanceSnapshot.user_id == user.id)
             .order_by(UserBalanceSnapshot.recorded_at.desc())
             .first()
         )
-        prev_balance = prev_snap.balance if prev_snap else None
-
-        # Session P&L: balance delta from previous snapshot
-        session_pnl = round(balance - prev_balance, 8) if prev_balance is not None else None
-
-        # Bot P&L: sum of trade profits settled in this candle session
-        bot_pnl = None
-        if candle_open is not None:
-            user_bot_names = [b.bot_name for b in active_bots]
-            if user_bot_names:
-                bot_pnl = (
-                    db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
-                    .filter(
-                        BinaryOption.bot_name.in_(user_bot_names),
-                        BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
-                        BinaryOption.candle_open == candle_open,
-                    )
-                    .scalar()
-                ) or 0.0
+        prev_net_liq = prev_snap.net_liquidation if prev_snap else None
+        snapshot_delta = round(net_liquidation - prev_net_liq, 8) if prev_net_liq is not None else None
 
         db.add(UserBalanceSnapshot(
             user_id=user.id,
-            balance=balance,
-            bot_balance=bot_balance,
-            available=available,
             session_id=session_label,
-            session_pnl=session_pnl,
-            prev_balance=prev_balance,
-            bot_pnl=bot_pnl,
-            unrealized_pnl=total_unrealized,
+            candle_open=candle_open,
+            unallocated=unallocated,
+            bot_cash=bot_cash,
+            bo_locked=bo_locked,
+            futures_locked=futures_locked,
+            equity=equity,
+            bo_unrealized_pnl=bo_unrealized_pnl,
+            futures_unrealized_pnl=futures_unrealized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            net_liquidation=net_liquidation,
+            cumulative_realized_pnl=cumulative_realized_pnl,
+            session_realized_pnl=session_realized_pnl,
+            snapshot_delta=snapshot_delta,
+            active_bot_count=len(active_bots),
+            open_bo_count=total_open_bo,
+            open_futures_count=total_open_futures,
             recorded_at=datetime.now(timezone.utc),
         ))
         count += 1
+
+        logger.info(
+            "Snapshot user #%d: equity=%.2f net_liq=%.2f unrealized=%.2f "
+            "session_pnl=%.2f delta=%s bots=%d bo=%d fut=%d",
+            user.id, equity, net_liquidation, unrealized_pnl,
+            session_realized_pnl, snapshot_delta,
+            len(active_bots), total_open_bo, total_open_futures,
+        )
 
     if count:
         db.commit()
