@@ -88,7 +88,7 @@ def _calc_expected_equity(db: SASession, bot_name: str, at: datetime, initial: f
         .filter(
             FuturesPosition.bot_name == bot_name,
             FuturesPosition.status == FuturesPositionStatus.OPEN,
-            FuturesPosition.opened_at <= at,
+            FuturesPosition.created_at <= at,
         )
         .all()
     )

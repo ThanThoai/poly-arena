@@ -72,7 +72,7 @@ def _calc_equity_at(db, bot_name: str, initial: float, at) -> float:
         .filter(
             FuturesPosition.bot_name == bot_name,
             FuturesPosition.status == FuturesPositionStatus.OPEN,
-            FuturesPosition.opened_at <= at,
+            FuturesPosition.created_at <= at,
         )
         .all()
     )
