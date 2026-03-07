@@ -814,7 +814,7 @@ def create_bo(
             symbol            = payload.symbol,
             timeframe         = payload.timeframe,
             forecast          = payload.forecast,
-            amount            = round(original_amount - remaining_budget, 8) if num_shares > 0 else original_amount,
+            amount            = original_amount,
             original_amount   = original_amount,
             result            = BOResult.PENDING,
             avg_price         = avg_price if num_shares > 0 else None,
@@ -845,7 +845,7 @@ def create_bo(
         if has_remainder:
             est_qty = round(remaining_budget / payload.limit_price, 8)
             try:
-                _queue_order_to_session(bo.id, session_id, {
+                remainder_payload = {
                     "bo_id": bo.id,
                     "direction": direction,
                     "symbol": payload.symbol.value,
@@ -856,17 +856,25 @@ def create_bo(
                     "quantity": est_qty,
                     "amount": remaining_budget,
                     "limit_price": payload.limit_price,
-                    "tp_price": payload.tp_price,
-                    "sl_price": payload.sl_price,
                     "timeframe": payload.timeframe.value,
                     "ttl": payload.ttl,
                     "slippage_tolerance": payload.slippage_tolerance,
                     "session_offset": session_offset,
                     "settlement_at": settlement_at.isoformat() if settlement_at else None,
-                    "prefilled": True if num_shares > 0 else False,
-                    "prefilled_avg_price": avg_price if num_shares > 0 else None,
-                    "prefilled_filled": num_shares if num_shares > 0 else None,
-                })
+                }
+                # Pass REST prefill data so OrderConsumer can merge fills
+                # into the BO's existing avg_price/num_shares.
+                # NOT setting "prefilled": True — this must go through
+                # _process_standard_order to actually place the LIMIT order.
+                if num_shares > 0:
+                    remainder_payload["rest_prefill_avg"] = avg_price
+                    remainder_payload["rest_prefill_filled"] = num_shares
+                # Only pass tp/sl to remainder if there's NO separate bracket
+                # order being queued (to avoid duplicate bracket exits).
+                if not has_bracket:
+                    remainder_payload["tp_price"] = payload.tp_price
+                    remainder_payload["sl_price"] = payload.sl_price
+                _queue_order_to_session(bo.id, session_id, remainder_payload)
                 append_trace(bo, make_trace(
                     "MATCHING", "REMAINDER_QUEUED",
                     f"Unfilled ${remaining_budget:.4f} queued to ME as LIMIT "
@@ -879,6 +887,15 @@ def create_bo(
             except Exception as exc:
                 logger.error(
                     "Failed to queue remainder for BO #%d: %s", bo.id, exc,
+                )
+            # Separately queue bracket monitoring for the already-filled portion
+            if has_bracket and num_shares > 0:
+                _queue_prefilled_to_me(
+                    bo, avg_price, num_shares, payload,
+                    direction=direction,
+                    session_offset=session_offset,
+                    settlement_at=settlement_at,
+                    candle_open=candle_open,
                 )
         elif has_bracket:
             # Fully filled + has bracket → queue for TP/SL monitoring

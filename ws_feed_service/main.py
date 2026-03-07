@@ -262,39 +262,106 @@ async def _recover_pending_orders(sync_redis, session_manager: SessionManager, r
                 and has_bracket
             )
 
-            if is_unfilled:
-                # Unfilled LIMIT: use limit_price as price, amount/limit_price as quantity
-                rec_price = bo.limit_price
-                rec_quantity = round(bo.amount / bo.limit_price, 8)
+            # Detect PARTIAL aggressive LIMIT: has fills + has remainder
+            is_partial_limit = (
+                not is_unfilled
+                and is_limit
+                and bo.me_order_status == "PARTIAL"
+            )
+
+            if is_partial_limit:
+                # PARTIAL aggressive LIMIT: REST filled some, remainder needs LIMIT order.
+                # 1) Queue remainder as standard LIMIT order
+                original_budget = bo.original_amount or bo.amount
+                filled_cost = bo.avg_price * bo.num_shares if bo.avg_price and bo.num_shares else 0
+                remaining_budget = round(max(0, original_budget - filled_cost), 8)
+                if remaining_budget > 0 and bo.limit_price and bo.limit_price > 0:
+                    est_qty = round(remaining_budget / bo.limit_price, 8)
+                    remainder_payload = {
+                        "bo_id": bo.id,
+                        "token_id": token_id,
+                        "side": "BUY",
+                        "price": bo.limit_price,
+                        "quantity": est_qty,
+                        "amount": remaining_budget,
+                        "limit_price": bo.limit_price,
+                        "timeframe": tf_val,
+                        "ttl": ttl_remaining,
+                        "session_id": session_id,
+                        "rest_prefill_avg": bo.avg_price,
+                        "rest_prefill_filled": bo.num_shares,
+                    }
+                    # Only pass tp/sl to remainder if there's no bracket
+                    if not has_bracket:
+                        remainder_payload["tp_price"] = bo.tp_price
+                        remainder_payload["sl_price"] = bo.sl_price
+                    queue_key = f"queue:orders:{session_id}"
+                    sync_redis.lpush(queue_key, json.dumps(remainder_payload))
+                    count += 1
+                    log.info(
+                        "Recovery: BO #%d PARTIAL LIMIT remainder $%.4f → LIMIT queue",
+                        bo.id, remaining_budget,
+                    )
+
+                # 2) Queue bracket monitoring for already-filled portion
+                if has_bracket and bo.avg_price and bo.num_shares:
+                    bracket_payload = {
+                        "bo_id": bo.id,
+                        "token_id": token_id,
+                        "side": "BUY",
+                        "prefilled": True,
+                        "prefilled_avg_price": bo.avg_price,
+                        "prefilled_filled": bo.num_shares,
+                        "tp_price": bo.tp_price,
+                        "sl_price": bo.sl_price,
+                        "timeframe": tf_val,
+                        "session_id": session_id,
+                    }
+                    queue_key = f"queue:orders:{session_id}"
+                    sync_redis.lpush(queue_key, json.dumps(bracket_payload))
+                    count += 1
+                    log.info(
+                        "Recovery: BO #%d PARTIAL LIMIT bracket monitor queued",
+                        bo.id,
+                    )
             else:
-                rec_price = bo.avg_price
-                rec_quantity = bo.num_shares
+                if is_unfilled:
+                    # Unfilled LIMIT: use limit_price as price,
+                    # original_amount/limit_price as quantity (not bo.amount which
+                    # may have been reduced for aggressive LIMIT partial fills)
+                    rec_price = bo.limit_price
+                    budget = bo.original_amount if bo.original_amount else bo.amount
+                    rec_quantity = round(budget / bo.limit_price, 8)
+                else:
+                    rec_price = bo.avg_price
+                    rec_quantity = bo.num_shares
 
-            payload = {
-                "bo_id": bo.id,
-                "token_id": token_id,
-                "side": "BUY",
-                "price": rec_price,
-                "quantity": rec_quantity,
-                "limit_price": bo.limit_price,
-                "tp_price": bo.tp_price,
-                "sl_price": bo.sl_price,
-                "timeframe": tf_val,
-                "ttl": ttl_remaining,
-                "session_id": session_id,
-            }
+                payload = {
+                    "bo_id": bo.id,
+                    "token_id": token_id,
+                    "side": "BUY",
+                    "price": rec_price,
+                    "quantity": rec_quantity,
+                    "limit_price": bo.limit_price,
+                    "amount": (bo.original_amount or bo.amount) if is_limit else None,
+                    "tp_price": bo.tp_price,
+                    "sl_price": bo.sl_price,
+                    "timeframe": tf_val,
+                    "ttl": ttl_remaining,
+                    "session_id": session_id,
+                }
 
-            # Already-filled MARKET+bracket: set prefilled so OrderConsumer
-            # registers for bracket monitoring instead of re-matching
-            if is_already_filled:
-                payload["prefilled"] = True
-                payload["prefilled_avg_price"] = bo.avg_price
-                payload["prefilled_filled"] = bo.num_shares
+                # Already-filled MARKET+bracket: set prefilled so OrderConsumer
+                # registers for bracket monitoring instead of re-matching
+                if is_already_filled:
+                    payload["prefilled"] = True
+                    payload["prefilled_avg_price"] = bo.avg_price
+                    payload["prefilled_filled"] = bo.num_shares
 
-            order_data = json.dumps(payload)
-            queue_key = f"queue:orders:{session_id}"
-            sync_redis.lpush(queue_key, order_data)
-            count += 1
+                order_data = json.dumps(payload)
+                queue_key = f"queue:orders:{session_id}"
+                sync_redis.lpush(queue_key, order_data)
+                count += 1
     except Exception as exc:
         log.error("Recovery failed: %s", exc)
     finally:

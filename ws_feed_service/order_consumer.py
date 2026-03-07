@@ -126,6 +126,10 @@ class OrderConsumer:
         self._order_to_bo: dict[str, int] = {}       # order_id → bo_id
         self._order_to_token: dict[str, str] = {}    # order_id → token_id
         self._registered_books: set[str] = set()      # token_ids with callback
+        # REST prefill data for aggressive LIMIT remainders:
+        # order_id → (prefill_avg_price, prefill_filled)
+        # Used to merge REST snapshot fills with ME fills in publish events.
+        self._order_prefill: dict[str, tuple[float, float]] = {}
 
     def start(self) -> None:
         """Start the consumer daemon thread."""
@@ -363,6 +367,9 @@ class OrderConsumer:
         quantity = Decimal(str(data["quantity"]))
         amount = data.get("amount")
         limit_price = data.get("limit_price")
+        # REST prefill data from aggressive LIMIT partial fill
+        rest_prefill_avg = data.get("rest_prefill_avg")
+        rest_prefill_filled = data.get("rest_prefill_filled")
         tp_price = data.get("tp_price")
         sl_price = data.get("sl_price")
         timeframe = data.get("timeframe")
@@ -452,25 +459,39 @@ class OrderConsumer:
                 tp_price, sl_price, ttl,
             )
 
+            # Track REST prefill data for aggressive LIMIT remainders
+            if rest_prefill_avg is not None and rest_prefill_filled is not None and bo_id is not None:
+                self._order_prefill[order.order_id] = (
+                    float(rest_prefill_avg), float(rest_prefill_filled),
+                )
+
             # Step 1: Publish fill event FIRST so DB has avg_price/num_shares
             # before any bracket exit arrives.
             if bo_id is not None and order.filled > 0:
                 fill_levels_snapshot = list(order._fill_levels)
                 wp = _serialize_fill_levels(order._fill_levels)
                 order._fill_levels = []  # reset after serialization
+
+                pub_filled, pub_avg = self._merge_prefill(
+                    order.order_id,
+                    float(order.filled),
+                    float(order.avg_entry_price) if order.avg_entry_price else 0.0,
+                )
                 self._publish_async(
                     self._writer.publish_order_fill(
                         bo_id=bo_id,
                         order_id=order.order_id,
-                        filled=float(order.filled),
-                        avg_entry_price=float(order.avg_entry_price) if order.avg_entry_price else 0.0,
+                        filled=pub_filled,
+                        avg_entry_price=pub_avg,
                         status=order.status.value,
                         walk_prices=wp,
                     )
                 )
                 logger.info(
-                    "Immediate fill published: bo_id=%s filled=%s avg=%s status=%s",
-                    bo_id, order.filled, order.avg_entry_price, order.status.value,
+                    "Immediate fill published: bo_id=%s filled=%s avg=%s status=%s"
+                    " (me_filled=%s me_avg=%s)",
+                    bo_id, pub_filled, pub_avg, order.status.value,
+                    order.filled, order.avg_entry_price,
                 )
 
                 # Trace: ME fill
@@ -528,30 +549,36 @@ class OrderConsumer:
                 # registered, so the cancel event was silently dropped.
                 # Publish the cancel explicitly now.
                 if order.status == OrderStatus.CANCELED:
+                    ioc_filled, ioc_avg = self._merge_prefill(
+                        order.order_id,
+                        float(order.filled),
+                        float(order.avg_entry_price) if order.avg_entry_price else 0.0,
+                    )
                     self._publish_async(
                         self._writer.publish_order_cancel(
                             bo_id=bo_id,
                             order_id=order.order_id,
                             reason="MARKET_IOC_CANCEL",
-                            filled=float(order.filled),
-                            avg_entry_price=float(order.avg_entry_price) if order.avg_entry_price else 0.0,
+                            filled=ioc_filled,
+                            avg_entry_price=ioc_avg,
                         )
                     )
                     logger.info(
                         "Immediate cancel published (post-registration): "
                         "bo_id=%s order=%s filled=%s",
-                        bo_id, order.order_id[:12], order.filled,
+                        bo_id, order.order_id[:12], ioc_filled,
                     )
 
                     # Trace: ME cancel
                     self._publish_trace(bo_id, make_trace(
                         "MATCHING", "ME_CANCEL",
                         f"ME cancelled order. Reason: MARKET_IOC_CANCEL. "
-                        f"Filled: {float(order.filled):.4f}.",
+                        f"Filled: {ioc_filled:.4f}.",
                     ))
                     # Cleanup tracking for terminal state
                     self._order_to_bo.pop(order.order_id, None)
                     self._order_to_token.pop(order.order_id, None)
+                    self._order_prefill.pop(order.order_id, None)
 
             # Step 3: Fire bracket exit callbacks AFTER fill is published.
             # This ensures _handle_bracket_exit in API always finds
@@ -579,6 +606,27 @@ class OrderConsumer:
                 "Failed to place virtual order for bo_id=%s: %s", bo_id, exc,
             )
 
+    # ── REST prefill merging ──────────────────────────────────────────────
+
+    def _merge_prefill(
+        self, order_id: str, me_filled: float, me_avg: float,
+    ) -> tuple[float, float]:
+        """
+        Merge ME fill data with REST prefill data for aggressive LIMIT remainders.
+
+        Returns (total_filled, total_avg_entry_price).
+        If no prefill data exists for this order, returns the ME values unchanged.
+        """
+        prefill = self._order_prefill.get(order_id)
+        if prefill is None:
+            return me_filled, me_avg
+        pre_avg, pre_filled = prefill
+        me_cost = me_avg * me_filled
+        pre_cost = pre_avg * pre_filled
+        total_filled = me_filled + pre_filled
+        total_avg = (me_cost + pre_cost) / total_filled if total_filled > 0 else 0.0
+        return round(total_filled, 8), round(total_avg, 8)
+
     # ── Centralized state-change handler ───────────────────────────────────
 
     def _on_state_changes(self, events: list[OrderStateChangeEvent]) -> None:
@@ -595,19 +643,26 @@ class OrderConsumer:
 
             if event.event_type == "FILL":
                 wp = _serialize_fill_levels(event.fill_levels)
+                pub_filled, pub_avg = self._merge_prefill(
+                    event.order_id,
+                    float(event.filled),
+                    float(event.avg_entry_price) if event.avg_entry_price else 0.0,
+                )
                 self._publish_async(
                     self._writer.publish_order_fill(
                         bo_id=bo_id,
                         order_id=event.order_id,
-                        filled=float(event.filled),
-                        avg_entry_price=float(event.avg_entry_price) if event.avg_entry_price else 0.0,
+                        filled=pub_filled,
+                        avg_entry_price=pub_avg,
                         status=event.status.value,
                         walk_prices=wp,
                     )
                 )
                 logger.info(
-                    "State-change FILL: bo_id=%d order=%s filled=%s status=%s",
-                    bo_id, event.order_id[:12], event.filled, event.status.value,
+                    "State-change FILL: bo_id=%d order=%s filled=%s status=%s"
+                    " (me_filled=%s)",
+                    bo_id, event.order_id[:12], pub_filled, event.status.value,
+                    event.filled,
                 )
 
                 # Log limit order fill to file with orderbook snapshot
@@ -629,24 +684,30 @@ class OrderConsumer:
                     )
 
             elif event.event_type == "CANCEL":
+                cancel_filled, cancel_avg = self._merge_prefill(
+                    event.order_id,
+                    float(event.filled),
+                    float(event.avg_entry_price) if event.avg_entry_price else 0.0,
+                )
                 self._publish_async(
                     self._writer.publish_order_cancel(
                         bo_id=bo_id,
                         order_id=event.order_id,
                         reason=event.cancel_reason or "TTL_EXPIRED",
-                        filled=float(event.filled),
-                        avg_entry_price=float(event.avg_entry_price) if event.avg_entry_price else 0.0,
+                        filled=cancel_filled,
+                        avg_entry_price=cancel_avg,
                     )
                 )
                 logger.info(
                     "State-change CANCEL: bo_id=%d order=%s filled=%s reason=%s",
-                    bo_id, event.order_id[:12], event.filled, event.cancel_reason,
+                    bo_id, event.order_id[:12], cancel_filled, event.cancel_reason,
                 )
 
             # Cleanup tracking for terminal states
             if event.status in (OrderStatus.FILLED, OrderStatus.CANCELED):
                 self._order_to_bo.pop(event.order_id, None)
                 self._order_to_token.pop(event.order_id, None)
+                self._order_prefill.pop(event.order_id, None)
 
     def _publish_async(self, coro) -> None:
         """Bridge an async coroutine to the event loop from a sync thread."""
