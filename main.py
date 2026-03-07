@@ -326,14 +326,14 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                # Fee handling: maker rebate for passive LIMIT fills only.
-                # MARKET and aggressive LIMIT orders are filled at API level
-                # (snapshot fill with taker fee already deducted), so only
-                # passive LIMIT fills arrive here → apply maker rebate.
-                # Safety: skip rebate if entry_fee > 0 (already charged as taker).
+                # Fee handling: maker rebate for ALL LIMIT fills from ME.
+                # MARKET orders are filled at API level (taker fee deducted there).
+                # All ME fills for LIMIT orders are maker fills (order rests on
+                # book until matched), including aggressive LIMIT remainders
+                # that already have entry_fee > 0 from the REST taker portion.
                 fee_applied = 0.0
-                is_passive_limit = (bo.entry_fee or 0) <= 0
-                if wp_str and is_passive_limit:
+                is_maker_fill = bo.limit_price is not None
+                if wp_str and is_maker_fill:
                     try:
                         fill_levels = json.loads(wp_str)
                         rebate = maker_rebate_from_levels(fill_levels)

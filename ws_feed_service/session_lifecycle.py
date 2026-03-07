@@ -1,11 +1,12 @@
 """
-Session Lifecycle — ensure 4 active sessions per (sym, tf) + cleanup expired ones.
+Session Lifecycle — ensure 3 active sessions per (sym, tf) + cleanup expired ones.
 
 Called every SESSION_LIFECYCLE_TICK_S seconds from the WS Feed Service main loop.
 
 Responsibilities:
-  - ensure_future_sessions(): maintain current + 3 future sessions per (sym, tf)
-  - cleanup_expired_sessions(): archive + delete Redis keys for expired sessions
+  - ensure_future_sessions(): maintain current + 2 future sessions per (sym, tf)
+  - cleanup_expired_sessions(): archive expired sessions (keeps ARCHIVED in registry)
+  - purge_archived_sessions(): remove ARCHIVED sessions after ARCHIVED_RETENTION_S
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from config.timing import (
@@ -20,6 +22,7 @@ from config.timing import (
     REQUIRED_FUTURE_SESSIONS,
     SESSION_PRE_CREATE_BUFFER_S,
     SESSION_CLEANUP_DELAY_S,
+    ARCHIVED_RETENTION_S,
 )
 from services.session_engine import SessionState
 from ws_feed_service.config import SYMBOLS, TIMEFRAMES, ORDERBOOK_KEY_PREFIX
@@ -68,7 +71,7 @@ def ensure_future_sessions(
     registry: TokenRegistry,
 ) -> tuple[int, list[str]]:
     """
-    For each (sym, tf), ensure we have sessions for current + 3 future candles.
+    For each (sym, tf), ensure we have sessions for current + 2 future candles.
 
     Creates missing sessions by resolving tokens via Polymarket REST API directly
     (no TokenRegistry dependency for token resolution — avoids stale cache issues).
@@ -334,14 +337,16 @@ def cleanup_expired_sessions(
     sync_redis,
 ) -> int:
     """
-    Archive and clean up sessions that have expired (candle ended + delay).
+    Archive sessions that have expired (candle ended + delay).
 
     For each non-ARCHIVED session where now > candle_open + period + CLEANUP_DELAY:
       1. Transition ACTIVE → SETTLING → ARCHIVED (or SETTLING → ARCHIVED)
       2. RPOP orphaned orders from queue → cancel info logged
-      3. Delete Redis keys (queue + orderbook snapshots)
 
-    Returns the number of sessions cleaned up.
+    ARCHIVED sessions remain in the registry for ARCHIVED_RETENTION_S (60s)
+    after settling_at. Use purge_archived_sessions() to remove them later.
+
+    Returns the number of sessions archived.
     """
     now_ts = int(time.time())
     cleaned = 0
@@ -358,9 +363,6 @@ def cleanup_expired_sessions(
             continue
 
         session_id = session.session_id
-        sym = session.symbol
-        tf = session.timeframe
-        candle_open = session.candle_open
 
         # Transition through states
         if session.state == SessionState.ACTIVE:
@@ -389,9 +391,51 @@ def cleanup_expired_sessions(
                     session_id,
                 )
 
+        cleaned += 1
+        logger.info(
+            "Session lifecycle: archived %s (orphaned=%d)",
+            session_id, orphaned,
+        )
+
+    if cleaned:
+        logger.info("Session lifecycle: archived %d expired session(s)", cleaned)
+    return cleaned
+
+
+def purge_archived_sessions(
+    sm: SessionManager,
+    sync_redis,
+) -> int:
+    """
+    Permanently remove ARCHIVED sessions that have been settled for > ARCHIVED_RETENTION_S.
+
+    For each ARCHIVED session where now > settling_at + ARCHIVED_RETENTION_S:
+      1. Delete Redis keys (queue + orderbook snapshots)
+      2. Purge from SessionManager registry
+
+    Returns the number of sessions purged.
+    """
+    now = datetime.now(timezone.utc)
+    purged = 0
+
+    for session in sm.list_archived_sessions():
+        # Use settling_at if available, fall back to archived_at
+        reference_at = session.settling_at or session.archived_at
+        if reference_at is None:
+            continue
+
+        elapsed = (now - reference_at).total_seconds()
+        if elapsed <= ARCHIVED_RETENTION_S:
+            continue
+
+        session_id = session.session_id
+        sym = session.symbol
+        tf = session.timeframe
+        candle_open = session.candle_open
+
         # Delete Redis keys
         keys_to_delete = [
-            queue_key,
+            f"queue:orders:{session_id}",
             f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:UP:{candle_open}",
             f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:DOWN:{candle_open}",
         ]
@@ -401,12 +445,13 @@ def cleanup_expired_sessions(
             except Exception as exc:
                 logger.error("Session lifecycle: failed to delete %s: %s", key, exc)
 
-        cleaned += 1
+        sm.purge_session(session_id)
+        purged += 1
         logger.info(
-            "Session lifecycle: cleaned up %s (orphaned=%d, deleted %d keys)",
-            session_id, orphaned, len(keys_to_delete),
+            "Session lifecycle: purged %s (deleted %d keys, retained %.0fs after settling)",
+            session_id, len(keys_to_delete), elapsed,
         )
 
-    if cleaned:
-        logger.info("Session lifecycle: cleaned up %d expired session(s)", cleaned)
-    return cleaned
+    if purged:
+        logger.info("Session lifecycle: purged %d archived session(s)", purged)
+    return purged

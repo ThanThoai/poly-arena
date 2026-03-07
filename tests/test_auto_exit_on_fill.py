@@ -153,3 +153,47 @@ async def test_limit_fill_applies_maker_rebate(db, bot_and_bo, fake_async_redis)
     # Maker rebate should have been added (entry_fee goes negative)
     assert bo.entry_fee < 0
     assert bot.balance > initial_balance
+
+
+@pytest.mark.asyncio
+async def test_aggressive_limit_remainder_receives_maker_rebate(db, bot_and_bo, fake_async_redis):
+    """Aggressive LIMIT remainder (entry_fee > 0 from REST taker fill) should
+    still receive maker rebate when ME fills the remainder portion."""
+    bot = bot_and_bo
+    bo = _make_bo(db, bot, limit_price=0.55, amount=100.0)
+
+    # Simulate aggressive LIMIT: REST already filled part as taker
+    # entry_fee > 0 from REST taker fill portion
+    bo.entry_fee = 0.25  # taker fee from REST fill
+    bo.avg_price = 0.50
+    bo.num_shares = 120.0
+    bo.me_order_status = "PARTIAL"
+    bot.balance = round(bot.balance - bo.amount - bo.entry_fee, 8)
+    initial_balance = bot.balance
+    db.commit()
+
+    mock_r = fake_async_redis
+
+    # ME fills the remainder portion (maker fill)
+    walk_prices = '[{"price": 0.53, "qty": 75.47, "cost": 40.0}]'
+    await _handle_order_fill(
+        mock_r, "stream:order:fills", "test-group", "msg-5",
+        {
+            "bo_id": str(bo.id),
+            "filled": "195.47",
+            "avg_entry_price": "0.5115",
+            "status": "FILLED",
+            "order_id": "ord-201",
+            "walk_prices": walk_prices,
+        },
+    )
+
+    db.refresh(bo)
+    db.refresh(bot)
+
+    # Maker rebate applied on ME fill portion: entry_fee reduced from 0.25
+    from config.fees import maker_rebate_from_levels
+    expected_rebate = maker_rebate_from_levels([{"price": 0.53, "qty": 75.47}])
+    assert expected_rebate > 0
+    assert bo.entry_fee == pytest.approx(0.25 - expected_rebate, abs=1e-6)
+    assert bot.balance == pytest.approx(initial_balance + expected_rebate, abs=1e-6)

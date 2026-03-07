@@ -269,6 +269,48 @@ def _fetch_orderbook_rest(
     )
 
 
+def _fetch_asks_from_polymarket(
+    symbol: str, timeframe: str, direction: str,
+    candle_open: int = 0,
+) -> list[list]:
+    """Fetch asks directly from Polymarket REST API for order filling.
+
+    Primary: Polymarket CLOB /book REST API (fresh orderbook, most accurate).
+    Fallback: Redis orderbook snapshot (if REST fails or token not resolved).
+
+    Returns sorted asks list (ascending by price) as [[price, size], ...].
+    Raises HTTPException(503) if both sources are unavailable.
+    """
+    # 1. Primary: Polymarket REST API (fresh data for accurate fills)
+    token_id = _resolve_token_id(symbol, timeframe, direction, candle_open)
+    if token_id:
+        try:
+            pm = _get_pm_client()
+            bids_raw, asks_raw = pm.fetch_book_raw(token_id)
+            if asks_raw:
+                sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
+                return [[float(a["price"]), float(a["size"])] for a in sorted_asks]
+        except Exception as exc:
+            logger.warning(
+                "Polymarket REST fetch failed for %s: %s — falling back to Redis",
+                token_id[:16], exc,
+            )
+
+    # 2. Fallback: Redis orderbook snapshot
+    redis_asks = _fetch_orderbook_from_redis(symbol, timeframe, direction, candle_open)
+    if redis_asks:
+        logger.info(
+            "Using Redis fallback for orderbook %s:%s:%s:%d",
+            symbol, timeframe, direction, candle_open,
+        )
+        return redis_asks
+
+    raise HTTPException(
+        status_code=503,
+        detail="Orderbook unavailable — Polymarket REST API and Redis both failed",
+    )
+
+
 def _snapshot_best_ask(
     symbol: str, timeframe: str, direction: str,
     candle_open: int = 0,
@@ -326,7 +368,7 @@ def _fill_market_from_snapshot(
     HTTPException(400)
         If FOK order cannot be fully filled, or slippage exceeded.
     """
-    asks = _fetch_orderbook_rest(symbol, timeframe, direction, candle_open)
+    asks = _fetch_asks_from_polymarket(symbol, timeframe, direction, candle_open)
 
     # Price cap: LIMIT orders use limit_price; MARKET orders use slippage from best_ask
     if limit_price is not None:
@@ -429,7 +471,7 @@ def _fill_limit_from_snapshot(
     HTTPException(503)
         If orderbook is unavailable.
     """
-    asks = _fetch_orderbook_rest(symbol, timeframe, direction, candle_open)
+    asks = _fetch_asks_from_polymarket(symbol, timeframe, direction, candle_open)
 
     max_price = Decimal(str(limit_price))
     budget = Decimal(str(amount))
@@ -1023,8 +1065,8 @@ def create_bo(
 
         order_traces = list(pending_traces)
         order_traces.append(make_trace(
-            "MATCHING", "SNAPSHOT_FILL",
-            f"MARKET Order filled from orderbook snapshot. "
+            "MATCHING", "REST_FILL",
+            f"MARKET Order filled from Polymarket REST orderbook. "
             f"Avg Entry Price: ${avg_price:.4f}. "
             f"Shares: {num_shares:.4f}. "
             f"Fee: ${entry_fee:.4f} (TAKER).",
@@ -1035,7 +1077,7 @@ def create_bo(
 
         logger.info(
             "BO MARKET %s %s %s: amount=%.4f avg_price=%.6f shares=%.4f "
-            "fee=%.4f latency=%.0fms tp=%s sl=%s → filled from snapshot",
+            "fee=%.4f latency=%.0fms tp=%s sl=%s → filled from REST orderbook",
             payload.symbol.value, payload.timeframe.value,
             payload.forecast.value,
             payload.amount, avg_price, num_shares, entry_fee, latency_ms,

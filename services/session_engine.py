@@ -79,6 +79,7 @@ class SessionEngine:
         self.created_at = datetime.now(timezone.utc)
         self.activated_at: Optional[datetime] = None
         self.settling_at: Optional[datetime] = None
+        self.archived_at: Optional[datetime] = None
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -126,6 +127,7 @@ class SessionEngine:
                 logger.info("Session %s: %s → SETTLING", self.session_id, old_state)
 
             elif new_state == SessionState.ARCHIVED:
+                self.archived_at = datetime.now(timezone.utc)
                 self.books.clear()
                 self.tokens.clear()
                 self._token_to_dir.clear()

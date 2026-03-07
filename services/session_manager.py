@@ -105,7 +105,8 @@ class SessionManager:
             engine.transition(new_state)
 
             if new_state == SessionState.ARCHIVED:
-                del self._engines[session_id]
+                # Remove from token index (prevent event dispatch)
+                # but keep in _engines for ARCHIVED_RETENTION_S
                 for token_id in old_token_ids:
                     sids = self._token_index.get(token_id, [])
                     if session_id in sids:
@@ -117,6 +118,26 @@ class SessionManager:
         """Return all non-ARCHIVED sessions."""
         with self._lock:
             return [e for e in self._engines.values() if e.state != SessionState.ARCHIVED]
+
+    def list_archived_sessions(self) -> list[SessionEngine]:
+        """Return all ARCHIVED sessions still retained in the registry."""
+        with self._lock:
+            return [e for e in self._engines.values() if e.state == SessionState.ARCHIVED]
+
+    def purge_session(self, session_id: str) -> None:
+        """Permanently remove an ARCHIVED session from the registry."""
+        with self._lock:
+            engine = self._engines.get(session_id)
+            if engine is None:
+                return
+            if engine.state != SessionState.ARCHIVED:
+                logger.warning(
+                    "Cannot purge non-ARCHIVED session %s (state=%s)",
+                    session_id, engine.state.value,
+                )
+                return
+            del self._engines[session_id]
+            logger.debug("Purged ARCHIVED session %s", session_id)
 
     # ── WS Event dispatch ─────────────────────────────────────────────────────
 

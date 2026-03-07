@@ -23,6 +23,7 @@ HTTP_TIMEOUT_DISCOVERY = 15.0    # token discovery (Gamma API can be slow)
 # ── WebSocket ────────────────────────────────────────────────────────────────
 
 WS_PING_INTERVAL_S = 10         # PING heartbeat interval
+WS_PONG_TIMEOUT_S = 30          # close connection if no PONG within N seconds
 WS_CLOSE_TIMEOUT_S = 5          # graceful close timeout
 
 # ── Price Cache & Staleness ──────────────────────────────────────────────────
@@ -68,9 +69,10 @@ BRPOP_TIMEOUT_S = 1             # OrderConsumer BRPOP blocking timeout
 
 # ── Session Lifecycle ──────────────────────────────────────────────────────
 
-REQUIRED_FUTURE_SESSIONS = 3       # current + 3 future = 4 total per (sym, tf)
+REQUIRED_FUTURE_SESSIONS = 2       # current + 2 future = 3 total per (sym, tf)
 SESSION_PRE_CREATE_BUFFER_S = 20   # create next session 20s before candle boundary
 SESSION_CLEANUP_DELAY_S = 10       # cleanup 10s after session period ends
+ARCHIVED_RETENTION_S = 60          # keep ARCHIVED sessions for 60s after settling
 SESSION_LIFECYCLE_TICK_S = 5       # lifecycle check interval
 
 # ── REST Poller ──────────────────────────────────────────────────────────────

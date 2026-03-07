@@ -1,7 +1,9 @@
 """Dynamic Fee Curve for PolyArena — mirrors Polymarket Crypto markets.
 
 Formula per fill level:
-    nominal_fee = matched_qty × feeRate × (price × (1 - price))^exponent
+    nominal_fee = qty × price × feeRate × (price × (1 - price))^exponent
+
+    where qty × price = notional value (cost in USDC).
 
 Role-based application:
     Taker: pays 100% of nominal_fee
@@ -15,8 +17,11 @@ MAKER_REBATE_PCT = 0.20
 
 
 def nominal_fee_per_level(qty: float, price: float) -> float:
-    """Compute nominal fee for a single fill level."""
-    return round(qty * FEE_RATE * (price * (1 - price)) ** EXPONENT, 8)
+    """Compute nominal fee for a single fill level.
+
+    fee = qty × price × FEE_RATE × (price × (1 - price))^EXPONENT
+    """
+    return round(qty * price * FEE_RATE * (price * (1 - price)) ** EXPONENT, 8)
 
 
 def taker_fee_from_levels(levels: list[dict]) -> float:
@@ -46,6 +51,8 @@ def estimate_max_taker_fee(amount: float) -> float:
 
     Fee is maximized at price=0.50 where (p*(1-p))^2 = 0.0625.
     Assume all qty bought at price 0.50 → qty = amount / 0.50.
+
+    fee = (amount/0.50) × 0.50 × 0.25 × 0.0625 = amount × 0.015625
     """
     qty_at_worst = amount / 0.50
     return round(nominal_fee_per_level(qty_at_worst, 0.50), 8)

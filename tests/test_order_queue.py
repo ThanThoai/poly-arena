@@ -812,12 +812,13 @@ def test_session_keyed_orderbook_used(client, test_bot, fake_sync_redis):
 
 
 def test_market_order_fee_matches_formula_exactly(client, test_bot, fake_sync_redis, db):
-    """Verify entry_fee matches qty × 0.25 × (p×(1-p))² where qty = SHARES, not dollars.
+    """Verify entry_fee matches qty × price × 0.25 × (p×(1-p))².
 
     Orderbook: asks at [0.52, 500]. For a $10 order:
       shares = 10 / 0.52 ≈ 19.2308
-      fee = 19.2308 × 0.25 × (0.52 × 0.48)² = 0.29952
-    NOT: 10 × 0.25 × (0.52 × 0.48)² = 0.1558  (wrong — uses dollars instead of shares)
+      fee = 19.2308 × 0.52 × 0.25 × (0.52 × 0.48)²
+          = 10.0 × 0.25 × (0.52 × 0.48)²
+          ≈ 0.15575
     """
     from config.fees import nominal_fee_per_level
 
@@ -843,16 +844,14 @@ def test_market_order_fee_matches_formula_exactly(client, test_bot, fake_sync_re
     shares = data["num_shares"]
     assert abs(shares - 10.0 / 0.52) < 0.01  # ~19.23 shares
 
-    # Verify fee matches formula: qty(shares) × 0.25 × (p×(1-p))²
+    # Verify fee matches formula: qty × price × 0.25 × (p×(1-p))²
     expected_fee = nominal_fee_per_level(shares, 0.52)
     assert abs(data["entry_fee"] - expected_fee) < 1e-6, (
         f"entry_fee={data['entry_fee']} != expected={expected_fee} "
         f"(qty={shares} shares, price=0.52)"
     )
 
-    # Sanity: fee should be ~0.30, NOT ~0.16 (which would be the dollar-based calc)
-    wrong_fee = nominal_fee_per_level(10.0, 0.52)  # using dollars as qty
-    assert data["entry_fee"] > wrong_fee * 1.5, (
-        f"Fee {data['entry_fee']} looks like it used dollars instead of shares. "
-        f"Dollar-based fee would be {wrong_fee}"
+    # Sanity: fee ≈ cost × FEE_RATE × (p(1-p))² = $10 × 0.25 × 0.0623 ≈ 0.156
+    assert 0.10 < data["entry_fee"] < 0.25, (
+        f"Fee {data['entry_fee']} outside expected range for $10 order at 0.52"
     )

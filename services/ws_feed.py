@@ -15,7 +15,8 @@ Integration (WS Feed Service):
 The feed automatically:
   - Subscribes to the given asset (token) IDs
   - Sends PING heartbeats every 10s to keep the connection alive
-  - Reconnects on disconnect with exponential back-off (2s → 4s → 8s → max 60s)
+  - Tracks PONG replies; forces reconnect if no PONG within 30s
+  - Reconnects on disconnect with exponential back-off (1s → 2s → … → max 10s)
   - Routes all events through the ``on_event`` callback
 """
 
@@ -24,12 +25,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Callable, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from config.timing import WS_PING_INTERVAL_S, WS_CLOSE_TIMEOUT_S
+from config.timing import WS_PING_INTERVAL_S, WS_PONG_TIMEOUT_S, WS_CLOSE_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,7 @@ class PolymarketFeed:
         self._ping_task: Optional[asyncio.Task] = None
         self._running = False
         self._reconnect_delay = _RECONNECT_BASE
+        self._last_pong: float = 0.0  # monotonic timestamp of last PONG
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -165,6 +168,7 @@ class PolymarketFeed:
             close_timeout=WS_CLOSE_TIMEOUT_S,
         ) as ws:
             self._ws = ws
+            self._last_pong = time.monotonic()
             logger.info("Connected to Polymarket Market Channel")
 
             # Subscribe
@@ -187,6 +191,7 @@ class PolymarketFeed:
                     if not self._running:
                         break
                     if raw_msg == "PONG":
+                        self._last_pong = time.monotonic()
                         continue
                     self._handle_message(raw_msg)
             finally:
@@ -194,10 +199,19 @@ class PolymarketFeed:
                     self._ping_task.cancel()
 
     async def _heartbeat(self, ws: websockets.WebSocketClientProtocol) -> None:
-        """Send PING every N seconds to keep the connection alive."""
+        """Send PING every N seconds; close connection if PONG not received within timeout."""
         try:
             while self._running:
                 await asyncio.sleep(_PING_INTERVAL)
+                # Check pong timeout before sending next ping
+                elapsed = time.monotonic() - self._last_pong
+                if elapsed > WS_PONG_TIMEOUT_S:
+                    logger.warning(
+                        "No PONG received for %.0fs (timeout=%ds) — forcing reconnect",
+                        elapsed, WS_PONG_TIMEOUT_S,
+                    )
+                    await ws.close(1000, "Pong timeout")
+                    return
                 await ws.send("PING")
         except (ConnectionClosed, asyncio.CancelledError):
             pass
