@@ -1,5 +1,6 @@
 from collections import defaultdict
 import json
+import os
 import time
 from decimal import Decimal
 from typing import List, Optional, Tuple
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import BinaryOption, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast, PriceHistory
+from models import BinaryOption, Bot, BOResult, BOSymbol, BOTimeframe, BOForecast, PriceHistory, BO_ACTIVE_TIMEFRAMES
 from services.polymarket import PolymarketClient
 from config.timing import (
     HTTP_TIMEOUT_FAST,
@@ -33,13 +34,78 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# ── Market order file logger ─────────────────────────────────────────────────
+_MARKET_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+_MARKET_LOG_PATH = os.path.join(_MARKET_LOG_DIR, "market_orders.log")
+
+_market_logger = logging.getLogger("market_order_log")
+_market_logger.setLevel(logging.INFO)
+_market_logger.propagate = False
+
+try:
+    os.makedirs(_MARKET_LOG_DIR, exist_ok=True)
+    _market_fh = logging.FileHandler(_MARKET_LOG_PATH, encoding="utf-8")
+    _market_fh.setFormatter(logging.Formatter("%(message)s"))
+    _market_logger.addHandler(_market_fh)
+except Exception as _exc:
+    logger.warning("Cannot create market order log at %s: %s", _MARKET_LOG_PATH, _exc)
+
+
+def _log_market_order(
+    fill_status: str,
+    *,
+    bo_id: Optional[int] = None,
+    bot_name: str = "",
+    symbol: str = "",
+    timeframe: str = "",
+    forecast: str = "",
+    order_type: str = "FAK",
+    requested_amount: float = 0,
+    filled_amount: float = 0,
+    refund: float = 0,
+    avg_price: Optional[float] = None,
+    num_shares: Optional[float] = None,
+    entry_fee: float = 0,
+    walk_levels: Optional[list] = None,
+    snapshot_prices: Optional[dict] = None,
+    ceiling_price: Optional[float] = None,
+    slippage_tolerance: Optional[float] = None,
+    reject_reason: str = "",
+    latency_ms: float = 0,
+) -> None:
+    """Write a structured JSON line to logs/market_orders.log."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fill_status": fill_status,
+        "bo_id": bo_id,
+        "bot_name": bot_name,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "forecast": forecast,
+        "order_type": order_type,
+        "requested_amount": requested_amount,
+        "filled_amount": filled_amount,
+        "refund": refund,
+        "avg_price": avg_price,
+        "num_shares": num_shares,
+        "entry_fee": entry_fee,
+        "walk_levels": walk_levels or [],
+        "snapshot": snapshot_prices or {},
+        "ceiling_price": ceiling_price,
+        "slippage_tolerance": slippage_tolerance,
+        "reject_reason": reject_reason,
+        "latency_ms": round(latency_ms, 1),
+    }
+    _market_logger.info(json.dumps(record, ensure_ascii=False))
+
+
 # GREEN → lấy min_ask của UP, RED → lấy min_ask của DOWN
 _FORECAST_TO_STATUS = {"GREEN": "UP", "RED": "DOWN"}
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
-_TF_PERIOD_S = {"M5": 300, "M15": 900}
+_TF_PERIOD_S = {"M5": 300}
 
 
 # ── Session resolution ────────────────────────────────────────────────────────
@@ -330,6 +396,65 @@ def _snapshot_best_ask(
         return None
 
 
+def _fetch_snapshot_prices(
+    symbol: str, timeframe: str, direction: str,
+    candle_open: int = 0,
+) -> dict:
+    """Fetch best ask/bid + sizes from orderbook for snapshot recording.
+
+    Primary: Polymarket CLOB REST API (fresh data).
+    Fallback: Redis orderbook snapshot.
+
+    Returns dict with best_ask, best_ask_size, best_bid, best_bid_size.
+    Values are None if unavailable.
+    """
+    result = {
+        "best_ask": None, "best_ask_size": None,
+        "best_bid": None, "best_bid_size": None,
+    }
+
+    # 1. Primary: Polymarket REST API
+    token_id = _resolve_token_id(symbol, timeframe, direction, candle_open)
+    if token_id:
+        try:
+            pm = _get_pm_client()
+            bids_raw, asks_raw = pm.fetch_book_raw(token_id)
+            if asks_raw:
+                sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
+                result["best_ask"] = float(sorted_asks[0]["price"])
+                result["best_ask_size"] = float(sorted_asks[0]["size"])
+            if bids_raw:
+                sorted_bids = sorted(bids_raw, key=lambda x: float(x["price"]), reverse=True)
+                result["best_bid"] = float(sorted_bids[0]["price"])
+                result["best_bid_size"] = float(sorted_bids[0]["size"])
+            if result["best_ask"] is not None or result["best_bid"] is not None:
+                return result
+        except Exception as exc:
+            logger.warning(
+                "Polymarket REST snapshot failed for %s — falling back to Redis: %s",
+                token_id[:16], exc,
+            )
+
+    # 2. Fallback: Redis orderbook snapshot
+    try:
+        from services.redis_client import get_sync_redis
+        sr = get_sync_redis()
+        key = f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}"
+        data = sr.hgetall(key)
+        if data:
+            asks = json.loads(data.get("asks", "[]")) if data.get("asks") else []
+            bids = json.loads(data.get("bids", "[]")) if data.get("bids") else []
+            if asks:
+                result["best_ask"] = float(asks[0][0])
+                result["best_ask_size"] = float(asks[0][1])
+            if bids:
+                result["best_bid"] = float(bids[0][0])
+                result["best_bid_size"] = float(bids[0][1])
+    except Exception as exc:
+        logger.warning("Redis snapshot fallback failed: %s", exc)
+    return result
+
+
 def _fill_market_from_snapshot(
     symbol: str, timeframe: str, direction: str, amount: float,
     slippage_tolerance: Optional[float] = None,
@@ -616,6 +741,13 @@ def create_bo(
     """
     order_received_at = datetime.now(timezone.utc)
 
+    if payload.timeframe not in BO_ACTIVE_TIMEFRAMES:
+        allowed = ", ".join(t.value for t in BO_ACTIVE_TIMEFRAMES)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Timeframe {payload.timeframe.value} is not supported. Allowed: {allowed}",
+        )
+
     bot = db.query(Bot).filter(Bot.api_key == x_api_key, Bot.is_active == True).first()
     if not bot:
         raise HTTPException(status_code=401, detail="Invalid or inactive API key")
@@ -676,15 +808,12 @@ def create_bo(
          "is_current": session.is_current, "bumped": session.bumped},
     ))
 
-    # ── Session availability check ───────────────────────────────────────
-    # Validate that orderbook data exists for the target session.
-    # Token resolution is deferred to OrderConsumer (which reads from
-    # session.tokens[direction]).  The API only needs the session_id +
-    # direction to route the order to the correct queue.
-    snapshot_best_ask = _snapshot_best_ask(
+    # ── Fetch orderbook snapshot (Polymarket REST primary, Redis fallback) ──
+    snapshot_prices = _fetch_snapshot_prices(
         payload.symbol.value, payload.timeframe.value,
         direction, candle_open=candle_open,
     )
+    snapshot_best_ask = snapshot_prices["best_ask"]
 
     if not session.is_current and snapshot_best_ask is None:
         # Future session with no orderbook data yet — ME hasn't created it
@@ -705,11 +834,25 @@ def create_bo(
     ask_fetched_at = datetime.now(timezone.utc)
     latency_ms = (ask_fetched_at - order_received_at).total_seconds() * 1000
 
+    pending_traces.append(make_trace(
+        "SNAPSHOT", "ORDERBOOK_SNAPSHOT",
+        f"Orderbook snapshot at order time: "
+        f"Best Ask={snapshot_prices['best_ask']}"
+        f" (size={snapshot_prices['best_ask_size']}), "
+        f"Best Bid={snapshot_prices['best_bid']}"
+        f" (size={snapshot_prices['best_bid_size']}).",
+        snapshot_prices,
+    ))
+
     # ── Pre-validation: ceiling_price vs Best Ask ────────────────────────────
     # ceiling_price must be >= best_ask; otherwise no fill is possible.
     if payload.ceiling_price is not None and snapshot_best_ask is not None:
         if payload.ceiling_price < snapshot_best_ask:
             bot.balance = round(bot.balance + payload.amount, 8)
+            reject_detail = (
+                f"ceiling_price ({payload.ceiling_price:.4f}) is below current "
+                f"Best Ask ({snapshot_best_ask:.4f}) — no fills possible"
+            )
             pending_traces.append(make_trace(
                 "VALIDATION", "CEILING_PRICE_REJECTED",
                 f"Ceiling price ${payload.ceiling_price:.4f} is below Best Ask "
@@ -717,13 +860,21 @@ def create_bo(
                 {"ceiling_price": payload.ceiling_price, "best_ask": snapshot_best_ask,
                  "order_type": payload.order_type},
             ))
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"ceiling_price ({payload.ceiling_price:.4f}) is below current "
-                    f"Best Ask ({snapshot_best_ask:.4f}) — no fills possible"
-                ),
-            )
+            if not is_limit:
+                _log_market_order(
+                    "REJECTED",
+                    bot_name=bot.bot_name,
+                    symbol=payload.symbol.value,
+                    timeframe=payload.timeframe.value,
+                    forecast=payload.forecast.value,
+                    order_type=payload.order_type or "FAK",
+                    requested_amount=payload.amount,
+                    snapshot_prices=snapshot_prices,
+                    ceiling_price=payload.ceiling_price,
+                    reject_reason=reject_detail,
+                    latency_ms=latency_ms,
+                )
+            raise HTTPException(status_code=400, detail=reject_detail)
 
     # ── Pre-validation: condition price vs Best Ask (v2 spec Section 2) ────
     # Prevents "logical suicide" orders where the condition is already met.
@@ -1036,6 +1187,7 @@ def create_bo(
 
     else:
         # ── MARKET path: fill immediately from session-keyed orderbook snapshot ──
+        original_market_amount = payload.amount
         try:
             avg_price, num_shares, walk_levels = _fill_market_from_snapshot(
                 payload.symbol.value, payload.timeframe.value, direction,
@@ -1045,14 +1197,42 @@ def create_bo(
                 order_type=payload.order_type or "FAK",
                 ceiling_price=payload.ceiling_price,
             )
-        except HTTPException:
+        except HTTPException as exc:
             bot.balance = round(bot.balance + payload.amount, 8)
+            logger.warning(
+                "BO MARKET FAK REJECTED %s %s %s: amount=%.4f "
+                "order_type=%s ceiling=%s slippage=%s "
+                "snapshot=[ask=%s(%s) bid=%s(%s)] "
+                "reason=%s latency=%.0fms",
+                payload.symbol.value, payload.timeframe.value,
+                payload.forecast.value, payload.amount,
+                payload.order_type or "FAK", payload.ceiling_price,
+                payload.slippage_tolerance,
+                snapshot_prices["best_ask"], snapshot_prices["best_ask_size"],
+                snapshot_prices["best_bid"], snapshot_prices["best_bid_size"],
+                exc.detail, latency_ms,
+            )
+            _log_market_order(
+                "REJECTED",
+                bot_name=bot.bot_name,
+                symbol=payload.symbol.value,
+                timeframe=payload.timeframe.value,
+                forecast=payload.forecast.value,
+                order_type=payload.order_type or "FAK",
+                requested_amount=payload.amount,
+                snapshot_prices=snapshot_prices,
+                ceiling_price=payload.ceiling_price,
+                slippage_tolerance=payload.slippage_tolerance,
+                reject_reason=exc.detail,
+                latency_ms=latency_ms,
+            )
             raise
 
         # FAK partial fill: refund unspent budget to bot
         actual_cost = sum(lv["cost"] for lv in walk_levels)
-        if actual_cost < payload.amount:
-            refund = round(payload.amount - actual_cost, 8)
+        is_partial = actual_cost < original_market_amount
+        if is_partial:
+            refund = round(original_market_amount - actual_cost, 8)
             bot.balance = round(bot.balance + refund, 8)
             payload.amount = round(actual_cost, 8)
 
@@ -1064,24 +1244,51 @@ def create_bo(
         me_order_status = "PREFILLED" if has_bracket else None
 
         order_traces = list(pending_traces)
-        order_traces.append(make_trace(
-            "MATCHING", "REST_FILL",
-            f"MARKET Order filled from Polymarket REST orderbook. "
-            f"Avg Entry Price: ${avg_price:.4f}. "
-            f"Shares: {num_shares:.4f}. "
-            f"Fee: ${entry_fee:.4f} (TAKER).",
-            {"order_type": "MARKET", "avg_price": avg_price,
-             "num_shares": num_shares, "walk_levels": walk_levels,
-             "entry_fee": entry_fee, "amount": payload.amount},
-        ))
+        if is_partial:
+            fak_fill_status = "PARTIAL_FILL"
+            order_traces.append(make_trace(
+                "MATCHING", "FAK_PARTIAL_FILL",
+                f"MARKET FAK partial fill: spent ${actual_cost:.4f} of "
+                f"${original_market_amount:.4f} (refund ${refund:.4f}). "
+                f"Avg Entry: ${avg_price:.4f}. Shares: {num_shares:.4f}. "
+                f"Fee: ${entry_fee:.4f} (TAKER). "
+                f"Snapshot: ask={snapshot_prices['best_ask']}({snapshot_prices['best_ask_size']}), "
+                f"bid={snapshot_prices['best_bid']}({snapshot_prices['best_bid_size']}).",
+                {"order_type": "MARKET", "fill_status": "PARTIAL_FILL",
+                 "avg_price": avg_price, "num_shares": num_shares,
+                 "walk_levels": walk_levels, "entry_fee": entry_fee,
+                 "original_amount": original_market_amount,
+                 "actual_cost": actual_cost, "refund": refund,
+                 **snapshot_prices},
+            ))
+        else:
+            fak_fill_status = "FILLED"
+            order_traces.append(make_trace(
+                "MATCHING", "REST_FILL",
+                f"MARKET FAK fully filled: ${actual_cost:.4f}. "
+                f"Avg Entry: ${avg_price:.4f}. Shares: {num_shares:.4f}. "
+                f"Fee: ${entry_fee:.4f} (TAKER). "
+                f"Snapshot: ask={snapshot_prices['best_ask']}({snapshot_prices['best_ask_size']}), "
+                f"bid={snapshot_prices['best_bid']}({snapshot_prices['best_bid_size']}).",
+                {"order_type": "MARKET", "fill_status": "FILLED",
+                 "avg_price": avg_price, "num_shares": num_shares,
+                 "walk_levels": walk_levels, "entry_fee": entry_fee,
+                 "amount": payload.amount, **snapshot_prices},
+            ))
 
         logger.info(
-            "BO MARKET %s %s %s: amount=%.4f avg_price=%.6f shares=%.4f "
-            "fee=%.4f latency=%.0fms tp=%s sl=%s → filled from REST orderbook",
+            "BO MARKET FAK %s %s %s %s: requested=%.4f filled=%.4f "
+            "avg_price=%.6f shares=%.4f fee=%.4f "
+            "snapshot=[ask=%s(%s) bid=%s(%s)] "
+            "latency=%.0fms tp=%s sl=%s",
+            fak_fill_status,
             payload.symbol.value, payload.timeframe.value,
             payload.forecast.value,
-            payload.amount, avg_price, num_shares, entry_fee, latency_ms,
-            payload.tp_price, payload.sl_price,
+            original_market_amount, actual_cost,
+            avg_price, num_shares, entry_fee,
+            snapshot_prices["best_ask"], snapshot_prices["best_ask_size"],
+            snapshot_prices["best_bid"], snapshot_prices["best_bid_size"],
+            latency_ms, payload.tp_price, payload.sl_price,
         )
 
         bo = BinaryOption(
@@ -1116,6 +1323,27 @@ def create_bo(
         db.commit()
         db.refresh(bo)
 
+        _log_market_order(
+            fak_fill_status,
+            bo_id=bo.id,
+            bot_name=bot.bot_name,
+            symbol=payload.symbol.value,
+            timeframe=payload.timeframe.value,
+            forecast=payload.forecast.value,
+            order_type=payload.order_type or "FAK",
+            requested_amount=original_market_amount,
+            filled_amount=actual_cost,
+            refund=round(original_market_amount - actual_cost, 8) if is_partial else 0,
+            avg_price=avg_price,
+            num_shares=num_shares,
+            entry_fee=entry_fee,
+            walk_levels=walk_levels,
+            snapshot_prices=snapshot_prices,
+            ceiling_price=payload.ceiling_price,
+            slippage_tolerance=payload.slippage_tolerance,
+            latency_ms=latency_ms,
+        )
+
         # If has bracket (TP/SL), queue as prefilled to ME for monitoring
         if has_bracket:
             _queue_prefilled_to_me(
@@ -1139,6 +1367,29 @@ def create_bo(
             publish_trace_to_redis(sr, bo.id, bo.traces[-1])
         except Exception:
             pass
+
+    # Attach snapshot prices as transient attributes for response (not persisted)
+    bo.snapshot_best_ask      = snapshot_prices["best_ask"]
+    bo.snapshot_best_ask_size = snapshot_prices["best_ask_size"]
+    bo.snapshot_best_bid      = snapshot_prices["best_bid"]
+    bo.snapshot_best_bid_size = snapshot_prices["best_bid_size"]
+
+    # Log fill status with snapshot context
+    fill_status = "FILLED" if bo.num_shares and bo.num_shares > 0 else "UNFILLED"
+    if bo.me_order_status == "PARTIAL":
+        fill_status = "PARTIAL_FILL"
+    elif bo.me_order_status == "PENDING":
+        fill_status = "QUEUED"
+    logger.info(
+        "BO #%d CREATED: fill_status=%s me_status=%s shares=%s avg_price=%s "
+        "amount=%.4f snapshot=[ask=%s(%s) bid=%s(%s)]",
+        bo.id, fill_status, bo.me_order_status,
+        f"{bo.num_shares:.4f}" if bo.num_shares else "0",
+        f"{bo.avg_price:.6f}" if bo.avg_price else "N/A",
+        bo.amount,
+        snapshot_prices["best_ask"], snapshot_prices["best_ask_size"],
+        snapshot_prices["best_bid"], snapshot_prices["best_bid_size"],
+    )
 
     return bo
 
@@ -1348,7 +1599,7 @@ def engine_status():
 
 # ─── Orderbook depth ──────────────────────────────────────────────────────
 
-_OB_SYMBOLS = ["BTC", "ETH"]
+_OB_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 _OB_DIRECTIONS = ["UP", "DOWN"]
 
 
@@ -1408,8 +1659,8 @@ def engine_orderbook(
 
 # ─── Live prices (direct REST) ─────────────────────────────────────────────
 
-_PRICE_SYMBOLS = ["BTC", "ETH"]
-_PRICE_TIMEFRAMES = ["M5", "M15"]
+_PRICE_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+_PRICE_TIMEFRAMES = ["M5"]
 _PRICE_DIRECTIONS = ["UP", "DOWN"]
 _PRICE_CACHE_TTL = API_PRICE_CACHE_TTL_S
 

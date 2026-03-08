@@ -114,6 +114,11 @@ class BOResponse(BaseModel):
     entry_fee:       Optional[float] = None
     order_type:      Optional[str]   = None
     ceiling_price:     Optional[float] = None
+    # Snapshot prices at order creation
+    snapshot_best_ask:      Optional[float] = None
+    snapshot_best_ask_size: Optional[float] = None
+    snapshot_best_bid:      Optional[float] = None
+    snapshot_best_bid_size: Optional[float] = None
     # Computed fill breakdown
     requested_quantity: Optional[float] = None
     filled_quantity:    Optional[float] = None

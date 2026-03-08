@@ -41,8 +41,8 @@ UI_PAST_SESSIONS = 1                # Number of past sessions to keep for UI
 
 # ── Market constants ─────────────────────────────────────────────────────────
 
-SYMBOLS = ["BTC", "ETH"]
-TIMEFRAMES = ["M5", "M15"]
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+TIMEFRAMES = ["M5"]
 DIRECTIONS = ["UP", "DOWN"]
 
 # ── Price history recording ─────────────────────────────────────────────────

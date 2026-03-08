@@ -59,11 +59,17 @@ class Bot(Base):
 class BOSymbol(str, enum.Enum):
     BTC = "BTC"
     ETH = "ETH"
+    SOL = "SOL"
+    XRP = "XRP"
 
 
 class BOTimeframe(str, enum.Enum):
     M5  = "M5"
-    M15 = "M15"
+    M15 = "M15"   # legacy — no longer accepted for new orders
+
+
+# Timeframes accepted for new orders
+BO_ACTIVE_TIMEFRAMES = {BOTimeframe.M5}
 
 
 class BOForecast(str, enum.Enum):

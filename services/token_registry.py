@@ -52,9 +52,9 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_SYMBOLS: list[str]    = ["BTC", "ETH"]
+_SYMBOLS: list[str]    = ["BTC", "ETH", "SOL", "XRP"]
 _DIRECTIONS: list[str] = ["UP", "DOWN"]
-_TIMEFRAMES: list[str] = ["M5", "M15"]
+_TIMEFRAMES: list[str] = ["M5"]
 
 _PREFETCH_CANDLES: int = TOKEN_PREFETCH_CANDLES
 
