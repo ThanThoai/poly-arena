@@ -181,8 +181,6 @@ def get_balance_history(
         bots_q = bots_q.filter(Bot.bot_name == bot_name)
     bots = bots_q.all()
 
-    now = datetime.now(timezone.utc)
-
     seed_records = [
         BalanceHistory(
             id=0,
@@ -194,62 +192,12 @@ def get_balance_history(
         for b in bots
     ]
 
-    # Current bot equity (cash + locked positions) as the latest data point
-    # b.balance = initial + realized_pnl - open_locked - net_fees (cash only)
-    # To match BalanceHistory which stores equity, add back open_locked.
-    bot_locked: dict[str, float] = {}
-    for b in bots:
-        # Binary options: amount locked in PENDING orders
-        bo_locked = (
-            db.query(sa_func.coalesce(sa_func.sum(BinaryOption.amount), 0.0))
-            .filter(
-                BinaryOption.bot_name == b.bot_name,
-                BinaryOption.result == BOResult.PENDING,
-            )
-            .scalar()
-        ) or 0.0
-
-        # Futures: margin locked in OPEN positions (already deducted from bot.balance)
-        fut_pos_margin = (
-            db.query(sa_func.coalesce(sa_func.sum(FuturesPosition.margin), 0.0))
-            .filter(
-                FuturesPosition.bot_name == b.bot_name,
-                FuturesPosition.status == FuturesPositionStatus.OPEN,
-            )
-            .scalar()
-        ) or 0.0
-
-        # Futures: margin reserved by PENDING limit orders
-        fut_ord_margin = (
-            db.query(sa_func.coalesce(
-                sa_func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0
-            ))
-            .filter(
-                FuturesOrder.bot_name == b.bot_name,
-                FuturesOrder.status == FuturesOrderStatus.PENDING,
-            )
-            .scalar()
-        ) or 0.0
-
-        bot_locked[b.bot_name] = bo_locked + fut_pos_margin + fut_ord_margin
-
-    current_records = [
-        BalanceHistory(
-            id=0,
-            bot_name=b.bot_name,
-            balance=round((b.balance or 0) + bot_locked.get(b.bot_name, 0), 8),
-            trade_id=None,
-            recorded_at=now,
-        )
-        for b in bots
-    ]
-
     q = db.query(BalanceHistory)
     if bot_name:
         q = q.filter(BalanceHistory.bot_name == bot_name)
     history = q.order_by(BalanceHistory.recorded_at.asc()).limit(limit).all()
 
-    return sorted(seed_records + history + current_records, key=lambda r: (r.recorded_at or ""))
+    return sorted(seed_records + history, key=lambda r: (r.recorded_at or ""))
 
 
 @router.get("/user-balance-history", response_model=List[UserBalanceHistoryResponse])
