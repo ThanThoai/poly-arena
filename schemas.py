@@ -242,6 +242,29 @@ class BalanceHistoryResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class BotBalanceEntry(BaseModel):
+    """Single bot's balance at a settlement timestamp."""
+    bot_name:       str
+    prev_balance:   float
+    new_balance:    float
+    delta:          float
+    total_profit:   float
+    total_fee:      float
+    session_result: Optional[str] = None   # WIN / LOSS / BREAKEVEN
+    session_id:     Optional[str] = None
+    symbol:         Optional[str] = None
+    timeframe:      Optional[str] = None
+    trade_count:    Optional[int] = None
+    win_count:      Optional[int] = None
+    loss_count:     Optional[int] = None
+
+
+class BalanceHistoryGrouped(BaseModel):
+    """All bot balances at a single settlement timestamp."""
+    settled_at: datetime
+    bots:       List[BotBalanceEntry]
+
+
 class UserBalanceHistoryResponse(BaseModel):
     id:          int
     user_id:     int
@@ -289,6 +312,29 @@ class UserBalanceSnapshotResponse(BaseModel):
     active_bot_count:   Optional[int] = 0
     open_bo_count:      Optional[int] = 0
     open_futures_count: Optional[int] = 0
+
+    model_config = {"from_attributes": True}
+
+
+class BotSettlementLedgerResponse(BaseModel):
+    id:             int
+    bot_name:       str
+    session_id:     Optional[str] = None
+    symbol:         Optional[str] = None
+    timeframe:      Optional[str] = None
+    candle_open:    Optional[int] = None
+    prev_balance:   float
+    total_profit:   float
+    total_fee:      float
+    delta:          float
+    new_balance:    float
+    session_result: Optional[str] = None
+    trade_count:    Optional[int] = None
+    win_count:      Optional[int] = None
+    loss_count:     Optional[int] = None
+    trade_ids:      Optional[list] = None
+    settled_at:     Optional[datetime] = None
+    recorded_at:    Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 

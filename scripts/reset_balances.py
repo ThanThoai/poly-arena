@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import text
 from database import SessionLocal, engine, Base
 from datetime import datetime, timezone
-from models import Bot, User, UserBalanceSnapshot
+from models import Bot, User, UserBalanceSnapshot, BotSettlementLedger
 
 BOT_BALANCE = 10000.0
 USER_TOTAL = 50000.0
@@ -39,6 +39,7 @@ def reset(apply: bool = False) -> None:
         bh_count = db.execute(text("SELECT count(*) FROM balance_history")).scalar()
         ubh_count = db.execute(text("SELECT count(*) FROM user_balance_history")).scalar()
         ubs_count = db.execute(text("SELECT count(*) FROM user_balance_snapshots")).scalar()
+        bsl_count = db.execute(text("SELECT count(*) FROM bot_settlement_ledger")).scalar()
 
         bots = db.query(Bot).filter(Bot.is_active == True).all()
         users = db.query(User).all()
@@ -49,6 +50,7 @@ def reset(apply: bool = False) -> None:
         print(f"  BalanceHistory to delete:       {bh_count}")
         print(f"  UserBalanceHistory to delete:   {ubh_count}")
         print(f"  UserBalanceSnapshots to delete: {ubs_count}")
+        print(f"  BotSettlementLedger to delete: {bsl_count}")
         print(f"  Active bots to reset:           {len(bots)}")
         print(f"  Users to reset:                 {len(users)}")
         print()
@@ -86,6 +88,10 @@ def reset(apply: bool = False) -> None:
         # ── 3b. Xoá user balance snapshots ──
         r_ubs = db.execute(text("DELETE FROM user_balance_snapshots"))
         print(f"  Deleted {r_ubs.rowcount} user balance snapshot records")
+
+        # ── 3c. Xoá bot settlement ledger ──
+        r_bsl = db.execute(text("DELETE FROM bot_settlement_ledger"))
+        print(f"  Deleted {r_bsl.rowcount} bot settlement ledger records")
 
         # ── 4. Reset bots ──
         for bot in bots:

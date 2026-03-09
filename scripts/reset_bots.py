@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from database import SessionLocal, engine, Base
 from models import (
-    BalanceHistory, BinaryOption, Bot, BotAchievement, BOResult,
+    BalanceHistory, BinaryOption, Bot, BotAchievement, BotSettlementLedger, BOResult,
     User, UserBalanceHistory, UserBalanceSnapshot,
 )
 from models_futures import FuturesPosition, FuturesOrder
@@ -92,6 +92,11 @@ def reset(
             .filter(BotAchievement.bot_id.in_(bot_ids))
             .count()
         )
+        bsl_count = (
+            db.query(BotSettlementLedger)
+            .filter(BotSettlementLedger.bot_name.in_(bot_names))
+            .count()
+        )
 
         prefix = "[DRY-RUN] " if not apply else ""
         scope = f"bot={bot_filter}" if bot_filter else f"user={user_filter}" if user_filter else "ALL"
@@ -102,6 +107,7 @@ def reset(
         print(f"  Futures orders to delete:   {fut_ord_count}")
         print(f"  BalanceHistory to delete:   {bh_count}")
         print(f"  Achievements to delete:     {ach_count}")
+        print(f"  Settlement ledger to delete: {bsl_count}")
         print()
 
         for bot in bots:
@@ -150,6 +156,14 @@ def reset(
             .delete(synchronize_session="fetch")
         )
         print(f"  Deleted {deleted_ach} achievement records")
+
+        # -- 5b. Delete settlement ledger --
+        deleted_bsl = (
+            db.query(BotSettlementLedger)
+            .filter(BotSettlementLedger.bot_name.in_(bot_names))
+            .delete(synchronize_session="fetch")
+        )
+        print(f"  Deleted {deleted_bsl} settlement ledger records")
 
         # -- 6. Reset bot balances --
         for bot in bots:

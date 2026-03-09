@@ -24,7 +24,8 @@ import httpx
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from models import BalanceHistory, BinaryOption, Bot, BOResult, INITIAL_BALANCE
+from collections import defaultdict
+from models import BalanceHistory, BinaryOption, Bot, BOResult, BotSettlementLedger, INITIAL_BALANCE
 from models_futures import FuturesPosition, FuturesPositionStatus, FuturesOrder, FuturesOrderStatus
 from services.user_balance import record_user_balance
 from config.timing import (
@@ -261,6 +262,94 @@ def _settle_single_trade(
     )
 
 
+# -- Settlement Ledger ---------------------------------------------------------
+
+def _write_settlement_ledger(
+    db: Session,
+    bot_name: str,
+    trade_ids: list[int],
+    initial_balance: float,
+) -> None:
+    """Write incremental ledger entries grouped by session (symbol:timeframe:candle_open).
+
+    Each entry: prev_balance + total_profit - total_fee = new_balance.
+    """
+    # Fetch all settled trades in this batch
+    trades = (
+        db.query(BinaryOption)
+        .filter(BinaryOption.id.in_(trade_ids))
+        .all()
+    )
+    if not trades:
+        return
+
+    # Group trades by session key
+    session_trades: dict[tuple, list] = defaultdict(list)
+    for t in trades:
+        if t.settlement_at:
+            tf_seconds = 300 if (t.timeframe and t.timeframe.value == "M5") else 300
+            co = int(t.settlement_at.timestamp()) // tf_seconds * tf_seconds
+        else:
+            co = 0
+        sym = t.symbol.value if t.symbol else "?"
+        tf = t.timeframe.value if t.timeframe else "?"
+        session_trades[(sym, tf, co)].append(t)
+
+    # Get previous ledger balance for this bot
+    last_ledger = (
+        db.query(BotSettlementLedger)
+        .filter(BotSettlementLedger.bot_name == bot_name)
+        .order_by(BotSettlementLedger.id.desc())
+        .first()
+    )
+    ledger_prev = last_ledger.new_balance if last_ledger else initial_balance
+
+    now = datetime.now(timezone.utc)
+
+    for (sym, tf, co), sess_trades in session_trades.items():
+        total_profit = round(sum(t.profit or 0 for t in sess_trades), 8)
+        total_fee = round(sum(t.entry_fee or 0 for t in sess_trades), 8)
+        delta = round(total_profit - total_fee, 8)
+        new_bal = round(ledger_prev + delta, 8)
+
+        wins = sum(1 for t in sess_trades if t.result == BOResult.WIN)
+        losses = sum(1 for t in sess_trades if t.result == BOResult.LOSS)
+
+        if delta > 0:
+            session_result = "WIN"
+        elif delta < 0:
+            session_result = "LOSS"
+        else:
+            session_result = "BREAKEVEN"
+
+        db.add(BotSettlementLedger(
+            bot_name=bot_name,
+            session_id=f"{sym}:{tf}:{co}",
+            symbol=sym,
+            timeframe=tf,
+            candle_open=co,
+            prev_balance=ledger_prev,
+            total_profit=total_profit,
+            total_fee=total_fee,
+            delta=delta,
+            new_balance=new_bal,
+            session_result=session_result,
+            trade_count=len(sess_trades),
+            win_count=wins,
+            loss_count=losses,
+            trade_ids=[t.id for t in sess_trades],
+            settled_at=now,
+        ))
+
+        logger.info(
+            "LEDGER '%s' session=%s:%s:%d: %.8f %+.8f (profit=%+.8f fee=%.8f) -> %.8f [%s] %d trades",
+            bot_name, sym, tf, co, ledger_prev, delta,
+            total_profit, total_fee, new_bal, session_result, len(sess_trades),
+        )
+
+        ledger_prev = new_bal  # chain to next session
+
+
 # -- Balance reconciliation ----------------------------------------------------
 
 def reconcile_bot_balances(
@@ -423,6 +512,10 @@ def reconcile_bot_balances(
             bot_name=bot_name,
             balance=equity,
         ))
+
+        # ── Settlement Ledger: one record per session ──────────────────────────
+        if trade_ids:
+            _write_settlement_ledger(db, bot_name, trade_ids, initial)
 
         # Auto-pause on bankruptcy
         if bot.balance <= 0:

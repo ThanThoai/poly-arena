@@ -8,11 +8,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func as sa_func
 
 from database import get_db
-from models import BalanceHistory, BinaryOption, Bot, BOResult, User, UserBalanceHistory, UserBalanceSnapshot
+from models import BalanceHistory, BinaryOption, Bot, BOResult, BotSettlementLedger, User, UserBalanceHistory, UserBalanceSnapshot
 from models_futures import FuturesPosition, FuturesPositionStatus, FuturesOrder, FuturesOrderStatus
+from collections import defaultdict
 from schemas import (
-    BalanceHistoryResponse, BOResponse, BotBalanceAdjust, BotCreate, BotPerformanceResponse,
-    BotPnlResponse, BotPublic, BotRename, BotResponse,
+    BalanceHistoryGrouped, BalanceHistoryResponse, BotBalanceEntry,
+    BOResponse, BotBalanceAdjust, BotCreate, BotPerformanceResponse,
+    BotPnlResponse, BotPublic, BotRename, BotResponse, BotSettlementLedgerResponse,
     UserBalanceHistoryResponse, UserBalanceSnapshotResponse, UserPnlResponse,
 )
 
@@ -170,34 +172,80 @@ def adjust_bot_balance(
     return bot
 
 
-@router.get("/balance-history", response_model=List[BalanceHistoryResponse])
+@router.get("/balance-history", response_model=List[BalanceHistoryGrouped])
 def get_balance_history(
     bot_name: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=50000),
     db: Session = Depends(get_db),
 ):
+    """Balance history from settlement ledger, grouped by settlement timestamp.
+
+    Each entry has a settled_at timestamp and list of bot balances at that time.
+    Includes a seed entry (initial balances) at bot creation time.
+    """
+    # Determine target bots for seed records
     bots_q = db.query(Bot)
     if bot_name:
         bots_q = bots_q.filter(Bot.bot_name == bot_name)
     bots = bots_q.all()
 
-    seed_records = [
-        BalanceHistory(
-            id=0,
-            bot_name=b.bot_name,
-            balance=b.initial_balance,
-            trade_id=None,
-            recorded_at=b.created_at,
+    # Build seed group: initial balances at earliest bot creation
+    if bots:
+        earliest = min(b.created_at for b in bots if b.created_at)
+        seed_group = BalanceHistoryGrouped(
+            settled_at=earliest,
+            bots=[
+                BotBalanceEntry(
+                    bot_name=b.bot_name,
+                    prev_balance=0,
+                    new_balance=b.initial_balance or 0,
+                    delta=b.initial_balance or 0,
+                    total_profit=0,
+                    total_fee=0,
+                    session_result=None,
+                )
+                for b in bots
+            ],
         )
-        for b in bots
+    else:
+        seed_group = None
+
+    # Query settlement ledger
+    q = db.query(BotSettlementLedger)
+    if bot_name:
+        q = q.filter(BotSettlementLedger.bot_name == bot_name)
+    rows = q.order_by(BotSettlementLedger.settled_at.asc()).limit(limit).all()
+
+    # Group by settled_at
+    groups: dict[datetime, list] = defaultdict(list)
+    for r in rows:
+        groups[r.settled_at].append(
+            BotBalanceEntry(
+                bot_name=r.bot_name,
+                prev_balance=r.prev_balance,
+                new_balance=r.new_balance,
+                delta=r.delta,
+                total_profit=r.total_profit,
+                total_fee=r.total_fee,
+                session_result=r.session_result,
+                session_id=r.session_id,
+                symbol=r.symbol,
+                timeframe=r.timeframe,
+                trade_count=r.trade_count,
+                win_count=r.win_count,
+                loss_count=r.loss_count,
+            )
+        )
+
+    result = [
+        BalanceHistoryGrouped(settled_at=ts, bots=entries)
+        for ts, entries in sorted(groups.items())
     ]
 
-    q = db.query(BalanceHistory)
-    if bot_name:
-        q = q.filter(BalanceHistory.bot_name == bot_name)
-    history = q.order_by(BalanceHistory.recorded_at.asc()).limit(limit).all()
+    if seed_group:
+        result.insert(0, seed_group)
 
-    return sorted(seed_records + history, key=lambda r: (r.recorded_at or ""))
+    return result
 
 
 @router.get("/user-balance-history", response_model=List[UserBalanceHistoryResponse])
@@ -279,6 +327,22 @@ def get_user_balance_snapshots(
     history = q.order_by(UserBalanceSnapshot.recorded_at.asc()).limit(limit).all()
 
     return sorted(seeds + history, key=lambda r: (r.recorded_at or ""))
+
+
+@router.get("/settlement-ledger", response_model=List[BotSettlementLedgerResponse])
+def get_settlement_ledger(
+    bot_name: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=50000),
+    db: Session = Depends(get_db),
+):
+    """Get bot settlement ledger — incremental balance changes per session."""
+    q = db.query(BotSettlementLedger)
+    if bot_name:
+        q = q.filter(BotSettlementLedger.bot_name == bot_name)
+    if symbol:
+        q = q.filter(BotSettlementLedger.symbol == symbol)
+    return q.order_by(BotSettlementLedger.settled_at.asc()).limit(limit).all()
 
 
 # ── Pause / Resume ───────────────────────────────────────────────────────────
@@ -376,13 +440,23 @@ def bot_performance(
     settled.sort(key=lambda t: t.settlement_at or t.updated_at or t.created_at or "", reverse=True)
     recent = settled[:20]
 
-    # Balance history for charting
-    history = (
-        db.query(BalanceHistory)
-        .filter(BalanceHistory.bot_name == bot.bot_name)
-        .order_by(BalanceHistory.recorded_at.asc())
+    # Balance history from settlement ledger → convert to BalanceHistoryResponse for compat
+    ledger_rows = (
+        db.query(BotSettlementLedger)
+        .filter(BotSettlementLedger.bot_name == bot.bot_name)
+        .order_by(BotSettlementLedger.settled_at.asc())
         .all()
     )
+    history = [
+        BalanceHistory(
+            id=r.id,
+            bot_name=r.bot_name,
+            balance=r.new_balance,
+            trade_id=None,
+            recorded_at=r.settled_at,
+        )
+        for r in ledger_rows
+    ]
 
     locked = _bot_locked_margin(db, bot.bot_name)
     return BotPerformanceResponse(
@@ -426,15 +500,34 @@ def _bot_locked_margin(db: Session, bot_name: str) -> float:
 
 
 def _bot_pnl(db: Session, bot: Bot, trades: list) -> BotPnlResponse:
-    """Build a BotPnlResponse from a Bot and its trades."""
-    wins = sum(1 for t in trades if t.result == BOResult.WIN)
-    losses = sum(1 for t in trades if t.result == BOResult.LOSS)
-    pending = sum(1 for t in trades if t.result == BOResult.PENDING)
-    decided = wins + losses
-    realized_pnl = round(sum(t.profit or 0 for t in trades if t.result in (BOResult.WIN, BOResult.LOSS)), 8)
-    total_fees = round(sum(t.entry_fee or 0 for t in trades), 8)
+    """Build a BotPnlResponse from Bot + settlement ledger + pending trades."""
     initial = bot.initial_balance or 0
     locked = _bot_locked_margin(db, bot.bot_name)
+
+    # Aggregate from settlement ledger
+    ledger_rows = (
+        db.query(BotSettlementLedger)
+        .filter(BotSettlementLedger.bot_name == bot.bot_name)
+        .all()
+    )
+
+    if ledger_rows:
+        wins = sum(r.win_count or 0 for r in ledger_rows)
+        losses = sum(r.loss_count or 0 for r in ledger_rows)
+        total_settled = sum(r.trade_count or 0 for r in ledger_rows)
+        realized_pnl = round(sum(r.total_profit or 0 for r in ledger_rows), 8)
+        total_fees = round(sum(r.total_fee or 0 for r in ledger_rows), 8)
+    else:
+        # Fallback to trades if no ledger data yet
+        wins = sum(1 for t in trades if t.result == BOResult.WIN)
+        losses = sum(1 for t in trades if t.result == BOResult.LOSS)
+        total_settled = wins + losses
+        realized_pnl = round(sum(t.profit or 0 for t in trades if t.result in (BOResult.WIN, BOResult.LOSS)), 8)
+        total_fees = round(sum(t.entry_fee or 0 for t in trades), 8)
+
+    pending = sum(1 for t in trades if t.result == BOResult.PENDING)
+    decided = wins + losses
+
     return BotPnlResponse(
         bot_name=bot.bot_name,
         status=getattr(bot, "status", "ACTIVE") or "ACTIVE",
@@ -445,7 +538,7 @@ def _bot_pnl(db: Session, bot: Bot, trades: list) -> BotPnlResponse:
         wins=wins,
         losses=losses,
         pending=pending,
-        total_trades=len(trades),
+        total_trades=total_settled + pending,
         win_rate=round(wins / decided * 100, 2) if decided else 0.0,
         avg_profit_per_trade=round(realized_pnl / decided, 8) if decided else 0.0,
         total_fees=total_fees,

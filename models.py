@@ -95,6 +95,41 @@ class BalanceHistory(Base):
     recorded_at = Column(DateTime(timezone=True), default=_now)
 
 
+class BotSettlementLedger(Base):
+    """Incremental balance ledger — one record per bot per session at settlement.
+
+    Each record = prev_balance + total_profit - total_fee = new_balance.
+    session_result: WIN (delta > 0), LOSS (delta < 0), BREAKEVEN (delta == 0).
+    """
+    __tablename__ = "bot_settlement_ledger"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    bot_name       = Column(String(100), nullable=False, index=True)
+
+    # Session context
+    session_id     = Column(String(64), nullable=True, index=True)   # e.g. "BTC:M5:1709313000"
+    symbol         = Column(String(10), nullable=True)
+    timeframe      = Column(String(5), nullable=True)
+    candle_open    = Column(Integer, nullable=True)
+
+    # Incremental balance tracking
+    prev_balance   = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+    total_profit   = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+    total_fee      = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+    delta          = Column(Numeric(18, 8, asdecimal=False), nullable=False, default=0)
+    new_balance    = Column(Numeric(18, 8, asdecimal=False), nullable=False)
+
+    # Session summary
+    session_result = Column(String(10), nullable=True)   # WIN / LOSS / BREAKEVEN
+    trade_count    = Column(Integer, nullable=True, default=0)
+    win_count      = Column(Integer, nullable=True, default=0)
+    loss_count     = Column(Integer, nullable=True, default=0)
+    trade_ids      = Column(JSON, nullable=True)          # [1, 2, 3]
+
+    settled_at     = Column(DateTime(timezone=True), nullable=True)
+    recorded_at    = Column(DateTime(timezone=True), default=_now)
+
+
 class UserBalanceHistory(Base):
     __tablename__ = "user_balance_history"
 
