@@ -175,51 +175,48 @@ def adjust_bot_balance(
 @router.get("/balance-history", response_model=List[BalanceHistoryGrouped])
 def get_balance_history(
     bot_name: Optional[str] = Query(None),
-    limit: int = Query(500, ge=1, le=50000),
+    limit: int = Query(100, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     """Balance history from settlement ledger, grouped by settlement timestamp.
 
-    Each entry has a settled_at timestamp and list of bot balances at that time.
-    Includes a seed entry (initial balances) at bot creation time.
+    Returns the most recent `limit` timestamps (max 100), each with all bot balances.
     """
-    # Determine target bots for seed records
-    bots_q = db.query(Bot)
+    # Find the newest `limit` distinct settled_at timestamps
+    ts_q = db.query(BotSettlementLedger.settled_at)
     if bot_name:
-        bots_q = bots_q.filter(Bot.bot_name == bot_name)
-    bots = bots_q.all()
+        ts_q = ts_q.filter(BotSettlementLedger.bot_name == bot_name)
+    recent_times = [
+        row[0] for row in
+        ts_q.distinct()
+        .order_by(BotSettlementLedger.settled_at.desc())
+        .limit(limit)
+        .all()
+    ]
 
-    # Build seed group: initial balances at earliest bot creation
-    if bots:
-        earliest = min(b.created_at for b in bots if b.created_at)
-        seed_group = BalanceHistoryGrouped(
-            settled_at=earliest,
-            bots=[
-                BotBalanceEntry(
-                    bot_name=b.bot_name,
-                    prev_balance=0,
-                    new_balance=b.initial_balance or 0,
-                    delta=b.initial_balance or 0,
-                    total_profit=0,
-                    total_fee=0,
-                    session_result=None,
-                )
-                for b in bots
-            ],
-        )
-    else:
-        seed_group = None
+    if not recent_times:
+        return []
 
-    # Query settlement ledger
-    q = db.query(BotSettlementLedger)
+    # Fetch all rows for those timestamps
+    q = db.query(BotSettlementLedger).filter(
+        BotSettlementLedger.settled_at.in_(recent_times),
+    )
     if bot_name:
         q = q.filter(BotSettlementLedger.bot_name == bot_name)
-    rows = q.order_by(BotSettlementLedger.settled_at.asc()).limit(limit).all()
+    rows = q.all()
+
+    # For each (settled_at, bot_name), keep only the row with the latest session_id
+    best: dict[tuple, BotSettlementLedger] = {}
+    for r in rows:
+        key = (r.settled_at, r.bot_name)
+        prev = best.get(key)
+        if prev is None or (r.session_id or "") > (prev.session_id or ""):
+            best[key] = r
 
     # Group by settled_at
     groups: dict[datetime, list] = defaultdict(list)
-    for r in rows:
-        groups[r.settled_at].append(
+    for (ts, _), r in sorted(best.items()):
+        groups[ts].append(
             BotBalanceEntry(
                 bot_name=r.bot_name,
                 prev_balance=r.prev_balance,
@@ -237,45 +234,26 @@ def get_balance_history(
             )
         )
 
-    result = [
+    return [
         BalanceHistoryGrouped(settled_at=ts, bots=entries)
         for ts, entries in sorted(groups.items())
     ]
-
-    if seed_group:
-        result.insert(0, seed_group)
-
-    return result
 
 
 @router.get("/user-balance-history", response_model=List[UserBalanceHistoryResponse])
 def get_user_balance_history(
     user_id: Optional[int] = Query(None),
-    limit: int = Query(500, ge=1, le=50000),
+    limit: int = Query(100, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """Get balance history (public). Optional user_id filter."""
-    if user_id is not None:
-        target_users = db.query(User).filter(User.id == user_id).all()
-    else:
-        target_users = db.query(User).filter(User.is_active == True).all()
-
-    seeds = []
-    for u in target_users:
-        seeds.append(UserBalanceHistory(
-            id=0,
-            user_id=u.id,
-            balance=u.initial_balance or 0,
-            trade_id=None,
-            recorded_at=u.created_at,
-        ))
-
+    """Get balance history (public). Optional user_id filter. Returns most recent `limit` records (max 100), no seed."""
     q = db.query(UserBalanceHistory)
     if user_id is not None:
         q = q.filter(UserBalanceHistory.user_id == user_id)
-    history = q.order_by(UserBalanceHistory.recorded_at.asc()).limit(limit).all()
+    history = q.order_by(UserBalanceHistory.recorded_at.desc()).limit(limit).all()
+    history.reverse()
 
-    return sorted(seeds + history, key=lambda r: (r.recorded_at or ""))
+    return history
 
 
 @router.get("/user-balance-snapshots", response_model=List[UserBalanceSnapshotResponse])
@@ -516,14 +494,16 @@ def _bot_pnl(db: Session, bot: Bot, trades: list) -> BotPnlResponse:
         losses = sum(r.loss_count or 0 for r in ledger_rows)
         total_settled = sum(r.trade_count or 0 for r in ledger_rows)
         realized_pnl = round(sum(r.total_profit or 0 for r in ledger_rows), 8)
-        total_fees = round(sum(r.total_fee or 0 for r in ledger_rows), 8)
     else:
         # Fallback to trades if no ledger data yet
         wins = sum(1 for t in trades if t.result == BOResult.WIN)
         losses = sum(1 for t in trades if t.result == BOResult.LOSS)
         total_settled = wins + losses
         realized_pnl = round(sum(t.profit or 0 for t in trades if t.result in (BOResult.WIN, BOResult.LOSS)), 8)
-        total_fees = round(sum(t.entry_fee or 0 for t in trades), 8)
+
+    # Always compute total_fees from trades (source of truth).
+    # Ledger total_fee can be stale when maker rebates update entry_fee after settlement.
+    total_fees = round(sum(t.entry_fee or 0 for t in trades), 8)
 
     pending = sum(1 for t in trades if t.result == BOResult.PENDING)
     decided = wins + losses

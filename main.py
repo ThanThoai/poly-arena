@@ -384,7 +384,7 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                 # Publish trace to Redis for real-time UI
                 _publish_trace_sync(bo)
 
-                role = "MAKER" if is_passive_limit else "TAKER"
+                role = "MAKER" if is_maker_fill else "TAKER"
                 log.info(
                     "Fill update: BO #%d filled=%.4f avg=%.6f status=%s role=%s fee=%.6f",
                     bo_id,
