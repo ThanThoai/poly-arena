@@ -4,8 +4,8 @@ Backfill bot_settlement_ledger from existing settled trades.
 
 For each bot:
   1. Query all settled trades (WIN/LOSS) ordered by settlement_at.
-  2. Group trades by session (symbol:timeframe:candle_open) in chronological order.
-  3. Chain prev_balance → new_balance across sessions (same logic as _write_settlement_ledger).
+  2. Group trades by settlement batch (same settlement_at timestamp).
+  3. Write ONE aggregated ledger row per batch, chaining prev_balance → new_balance.
 
 Skips bots that already have ledger entries (safe to re-run).
 
@@ -19,7 +19,6 @@ Usage:
 import argparse
 import sys
 from collections import defaultdict
-from datetime import timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -31,29 +30,6 @@ from models import (
     Bot,
     BotSettlementLedger,
 )
-
-
-TF_SECONDS = {
-    "M5": 300,
-    "M15": 900,
-}
-
-
-def _session_key(trade: BinaryOption) -> tuple[str, str, int]:
-    """Derive (symbol, timeframe, candle_open) from a settled trade."""
-    sym = trade.symbol.value if trade.symbol else "?"
-    tf = trade.timeframe.value if trade.timeframe else "?"
-
-    # Prefer the stored candle_open, fall back to deriving from settlement_at
-    if trade.candle_open:
-        co = int(trade.candle_open)
-    elif trade.settlement_at:
-        interval = TF_SECONDS.get(tf, 300)
-        co = int(trade.settlement_at.timestamp()) // interval * interval
-    else:
-        co = 0
-
-    return (sym, tf, co)
 
 
 def backfill(force: bool = False, bot_filter: str | None = None, dry_run: bool = False) -> None:
@@ -106,37 +82,31 @@ def backfill(force: bool = False, bot_filter: str | None = None, dry_run: bool =
                 print(f"  Skip  {bot.bot_name!r:20s} — no settled trades")
                 continue
 
-            # Group trades by session, preserving chronological order of first appearance
-            session_trades: dict[tuple, list[BinaryOption]] = defaultdict(list)
-            session_order: list[tuple] = []
-            session_settled_at: dict[tuple, object] = {}
+            # Group trades by settlement_at timestamp (one batch = one ledger row)
+            batch_trades: dict[object, list[BinaryOption]] = defaultdict(list)
+            batch_order: list[object] = []
 
             for t in trades:
-                key = _session_key(t)
-                if key not in session_trades:
-                    session_order.append(key)
-                session_trades[key].append(t)
-                # Use latest settlement_at in the session
-                if t.settlement_at:
-                    prev = session_settled_at.get(key)
-                    if prev is None or t.settlement_at > prev:
-                        session_settled_at[key] = t.settlement_at
+                key = t.settlement_at
+                if key not in batch_trades:
+                    batch_order.append(key)
+                batch_trades[key].append(t)
 
             # Chain balance forward
             initial = bot.initial_balance or 0
             ledger_prev = initial
             records = []
 
-            for (sym, tf, co) in session_order:
-                sess_trades = session_trades[(sym, tf, co)]
+            for settled_at in batch_order:
+                batch = batch_trades[settled_at]
 
-                total_profit = round(sum(t.profit or 0 for t in sess_trades), 8)
-                total_fee = round(sum(t.entry_fee or 0 for t in sess_trades), 8)
+                total_profit = round(sum(t.profit or 0 for t in batch), 8)
+                total_fee = round(sum(t.entry_fee or 0 for t in batch), 8)
                 delta = round(total_profit - total_fee, 8)
                 new_bal = round(ledger_prev + delta, 8)
 
-                wins = sum(1 for t in sess_trades if t.result == BOResult.WIN)
-                losses = sum(1 for t in sess_trades if t.result == BOResult.LOSS)
+                wins = sum(1 for t in batch if t.result == BOResult.WIN)
+                losses = sum(1 for t in batch if t.result == BOResult.LOSS)
 
                 if delta > 0:
                     session_result = "WIN"
@@ -145,24 +115,18 @@ def backfill(force: bool = False, bot_filter: str | None = None, dry_run: bool =
                 else:
                     session_result = "BREAKEVEN"
 
-                settled_at = session_settled_at.get((sym, tf, co))
-
                 record = BotSettlementLedger(
                     bot_name=bot.bot_name,
-                    session_id=f"{sym}:{tf}:{co}",
-                    symbol=sym,
-                    timeframe=tf,
-                    candle_open=co,
                     prev_balance=ledger_prev,
                     total_profit=total_profit,
                     total_fee=total_fee,
                     delta=delta,
                     new_balance=new_bal,
                     session_result=session_result,
-                    trade_count=len(sess_trades),
+                    trade_count=len(batch),
                     win_count=wins,
                     loss_count=losses,
-                    trade_ids=[t.id for t in sess_trades],
+                    trade_ids=[t.id for t in batch],
                     settled_at=settled_at,
                 )
                 records.append(record)
@@ -179,7 +143,7 @@ def backfill(force: bool = False, bot_filter: str | None = None, dry_run: bool =
 
             print(
                 f"  {'(dry) ' if dry_run else ''}Done  {bot.bot_name!r:20s} — "
-                f"{len(records)} session(s), "
+                f"{len(records)} batch(es), "
                 f"{len(trades)} trade(s), "
                 f"init=${initial:,.2f} → final=${final_bal:,.2f} ({sign}{total_delta:,.2f})"
             )

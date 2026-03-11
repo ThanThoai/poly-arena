@@ -96,7 +96,7 @@ class BalanceHistory(Base):
 
 
 class BotSettlementLedger(Base):
-    """Incremental balance ledger — one record per bot per session at settlement.
+    """Incremental balance ledger — one aggregated record per bot per settlement batch.
 
     Each record = prev_balance + total_profit - total_fee = new_balance.
     session_result: WIN (delta > 0), LOSS (delta < 0), BREAKEVEN (delta == 0).
@@ -105,12 +105,6 @@ class BotSettlementLedger(Base):
 
     id             = Column(Integer, primary_key=True, index=True)
     bot_name       = Column(String(100), nullable=False, index=True)
-
-    # Session context
-    session_id     = Column(String(64), nullable=True, index=True)   # e.g. "BTC:M5:1709313000"
-    symbol         = Column(String(10), nullable=True)
-    timeframe      = Column(String(5), nullable=True)
-    candle_open    = Column(Integer, nullable=True)
 
     # Incremental balance tracking
     prev_balance   = Column(Numeric(18, 8, asdecimal=False), nullable=False)

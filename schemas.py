@@ -251,9 +251,6 @@ class BotBalanceEntry(BaseModel):
     total_profit:   float
     total_fee:      float
     session_result: Optional[str] = None   # WIN / LOSS / BREAKEVEN
-    session_id:     Optional[str] = None
-    symbol:         Optional[str] = None
-    timeframe:      Optional[str] = None
     trade_count:    Optional[int] = None
     win_count:      Optional[int] = None
     loss_count:     Optional[int] = None
@@ -319,10 +316,6 @@ class UserBalanceSnapshotResponse(BaseModel):
 class BotSettlementLedgerResponse(BaseModel):
     id:             int
     bot_name:       str
-    session_id:     Optional[str] = None
-    symbol:         Optional[str] = None
-    timeframe:      Optional[str] = None
-    candle_open:    Optional[int] = None
     prev_balance:   float
     total_profit:   float
     total_fee:      float

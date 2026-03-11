@@ -1,5 +1,5 @@
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,6 +17,7 @@ from schemas import (
     BotPnlResponse, BotPublic, BotRename, BotResponse, BotSettlementLedgerResponse,
     UserBalanceHistoryResponse, UserBalanceSnapshotResponse, UserPnlResponse,
 )
+from datetime import date as date_type
 
 router = APIRouter()
 
@@ -205,18 +206,10 @@ def get_balance_history(
         q = q.filter(BotSettlementLedger.bot_name == bot_name)
     rows = q.all()
 
-    # For each (settled_at, bot_name), keep only the row with the latest session_id
-    best: dict[tuple, BotSettlementLedger] = {}
-    for r in rows:
-        key = (r.settled_at, r.bot_name)
-        prev = best.get(key)
-        if prev is None or (r.session_id or "") > (prev.session_id or ""):
-            best[key] = r
-
-    # Group by settled_at
+    # Group by settled_at (one row per bot per timestamp now)
     groups: dict[datetime, list] = defaultdict(list)
-    for (ts, _), r in sorted(best.items()):
-        groups[ts].append(
+    for r in rows:
+        groups[r.settled_at].append(
             BotBalanceEntry(
                 bot_name=r.bot_name,
                 prev_balance=r.prev_balance,
@@ -225,9 +218,6 @@ def get_balance_history(
                 total_profit=r.total_profit,
                 total_fee=r.total_fee,
                 session_result=r.session_result,
-                session_id=r.session_id,
-                symbol=r.symbol,
-                timeframe=r.timeframe,
                 trade_count=r.trade_count,
                 win_count=r.win_count,
                 loss_count=r.loss_count,
@@ -310,17 +300,49 @@ def get_user_balance_snapshots(
 @router.get("/settlement-ledger", response_model=List[BotSettlementLedgerResponse])
 def get_settlement_ledger(
     bot_name: Optional[str] = Query(None),
-    symbol: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=50000),
     db: Session = Depends(get_db),
 ):
-    """Get bot settlement ledger — incremental balance changes per session."""
+    """Get bot settlement ledger — incremental balance changes per settlement batch."""
     q = db.query(BotSettlementLedger)
     if bot_name:
         q = q.filter(BotSettlementLedger.bot_name == bot_name)
-    if symbol:
-        q = q.filter(BotSettlementLedger.symbol == symbol)
     return q.order_by(BotSettlementLedger.settled_at.asc()).limit(limit).all()
+
+
+# ── Order History by Bot + Date ───────────────────────────────────────────────
+
+@router.get("/order-history", response_model=List[BOResponse])
+def bot_order_history(
+    bot_name: str = Query(..., description="Bot name (exact match)"),
+    date_from: Optional[date_type] = Query(None, description="Start date (YYYY-MM-DD), inclusive"),
+    date_to: Optional[date_type] = Query(None, description="End date (YYYY-MM-DD), inclusive"),
+    result: Optional[str] = Query(None, description="Filter by result: WIN, LOSS, CANCELLED, PENDING"),
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Get order history for a specific bot, optionally filtered by date range."""
+    q = db.query(BinaryOption).filter(BinaryOption.bot_name == bot_name)
+
+    if date_from:
+        q = q.filter(BinaryOption.created_at >= datetime.combine(date_from, time.min, tzinfo=timezone.utc))
+    if date_to:
+        next_day = date_to + timedelta(days=1)
+        q = q.filter(BinaryOption.created_at < datetime.combine(next_day, time.min, tzinfo=timezone.utc))
+    if result:
+        q = q.filter(BinaryOption.result == result)
+
+    total = q.count()
+    orders = q.order_by(BinaryOption.created_at.desc()).offset(offset).limit(limit).all()
+
+    from fastapi.responses import JSONResponse
+    from fastapi.encoders import jsonable_encoder
+    response_data = jsonable_encoder([BOResponse.model_validate(o) for o in orders])
+    return JSONResponse(
+        content=response_data,
+        headers={"X-Total-Count": str(total)},
+    )
 
 
 # ── Pause / Resume ───────────────────────────────────────────────────────────
