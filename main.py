@@ -869,6 +869,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],
 )
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
 
