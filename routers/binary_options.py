@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -1420,7 +1421,10 @@ def list_bo(
         q = q.filter(BinaryOption.forecast == forecast)
     if result:
         q = q.filter(BinaryOption.result == result)
-    return q.order_by(BinaryOption.created_at.desc()).offset(offset).limit(limit).all()
+    total = q.count()
+    rows = q.order_by(BinaryOption.created_at.desc()).offset(offset).limit(limit).all()
+    data = [BOResponse.model_validate(r).model_dump(mode="json") for r in rows]
+    return JSONResponse(content=data, headers={"X-Total-Count": str(total)})
 
 
 # ─── Token mapping for direct Polymarket WS ──────────────────────────────────
