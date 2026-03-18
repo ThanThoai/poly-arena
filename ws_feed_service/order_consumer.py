@@ -377,8 +377,17 @@ class OrderConsumer:
         slippage_tolerance = data.get("slippage_tolerance")
         session_offset = data.get("session_offset", 0)
         settlement_at_str = data.get("settlement_at")
+        order_received_at_str = data.get("order_received_at")
 
         is_market = limit_price is None
+
+        # Parse order_received_at for accurate TTL base time
+        order_queued_at: Optional[datetime] = None
+        if order_received_at_str:
+            try:
+                order_queued_at = datetime.fromisoformat(order_received_at_str)
+            except (ValueError, TypeError):
+                pass
 
         # TTL: pass as ttl_seconds so matching engine uses raw offset.
         # For future sessions (offset >= 1), ensure the order lives at least
@@ -449,6 +458,7 @@ class OrderConsumer:
                 order_type="MARKET" if is_market else "LIMIT",
                 max_slippage=Decimal(str(slippage_tolerance)) if slippage_tolerance is not None else None,
                 max_cost=cost_cap,
+                order_queued_at=order_queued_at,
             )
 
             logger.info(

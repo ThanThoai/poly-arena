@@ -15,7 +15,7 @@ class BOCreate(BaseModel):
     limit_price: Optional[float] = None   # None = MARKET order; set = LIMIT order
     tp_price:    Optional[float] = None   # Take-profit price for bracket monitoring
     sl_price:    Optional[float] = None   # Stop-loss price for bracket monitoring
-    ttl:                Optional[int]   = None   # TTL in seconds; auto-cancel if unfilled within TTL
+    ttl:                Optional[int]   = Field(default=None, ge=5, le=3600)  # TTL in seconds (5s–3600s); auto-cancel if unfilled within TTL
     slippage_tolerance: Optional[float] = None   # 0.0-1.0; None = 10% default for MARKET orders
     session_offset:     Optional[int]   = Field(default=0, ge=0, le=3)  # 0 = current, 1-3 = future sessions
     timestamp:          Optional[int]   = None   # Unix timestamp (seconds) to target a specific candle session
@@ -39,8 +39,8 @@ class BOCreate(BaseModel):
     @field_validator("ttl")
     @classmethod
     def ttl_positive(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None and v <= 0:
-            raise ValueError("ttl must be positive (seconds)")
+        if v is not None and (v < 5 or v > 3600):
+            raise ValueError("ttl must be between 5 and 3600 seconds")
         return v
 
     @field_validator("slippage_tolerance")

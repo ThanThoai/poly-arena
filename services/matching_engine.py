@@ -132,6 +132,7 @@ class SimulatedOrder:
     status:    OrderStatus      = OrderStatus.PENDING
     created_at: datetime        = field(default_factory=lambda: datetime.now(timezone.utc))
     expire_at:  Optional[datetime] = None   # None = never expires
+    cancel_reason: Optional[str]   = None   # Set when status → CANCELED (e.g. "TTL_EXPIRED", "IOC_UNFILLED")
 
     # ── Entry tracking (weighted avg across multiple fill levels) ────────────
     _entry_cost: Decimal        = field(default_factory=lambda: Decimal("0"))
@@ -522,6 +523,7 @@ class ShadowOrderbook:
         order_type:        str                = "LIMIT",
         max_slippage:      Optional[Decimal]  = None,
         max_cost:          Optional[Decimal]  = None,
+        order_queued_at:   Optional[datetime] = None,
     ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
         """
         Create a virtual order, immediately try to match it,
@@ -539,7 +541,7 @@ class ShadowOrderbook:
             sees the fill before the bracket exit.
 
         Expiry (one of, in priority order):
-          - ``ttl_seconds`` — raw offset from now (user-specified TTL).
+          - ``ttl_seconds`` — raw offset from ``order_queued_at`` (or now).
           - ``timeframe``   — align to next candle close on the grid.
                               e.g. timeframe='M5', now=12:12 → expire_at=12:15
           - both None       — Good-Till-Canceled, never expires automatically.
@@ -555,9 +557,14 @@ class ShadowOrderbook:
             max_slippage:     Maximum slippage for MARKET orders as a fraction
                               (e.g. 0.05 = 5%). None = _DEFAULT_SLIPPAGE (10%).
                               Ignored for LIMIT orders.
+            order_queued_at:  Timestamp when the order was originally created by
+                              the API. Used as the base for TTL calculation so
+                              queue processing delay doesn't extend the TTL.
+                              If None, falls back to now.
         """
         if ttl_seconds is not None:
-            expire_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+            base_time = order_queued_at or datetime.now(timezone.utc)
+            expire_at = base_time + timedelta(seconds=ttl_seconds)
         elif timeframe is not None:
             expire_at = candle_expire_at(timeframe)
         else:
@@ -758,7 +765,7 @@ class ShadowOrderbook:
                     filled=order.filled,
                     avg_entry_price=order.avg_entry_price,
                     status=order.status,
-                    cancel_reason="TTL_EXPIRED",
+                    cancel_reason=order.cancel_reason or "UNKNOWN",
                 ))
 
             # Update tracking
@@ -823,6 +830,7 @@ class ShadowOrderbook:
                 if order.order_type == "MARKET" and order.status != OrderStatus.FILLED:
                     if had_liquidity or order.filled > 0:
                         order.status = OrderStatus.CANCELED
+                        order.cancel_reason = "IOC_UNFILLED"
                         logger.info(
                             "MARKET IOC cancel (rematch): id=%s filled=%s/%s avg=%s",
                             order.order_id[:12], order.filled, order.quantity,
@@ -887,9 +895,9 @@ class ShadowOrderbook:
         Behaviour by status:
           - PENDING (filled=0): status → CANCELED. No fill, no P&L.
           - PARTIAL (filled>0): quantity is clamped to filled so remaining
-            unfilled qty can no longer be matched. Status stays PARTIAL
-            (the filled portion proceeds to settlement). Any future
-            run_matching() calls will skip it because remaining_qty == 0.
+            unfilled qty can no longer be matched. Status → CANCELED.
+            The filled portion proceeds to settlement via the DB cancel
+            handler which keeps bo.result=PENDING.
 
         Returns all orders that were acted on (both PENDING→CANCELED and
         PARTIAL that had their quantity clamped).
@@ -909,6 +917,7 @@ class ShadowOrderbook:
             if order.status == OrderStatus.PENDING:
                 # Zero fill — nothing to settle, just cancel
                 order.status = OrderStatus.CANCELED
+                order.cancel_reason = "TTL_EXPIRED"
                 expired.append(order)
                 logger.info(
                     "Order expired (PENDING→CANCELED): id=%s price=%s qty=%s",
@@ -922,6 +931,7 @@ class ShadowOrderbook:
                 unfilled = order.remaining_qty
                 order.quantity = order.filled  # remaining_qty now == 0
                 order.status = OrderStatus.CANCELED
+                order.cancel_reason = "TTL_EXPIRED"
                 expired.append(order)
                 logger.info(
                     "Order expired (PARTIAL→CANCELED): id=%s filled=%s unfilled=%s",

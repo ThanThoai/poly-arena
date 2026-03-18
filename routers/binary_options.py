@@ -1054,6 +1054,7 @@ def create_bo(
                     "slippage_tolerance": payload.slippage_tolerance,
                     "session_offset": session_offset,
                     "settlement_at": settlement_at.isoformat() if settlement_at else None,
+                    "order_received_at": order_received_at.isoformat(),
                 }
                 # Pass REST prefill data so OrderConsumer can merge fills
                 # into the BO's existing avg_price/num_shares.
@@ -1178,6 +1179,7 @@ def create_bo(
                 "slippage_tolerance": payload.slippage_tolerance,
                 "session_offset": session_offset,
                 "settlement_at": settlement_at.isoformat() if settlement_at else None,
+                "order_received_at": order_received_at.isoformat(),
             })
         except Exception as exc:
             logger.error(

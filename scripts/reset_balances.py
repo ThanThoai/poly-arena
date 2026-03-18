@@ -3,11 +3,16 @@
 Reset bot & user balances và xoá lịch sử lệnh.
 
 Thực hiện:
-  1. Xoá toàn bộ binary_options (lịch sử lệnh)
-  2. Xoá toàn bộ balance_history (snapshot balance bot)
-  3. Xoá toàn bộ user_balance_history (snapshot balance user)
-  4. Reset mỗi bot: balance = initial_balance = 10000, status = ACTIVE
-  5. Reset mỗi user: initial_balance = 50000 - tổng initial_balance các bot sở hữu
+  1. Xoá toàn bộ binary_options (lịch sử lệnh BO)
+  2. Xoá toàn bộ futures_orders (lệnh futures)
+  3. Xoá toàn bộ futures_positions (vị thế futures)
+  4. Xoá toàn bộ balance_history (snapshot balance bot)
+  5. Xoá toàn bộ user_balance_history (snapshot balance user)
+  6. Xoá toàn bộ user_balance_snapshots
+  7. Xoá toàn bộ bot_settlement_ledger
+  8. Xoá toàn bộ bot_achievements
+  9. Reset mỗi bot: balance = initial_balance = 10000, status = ACTIVE
+ 10. Reset mỗi user: initial_balance = 50000 - tổng initial_balance các bot sở hữu
 
 Usage:
     python scripts/reset_balances.py          # dry-run (chỉ hiển thị)
@@ -29,78 +34,101 @@ BOT_BALANCE = 10000.0
 USER_TOTAL = 50000.0
 
 
+def _safe_count(db, table: str) -> int:
+    """Return row count, 0 if table does not exist."""
+    try:
+        return db.execute(text(f"SELECT count(*) FROM {table}")).scalar()
+    except Exception:
+        db.rollback()
+        return 0
+
+
+def _safe_delete(db, table: str) -> int:
+    """Delete all rows, return rowcount. Skip if table missing."""
+    try:
+        r = db.execute(text(f"DELETE FROM {table}"))
+        return r.rowcount
+    except Exception:
+        db.rollback()
+        return 0
+
+
 def reset(apply: bool = False) -> None:
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
     try:
         # ── Counts ──
-        trade_count = db.execute(text("SELECT count(*) FROM binary_options")).scalar()
-        bh_count = db.execute(text("SELECT count(*) FROM balance_history")).scalar()
-        ubh_count = db.execute(text("SELECT count(*) FROM user_balance_history")).scalar()
-        ubs_count = db.execute(text("SELECT count(*) FROM user_balance_snapshots")).scalar()
-        bsl_count = db.execute(text("SELECT count(*) FROM bot_settlement_ledger")).scalar()
+        tables = [
+            ("binary_options",        "BO trades"),
+            ("futures_orders",        "Futures orders"),
+            ("futures_positions",     "Futures positions"),
+            ("balance_history",       "Balance history"),
+            ("user_balance_history",  "User balance history"),
+            ("user_balance_snapshots","User balance snapshots"),
+            ("bot_settlement_ledger", "Bot settlement ledger"),
+            ("bot_achievements",      "Bot achievements"),
+        ]
+
+        counts = {}
+        for tbl, _ in tables:
+            counts[tbl] = _safe_count(db, tbl)
 
         bots = db.query(Bot).filter(Bot.is_active == True).all()
         users = db.query(User).all()
 
         prefix = "[DRY-RUN] " if not apply else ""
         print(f"{prefix}Reset summary:")
-        print(f"  Trades to delete:              {trade_count}")
-        print(f"  BalanceHistory to delete:       {bh_count}")
-        print(f"  UserBalanceHistory to delete:   {ubh_count}")
-        print(f"  UserBalanceSnapshots to delete: {ubs_count}")
-        print(f"  BotSettlementLedger to delete: {bsl_count}")
-        print(f"  Active bots to reset:           {len(bots)}")
-        print(f"  Users to reset:                 {len(users)}")
+        for tbl, label in tables:
+            c = counts[tbl]
+            flag = "" if c == 0 else " ⚠"
+            print(f"  {label + ' to delete:':<35} {c}{flag}")
+        print(f"  {'Active bots to reset:':<35} {len(bots)}")
+        print(f"  {'Users to reset:':<35} {len(users)}")
         print()
 
-        # ── Bot details ──
+        # ── Bot details (with ID) ──
+        print("  ── Bots ──")
         for bot in bots:
-            print(f"  Bot '{bot.bot_name}': balance {bot.balance:.2f} → {BOT_BALANCE:.2f}")
+            owner = next((u.username for u in users if u.id == bot.user_id), "?")
+            print(
+                f"  [{bot.id}] {bot.bot_name:<20} "
+                f"owner={owner:<12} "
+                f"balance {bot.balance:.2f} → {BOT_BALANCE:.2f}"
+            )
 
         # ── User details ──
+        print()
+        print("  ── Users ──")
         for user in users:
             user_bots = [b for b in bots if b.user_id == user.id]
+            bot_ids = ", ".join(str(b.id) for b in user_bots) or "none"
             total_allocated = len(user_bots) * BOT_BALANCE
             available = USER_TOTAL - total_allocated
             print(
-                f"  User '{user.username}': initial_balance {user.initial_balance:.2f} → {USER_TOTAL:.2f} "
-                f"(available: {available:.0f} = {USER_TOTAL:.0f} - {len(user_bots)} bots × {BOT_BALANCE:.0f})"
+                f"  [{user.id}] {user.username:<15} "
+                f"initial_balance {user.initial_balance:.2f} → {USER_TOTAL:.2f} "
+                f"(bots: {bot_ids})"
             )
 
         if not apply:
             print("\nPass --apply to execute.")
             return
 
-        # ── 1. Xoá lịch sử lệnh ──
-        r_bo = db.execute(text("DELETE FROM binary_options"))
-        print(f"\n  Deleted {r_bo.rowcount} trades")
+        # ── Delete in dependency order ──
+        print()
+        for tbl, label in tables:
+            n = _safe_delete(db, tbl)
+            print(f"  Deleted {n} {label.lower()}")
 
-        # ── 2. Xoá balance history ──
-        r_bh = db.execute(text("DELETE FROM balance_history"))
-        print(f"  Deleted {r_bh.rowcount} balance history records")
-
-        # ── 3. Xoá user balance history ──
-        r_ubh = db.execute(text("DELETE FROM user_balance_history"))
-        print(f"  Deleted {r_ubh.rowcount} user balance history records")
-
-        # ── 3b. Xoá user balance snapshots ──
-        r_ubs = db.execute(text("DELETE FROM user_balance_snapshots"))
-        print(f"  Deleted {r_ubs.rowcount} user balance snapshot records")
-
-        # ── 3c. Xoá bot settlement ledger ──
-        r_bsl = db.execute(text("DELETE FROM bot_settlement_ledger"))
-        print(f"  Deleted {r_bsl.rowcount} bot settlement ledger records")
-
-        # ── 4. Reset bots ──
+        # ── Reset bots ──
         for bot in bots:
             bot.balance = BOT_BALANCE
             bot.initial_balance = BOT_BALANCE
             bot.status = "ACTIVE"
         print(f"  Reset {len(bots)} bots → balance={BOT_BALANCE:.0f}")
 
-        # ── 5. Reset users & tạo bản ghi snapshot ban đầu ──
+        # ── Reset users & tạo snapshot ban đầu ──
         for user in users:
             user.initial_balance = USER_TOTAL
             user_bots = [b for b in bots if b.user_id == user.id]

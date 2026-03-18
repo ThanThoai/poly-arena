@@ -35,6 +35,7 @@ from models import (
 from models_futures import FuturesPosition, FuturesOrder
 
 BOT_BALANCE = 10_000.0
+USER_TOTAL = 50_000.0
 
 
 def reset(
@@ -111,7 +112,8 @@ def reset(
         print()
 
         for bot in bots:
-            print(f"  {bot.bot_name}: ${bot.balance:,.2f} -> ${BOT_BALANCE:,.2f}")
+            owner = db.query(User.username).filter(User.id == bot.user_id).scalar() or "?"
+            print(f"  [{bot.id}] {bot.bot_name:<20} owner={owner:<12} ${bot.balance:,.2f} -> ${BOT_BALANCE:,.2f}")
 
         if not apply:
             print("\nPass --apply to execute.")
@@ -184,8 +186,9 @@ def reset(
                 .filter(Bot.user_id == uid, Bot.is_active == True)
                 .all()
             )
-            total_allocated = sum(b.initial_balance or 0 for b in all_user_bots)
-            user.initial_balance = total_allocated
+            total_allocated = len(all_user_bots) * BOT_BALANCE
+            available = USER_TOTAL - total_allocated
+            user.initial_balance = USER_TOTAL
 
             # Clean user-level history
             db.query(UserBalanceHistory).filter(UserBalanceHistory.user_id == uid).delete(synchronize_session="fetch")
@@ -196,15 +199,15 @@ def reset(
                 user_id=uid,
                 session_id=None,
                 candle_open=None,
-                unallocated=0.0,
+                unallocated=available,
                 bot_cash=total_allocated,
                 bo_locked=0,
                 futures_locked=0,
-                equity=total_allocated,
+                equity=USER_TOTAL,
                 bo_unrealized_pnl=0,
                 futures_unrealized_pnl=0,
                 unrealized_pnl=0,
-                net_liquidation=total_allocated,
+                net_liquidation=USER_TOTAL,
                 cumulative_realized_pnl=0,
                 session_realized_pnl=0,
                 snapshot_delta=None,
@@ -213,7 +216,11 @@ def reset(
                 open_futures_count=0,
                 recorded_at=datetime.now(timezone.utc),
             ))
-            print(f"  User '{user.username}': initial={total_allocated:,.0f} ({len(all_user_bots)} bots x balance)")
+            print(
+                f"  User '{user.username}': initial={USER_TOTAL:,.0f} "
+                f"(bot_cash={total_allocated:,.0f}, unallocated={available:,.0f}, "
+                f"{len(all_user_bots)} bots)"
+            )
 
         db.commit()
         print("\nDone.")

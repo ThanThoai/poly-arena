@@ -183,6 +183,16 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                 if order_id and not bo.me_order_id:
                     bo.me_order_id = order_id
 
+                # Guard: skip if cancel already processed (duplicate/replay)
+                if bo.me_order_status == "CANCELED":
+                    log.info(
+                        "Order cancel: BO #%d already CANCELED, skipping duplicate",
+                        bo_id,
+                    )
+                    db.close()
+                    await r.xack(stream, group, msg_id)
+                    return
+
                 if filled > 0 and avg_entry > 0:
                     # Preserve original budget before adjustment
                     if bo.original_amount is None:
@@ -229,6 +239,9 @@ async def _handle_order_cancel(r, stream, group, msg_id, data) -> None:
                                     trade_id=bo.id,
                                 )
                             )
+
+                    # Record user balance snapshot for the partial refund
+                    record_user_balance(db, bo.bot_name, trade_id=bo.id, pnl_amount=0.0)
 
                     db.commit()
                     _publish_trace_sync(bo)
@@ -310,7 +323,9 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
             if bo is not None and bo.result == BOResult.PENDING:
                 bo.avg_price = avg_entry
                 bo.num_shares = filled
-                if status in ("PARTIAL", "FILLED"):
+                # Guard: do not overwrite CANCELED status if cancel handler
+                # already processed (race between fill/cancel streams).
+                if status in ("PARTIAL", "FILLED") and bo.me_order_status != "CANCELED":
                     bo.me_order_status = status
                 if order_id and not bo.me_order_id:
                     bo.me_order_id = order_id
@@ -331,9 +346,12 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                 # All ME fills for LIMIT orders are maker fills (order rests on
                 # book until matched), including aggressive LIMIT remainders
                 # that already have entry_fee > 0 from the REST taker portion.
+                # Skip rebate if cancel handler already processed this order
+                # (race: CANCEL processed before FILL replay → avoid double rebate).
                 fee_applied = 0.0
                 is_maker_fill = bo.limit_price is not None
-                if wp_str and is_maker_fill:
+                already_canceled = bo.me_order_status == "CANCELED"
+                if wp_str and is_maker_fill and not already_canceled:
                     try:
                         fill_levels = json.loads(wp_str)
                         rebate = maker_rebate_from_levels(fill_levels)

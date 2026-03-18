@@ -256,6 +256,7 @@ class SessionEngine:
         order_type: str = "LIMIT",
         max_slippage: Optional[Decimal] = None,
         max_cost: Optional[Decimal] = None,
+        order_queued_at: Optional[datetime] = None,
     ) -> tuple[SimulatedOrder, list[BracketFillResult]]:
         """Place a virtual order — delegates to the correct ShadowOrderbook."""
         if self.state in (SessionState.SETTLING, SessionState.ARCHIVED):
@@ -269,7 +270,7 @@ class SessionEngine:
             raise ValueError(f"Book expired for token {token_id[:16]} in session {self.session_id}")
         return book.place_virtual_order(
             side, price, quantity, tp_price, sl_price, timeframe, ttl_seconds,
-            on_bracket_exit, order_type, max_slippage, max_cost,
+            on_bracket_exit, order_type, max_slippage, max_cost, order_queued_at,
         )
 
     def place_prefilled_bracket_order(
