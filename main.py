@@ -807,28 +807,6 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.warning("Failed to seed achievements: %s", exc)
 
-    # Seed default admin user if none exists
-    try:
-        from auth import hash_password as _hash_pw
-        from models import User as _User
-        _db = SessionLocal()
-        try:
-            if not _db.query(_User).filter(_User.is_admin == True).first():
-                _admin_pw = os.getenv("ADMIN_PASSWORD", "admin123")
-                _admin = _User(
-                    username="admin",
-                    email="admin@polyarena.local",
-                    hashed_password=_hash_pw(_admin_pw),
-                    is_admin=True,
-                )
-                _db.add(_admin)
-                _db.commit()
-                log.info("Seeded default admin user (username=admin)")
-        finally:
-            _db.close()
-    except Exception as exc:
-        log.warning("Failed to seed admin user: %s", exc)
-
     yield
 
     # ── Shutdown ────────────────────────────────────────────────────────────

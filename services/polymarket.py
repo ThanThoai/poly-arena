@@ -173,16 +173,17 @@ class PolymarketClient:
         max_bid = float(raw_bids[0]["price"]) if raw_bids else 0.0
         return min_ask, max_bid, bid_depth, ask_depth
 
-    def fetch_book_raw(self, token_id: str) -> tuple[list[dict], list[dict]]:
-        """Return (bids, asks) as raw dicts compatible with ShadowOrderbook.apply_snapshot().
+    def fetch_book_raw(self, token_id: str) -> tuple[list[dict], list[dict], str]:
+        """Return (bids, asks, timestamp) as raw dicts compatible with ShadowOrderbook.apply_snapshot().
 
         Each entry is {"price": "0.55", "size": "100"} — the format returned
-        by the Polymarket CLOB /book endpoint.
+        by the Polymarket CLOB /book endpoint.  ``timestamp`` is the snapshot
+        timestamp string from the API response.
         """
         resp = self._http.get(_CLOB_URL, params={"token_id": token_id})
         resp.raise_for_status()
         book = resp.json()
-        return book.get("bids", []), book.get("asks", [])
+        return book.get("bids", []), book.get("asks", []), book.get("timestamp", "")
 
     # ── public API ────────────────────────────────────────────────────────────
 

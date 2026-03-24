@@ -570,6 +570,36 @@ class ShadowOrderbook:
         else:
             expire_at = None
 
+        # ── Early reject: if TTL already elapsed before we even start ───
+        if expire_at is not None and datetime.now(timezone.utc) >= expire_at:
+            order = SimulatedOrder(
+                order_id=str(uuid.uuid4()),
+                side=side,
+                price=price,
+                quantity=quantity,
+                order_type=order_type,
+                max_slippage=max_slippage,
+                max_cost=max_cost,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                expire_at=expire_at,
+                _on_bracket_exit=on_bracket_exit,
+            )
+            order.status = OrderStatus.CANCELED
+            order.cancel_reason = "TTL_EXPIRED"
+            with self._lock:
+                self._virtual_orders.append(order)
+                state_events = self.collect_state_changes()
+            self._fire_state_change_callbacks(state_events)
+            logger.info(
+                "Order rejected (TTL already expired): id=%s ttl=%ss "
+                "queued_at=%s expire_at=%s",
+                order.order_id[:12], ttl_seconds,
+                order_queued_at.isoformat() if order_queued_at else "None",
+                expire_at.isoformat(),
+            )
+            return order, []
+
         order = SimulatedOrder(
             order_id=str(uuid.uuid4()),
             side=side,
@@ -959,6 +989,23 @@ class ShadowOrderbook:
         MARKET orders: sweep all available levels (no price check).
         LIMIT orders: match only at limit price or better.
         """
+        # ── TTL guard: skip matching if order has already expired ───────
+        if order.is_expired:
+            if order.status in (OrderStatus.PENDING, OrderStatus.PARTIAL):
+                prev_status = order.status.value
+                unfilled = order.remaining_qty
+                if order.status == OrderStatus.PARTIAL:
+                    order.quantity = order.filled  # clamp to filled amount
+                order.status = OrderStatus.CANCELED
+                order.cancel_reason = "TTL_EXPIRED"
+                logger.info(
+                    "MATCH_SKIP TTL expired: id=%s prev_status=%s filled=%s "
+                    "unfilled=%s expire_at=%s",
+                    order.order_id[:12], prev_status, order.filled,
+                    unfilled, order.expire_at.isoformat() if order.expire_at else None,
+                )
+            return
+
         self._depth_cache.clear()
         is_market = order.order_type == "MARKET"
         filled_before = order.filled

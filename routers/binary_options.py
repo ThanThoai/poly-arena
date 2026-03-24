@@ -323,7 +323,7 @@ def _fetch_orderbook_rest(
     if token_id:
         try:
             pm = _get_pm_client()
-            bids_raw, asks_raw = pm.fetch_book_raw(token_id)
+            bids_raw, asks_raw, _ts = pm.fetch_book_raw(token_id)
             if asks_raw:
                 sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
                 return [[float(a["price"]), float(a["size"])] for a in sorted_asks]
@@ -339,13 +339,17 @@ def _fetch_orderbook_rest(
 def _fetch_asks_from_polymarket(
     symbol: str, timeframe: str, direction: str,
     candle_open: int = 0,
-) -> list[list]:
+) -> tuple[list[list], str]:
     """Fetch asks directly from Polymarket REST API for order filling.
 
     Primary: Polymarket CLOB /book REST API (fresh orderbook, most accurate).
     Fallback: Redis orderbook snapshot (if REST fails or token not resolved).
 
-    Returns sorted asks list (ascending by price) as [[price, size], ...].
+    Returns (asks, snapshot_timestamp):
+        asks: sorted asks list (ascending by price) as [[price, size], ...]
+        snapshot_timestamp: the ``timestamp`` field from the Polymarket API
+            response (Unix epoch string).  Empty string when the fallback
+            Redis source is used.
     Raises HTTPException(503) if both sources are unavailable.
     """
     # 1. Primary: Polymarket REST API (fresh data for accurate fills)
@@ -353,10 +357,10 @@ def _fetch_asks_from_polymarket(
     if token_id:
         try:
             pm = _get_pm_client()
-            bids_raw, asks_raw = pm.fetch_book_raw(token_id)
+            bids_raw, asks_raw, snapshot_ts = pm.fetch_book_raw(token_id)
             if asks_raw:
                 sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
-                return [[float(a["price"]), float(a["size"])] for a in sorted_asks]
+                return [[float(a["price"]), float(a["size"])] for a in sorted_asks], snapshot_ts
         except Exception as exc:
             logger.warning(
                 "Polymarket REST fetch failed for %s: %s — falling back to Redis",
@@ -370,7 +374,7 @@ def _fetch_asks_from_polymarket(
             "Using Redis fallback for orderbook %s:%s:%s:%d",
             symbol, timeframe, direction, candle_open,
         )
-        return redis_asks
+        return redis_asks, ""
 
     raise HTTPException(
         status_code=503,
@@ -419,7 +423,7 @@ def _fetch_snapshot_prices(
     if token_id:
         try:
             pm = _get_pm_client()
-            bids_raw, asks_raw = pm.fetch_book_raw(token_id)
+            bids_raw, asks_raw, _ts = pm.fetch_book_raw(token_id)
             if asks_raw:
                 sorted_asks = sorted(asks_raw, key=lambda x: float(x["price"]))
                 result["best_ask"] = float(sorted_asks[0]["price"])
@@ -463,7 +467,7 @@ def _fill_market_from_snapshot(
     candle_open: int = 0,
     order_type: str = "FAK",
     ceiling_price: Optional[float] = None,
-) -> Tuple[float, float, list]:
+) -> Tuple[float, float, list, str, datetime]:
     """
     Simulate a BUY by walking asks fetched from Polymarket REST API.
 
@@ -484,8 +488,11 @@ def _fill_market_from_snapshot(
 
     Returns
     -------
-    (avg_price, num_shares, walk_levels)
+    (avg_price, num_shares, walk_levels, snapshot_timestamp, rest_request_at)
         walk_levels: list of {"price": float, "qty": float, "cost": float}
+        snapshot_timestamp: the ``timestamp`` field from the Polymarket API
+            response (Unix epoch string).
+        rest_request_at: datetime when the REST API request was initiated.
 
     Raises
     ------
@@ -494,7 +501,8 @@ def _fill_market_from_snapshot(
     HTTPException(400)
         If FOK order cannot be fully filled, or slippage exceeded.
     """
-    asks = _fetch_asks_from_polymarket(symbol, timeframe, direction, candle_open)
+    rest_request_at = datetime.now(timezone.utc)
+    asks, snapshot_timestamp = _fetch_asks_from_polymarket(symbol, timeframe, direction, candle_open)
 
     # Price cap: LIMIT orders use limit_price; MARKET orders use slippage from best_ask
     if limit_price is not None:
@@ -568,7 +576,7 @@ def _fill_market_from_snapshot(
 
     avg_price = float(total_cost / total_qty)
     num_shares = float(total_qty)
-    return round(avg_price, 8), round(num_shares, 8), walk_levels
+    return round(avg_price, 8), round(num_shares, 8), walk_levels, snapshot_timestamp, rest_request_at
 
 
 def _fill_limit_from_snapshot(
@@ -597,7 +605,7 @@ def _fill_limit_from_snapshot(
     HTTPException(503)
         If orderbook is unavailable.
     """
-    asks = _fetch_asks_from_polymarket(symbol, timeframe, direction, candle_open)
+    asks, _snapshot_ts = _fetch_asks_from_polymarket(symbol, timeframe, direction, candle_open)
 
     max_price = Decimal(str(limit_price))
     budget = Decimal(str(amount))
@@ -1192,7 +1200,7 @@ def create_bo(
         # ── MARKET path: fill immediately from session-keyed orderbook snapshot ──
         original_market_amount = payload.amount
         try:
-            avg_price, num_shares, walk_levels = _fill_market_from_snapshot(
+            avg_price, num_shares, walk_levels, snapshot_ts_str, rest_request_at = _fill_market_from_snapshot(
                 payload.symbol.value, payload.timeframe.value, direction,
                 payload.amount,
                 slippage_tolerance=payload.slippage_tolerance,
@@ -1230,6 +1238,67 @@ def create_bo(
                 latency_ms=latency_ms,
             )
             raise
+
+        # ── Snapshot freshness check (MARKET orders only) ────────────────
+        # Compare order_received_at with the Polymarket API snapshot timestamp.
+        # If the snapshot is older than 100ms relative to when the order was
+        # received, the prices are considered stale → reject.
+        order_detail = {
+            "order_received_at": order_received_at.isoformat(),
+            "rest_request_at": rest_request_at.isoformat(),
+            "snapshot_timestamp": snapshot_ts_str,
+        }
+        if snapshot_ts_str:
+            try:
+                snapshot_epoch = float(snapshot_ts_str)
+                # Polymarket may return milliseconds (13 digits) or seconds (10 digits)
+                if snapshot_epoch > 1e12:
+                    snapshot_epoch = snapshot_epoch / 1000
+                order_epoch = order_received_at.timestamp()
+                order_to_snapshot_ms = (order_epoch - snapshot_epoch) * 1000
+                order_detail["order_to_snapshot_ms"] = round(order_to_snapshot_ms, 3)
+
+                if order_to_snapshot_ms > 100:
+                    bot.balance = round(bot.balance + payload.amount, 8)
+                    reject_detail = (
+                        f"Stale orderbook snapshot: order_to_snapshot={order_to_snapshot_ms:.1f}ms "
+                        f"(threshold=100ms). "
+                        f"order_received_at={order_received_at.isoformat()}, "
+                        f"snapshot_timestamp={snapshot_ts_str}, "
+                        f"rest_request_at={rest_request_at.isoformat()}"
+                    )
+                    logger.warning(
+                        "BO MARKET REJECTED (stale snapshot) %s %s %s: "
+                        "order_to_snapshot=%.1fms threshold=100ms "
+                        "order_received=%s snapshot_ts=%s rest_request=%s",
+                        payload.symbol.value, payload.timeframe.value,
+                        payload.forecast.value,
+                        order_to_snapshot_ms,
+                        order_received_at.isoformat(),
+                        snapshot_ts_str,
+                        rest_request_at.isoformat(),
+                    )
+                    _log_market_order(
+                        "REJECTED",
+                        bot_name=bot.bot_name,
+                        symbol=payload.symbol.value,
+                        timeframe=payload.timeframe.value,
+                        forecast=payload.forecast.value,
+                        order_type=payload.order_type or "FAK",
+                        requested_amount=payload.amount,
+                        snapshot_prices=snapshot_prices,
+                        ceiling_price=payload.ceiling_price,
+                        slippage_tolerance=payload.slippage_tolerance,
+                        reject_reason=reject_detail,
+                        latency_ms=latency_ms,
+                    )
+                    raise HTTPException(status_code=400, detail=reject_detail)
+            except (ValueError, TypeError):
+                # Cannot parse snapshot timestamp — allow order to proceed
+                logger.warning(
+                    "Could not parse snapshot timestamp %r — skipping freshness check",
+                    snapshot_ts_str,
+                )
 
         # FAK partial fill: refund unspent budget to bot
         actual_cost = sum(lv["cost"] for lv in walk_levels)
@@ -1294,6 +1363,24 @@ def create_bo(
             latency_ms, payload.tp_price, payload.sl_price,
         )
 
+        # Append timing detail to reason for order history
+        order_ts = f"{order_received_at.timestamp():.3f}"
+        rest_ts = f"{rest_request_at.timestamp():.3f}"
+        snap_ts = snapshot_ts_str or "N/A"
+        snap_ms_raw = order_detail.get("order_to_snapshot_ms")
+        snap_ms = f"{abs(snap_ms_raw):.3f}" if snap_ms_raw is not None else "N/A"
+        timing_info = (
+            f"[Timing] order_ts={order_ts}, "
+            f"rest_ts={rest_ts}, "
+            f"snapshot_ts={snap_ts}, "
+            f"order_to_snapshot_ms={snap_ms}"
+        )
+        market_reason = payload.reason
+        if market_reason:
+            market_reason = f"{market_reason} | {timing_info}"
+        else:
+            market_reason = timing_info
+
         bo = BinaryOption(
             bot_name          = bot.bot_name,
             symbol            = payload.symbol,
@@ -1304,7 +1391,7 @@ def create_bo(
             result            = BOResult.PENDING,
             avg_price         = avg_price,
             num_shares        = num_shares,
-            reason            = payload.reason,
+            reason            = market_reason,
             order_received_at = order_received_at,
             ask_fetched_at    = ask_fetched_at,
             settlement_at     = settlement_at,

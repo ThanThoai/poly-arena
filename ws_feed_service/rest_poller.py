@@ -154,7 +154,7 @@ class RestPoller:
     async def _fetch_book(self, token_id: str) -> tuple[list[dict], list[dict]]:
         """Fetch orderbook from Polymarket REST API."""
         loop = asyncio.get_event_loop()
-        bids, asks = await loop.run_in_executor(
+        bids, asks, _ts = await loop.run_in_executor(
             None, self._pm.fetch_book_raw, token_id
         )
         return bids, asks
