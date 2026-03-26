@@ -132,37 +132,47 @@ class WsFeedPoller:
             )
 
     def _handle_price_change(self, event: dict) -> None:
-        """Handle an incremental price change — update Redis price only."""
-        asset_id = event.get("asset_id")
-        if not asset_id or self._writer is None:
+        """Handle incremental price changes — update Redis prices + apply to sessions."""
+        if self._writer is None:
             return
 
-        # price_change events carry top-of-book prices directly
-        changes = event.get("changes", [])
-        if not changes:
+        # Polymarket uses "price_changes" key: list of dicts
+        # Each: {asset_id, price, size, side, hash, best_bid, best_ask}
+        price_changes = event.get("price_changes", [])
+        if not price_changes:
             return
 
-        # changes is a list of [side, price, size] — derive best bid/ask
-        best_bid = None
-        best_ask = None
-        for change in changes:
-            if len(change) < 3:
+        # Group changes by asset_id and extract best bid/ask
+        for change in price_changes:
+            asset_id = change.get("asset_id")
+            if not asset_id:
                 continue
-            side, price_str, _ = change[0], change[1], change[2]
-            price = float(price_str)
-            if side == "buy":
-                if best_bid is None or price > best_bid:
-                    best_bid = price
-            elif side == "sell":
-                if best_ask is None or price < best_ask:
-                    best_ask = price
 
-        if best_ask is not None or best_bid is not None:
-            loop = asyncio.get_event_loop()
-            asyncio.ensure_future(
-                self._writer.update_price(asset_id, best_ask, best_bid),
-                loop=loop,
-            )
+            best_bid = float(change["best_bid"]) if "best_bid" in change else None
+            best_ask = float(change["best_ask"]) if "best_ask" in change else None
+
+            if best_ask is not None or best_bid is not None:
+                loop = asyncio.get_event_loop()
+                asyncio.ensure_future(
+                    self._writer.update_price(asset_id, best_ask, best_bid),
+                    loop=loop,
+                )
+
+            # Apply incremental update to matching engine sessions
+            price = change.get("price")
+            size = change.get("size")
+            side = change.get("side", "")
+            if price is not None and size is not None:
+                # Map Polymarket sides to ShadowOrderbook sides
+                book_side = "bid" if side.upper() == "BUY" else "ask"
+                delta = [{"side": book_side, "price": price, "size": size}]
+                sessions = self._sm.get_sessions_for_token(asset_id)
+                for session in sessions:
+                    if session.state == SessionState.ARCHIVED:
+                        continue
+                    book = session.get_book_for_token(asset_id)
+                    if book is not None:
+                        book.apply_changes(delta)
 
     def _handle_last_trade(self, event: dict) -> None:
         """

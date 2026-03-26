@@ -18,8 +18,6 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timezone
-from decimal import Decimal
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,7 +51,6 @@ def _resolve_tokens(
 
     try:
         for tf in timeframes:
-            tf_lower = tf.lower() if tf[0].isdigit() else tf
             # Resolve candle_open for current candle
             from config.timing import TF_SECONDS
             tf_key = tf.upper() if not tf[0].isdigit() else f"M{tf.replace('m','')}"

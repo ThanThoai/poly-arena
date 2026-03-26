@@ -208,24 +208,15 @@ class SnapshotStore:
     # ── 4.2 price_change — incremental update ───────────────────────────
 
     def _handle_price_change(self, event: dict) -> None:
-        market_id = event.get("market", "")
         timestamp = int(event.get("timestamp", 0))
 
-        for change in event.get("changes", []):
-            # change format: {"asset_id", "price", "size", "side"} or list [side, price, size]
-            if isinstance(change, dict):
-                token_id = change.get("asset_id", "")
-                price = _dec(change.get("price", 0))
-                size = _dec(change.get("size", 0))
-                side = change.get("side", "")
-            elif isinstance(change, list) and len(change) >= 3:
-                # Alternate format: [side, price, size]
-                side = str(change[0])
-                price = _dec(change[1])
-                size = _dec(change[2])
-                token_id = event.get("asset_id", "")
-            else:
-                continue
+        # Polymarket uses "price_changes" key (list of dicts)
+        # Each: {asset_id, price, size, side, hash, best_bid, best_ask}
+        for change in event.get("price_changes", []):
+            token_id = change.get("asset_id", "")
+            price = _dec(change.get("price", 0))
+            size = _dec(change.get("size", 0))
+            side = change.get("side", "")
 
             if not token_id:
                 continue
@@ -238,7 +229,7 @@ class SnapshotStore:
                 if snap.is_resolved:
                     continue
 
-                # Apply change
+                # Apply change: size=0 means level removed
                 if side.upper() in ("BUY", "BID"):
                     if size == 0:
                         snap.bids.pop(-price, None)
@@ -250,9 +241,17 @@ class SnapshotStore:
                     else:
                         snap.asks[price] = size
 
+                # Use best_bid/best_ask from event if available (more reliable)
+                if "best_bid" in change:
+                    snap.best_bid = _dec(change["best_bid"])
+                if "best_ask" in change:
+                    snap.best_ask = _dec(change["best_ask"])
+                if snap.best_bid is not None and snap.best_ask is not None:
+                    snap.spread = snap.best_ask - snap.best_bid
+
+                snap.book_hash = change.get("hash", snap.book_hash)
                 snap.last_updated = timestamp
                 snap.price_change_count += 1
-                snap._update_bbo()
 
             self._emit(token_id, "price_change")
 
