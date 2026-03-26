@@ -36,13 +36,13 @@ STREAM_MAXLEN = 10_000              # XADD MAXLEN ~ for bracket exits
 
 # ── UI Future Sessions ──────────────────────────────────────────────────
 
-UI_FUTURE_SESSIONS = 3              # Number of future sessions to expose to UI (A+1, A+2, A+3)
-UI_PAST_SESSIONS = 1                # Number of past sessions to keep for UI
+UI_FUTURE_SESSIONS = 0              # TEMP: disabled future sessions
+UI_PAST_SESSIONS = 0                # TEMP: disabled past sessions
 
 # ── Market constants ─────────────────────────────────────────────────────────
 
-SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
-TIMEFRAMES = ["M5"]
+SYMBOLS = ["BTC"]                     # TEMP: BTC only
+TIMEFRAMES = ["M5", "M15"]           # TEMP: BTC 5M + 15M only
 DIRECTIONS = ["UP", "DOWN"]
 
 # ── Price history recording ─────────────────────────────────────────────────
