@@ -42,6 +42,9 @@ def create_bot(
         api_key=secrets.token_urlsafe(32),
         initial_balance=payload.initial_balance,
         balance=payload.initial_balance,
+        balance_rest=payload.initial_balance,
+        balance_ws=payload.initial_balance,
+        ws_initial_balance=payload.initial_balance,
         user_id=None,
     )
     db.add(bot)
@@ -221,6 +224,7 @@ def get_balance_history(
                 trade_count=r.trade_count,
                 win_count=r.win_count,
                 loss_count=r.loss_count,
+                fill_source=r.fill_source,
             )
         )
 

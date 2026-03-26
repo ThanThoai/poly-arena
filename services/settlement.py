@@ -269,67 +269,84 @@ def _write_settlement_ledger(
     trade_ids: list[int],
     initial_balance: float,
     settled_at: datetime | None = None,
+    ws_initial_balance: float | None = None,
 ) -> None:
-    """Write ONE aggregated ledger entry per bot per settlement batch.
+    """Write per-source ledger entries per bot per settlement batch.
 
+    Creates separate rows for REST and WS trades (if any exist for each source).
     Each entry: prev_balance + total_profit - total_fee = new_balance.
     """
-    # Fetch all settled trades in this batch
-    trades = (
+    all_trades = (
         db.query(BinaryOption)
         .filter(BinaryOption.id.in_(trade_ids))
         .all()
     )
-    if not trades:
+    if not all_trades:
         return
-
-    # Get previous ledger balance for this bot
-    last_ledger = (
-        db.query(BotSettlementLedger)
-        .filter(BotSettlementLedger.bot_name == bot_name)
-        .order_by(BotSettlementLedger.id.desc())
-        .first()
-    )
-    ledger_prev = last_ledger.new_balance if last_ledger else initial_balance
 
     now = settled_at or datetime.now(timezone.utc)
 
-    # Aggregate all trades into one row
-    total_profit = round(sum(t.profit or 0 for t in trades), 8)
-    total_fee = round(sum(t.entry_fee or 0 for t in trades), 8)
-    delta = round(total_profit - total_fee, 8)
-    new_bal = round(ledger_prev + delta, 8)
+    # Group trades by fill_source
+    source_trades: dict[str, list] = {}
+    for t in all_trades:
+        src = t.fill_source or "REST"
+        source_trades.setdefault(src, []).append(t)
 
-    wins = sum(1 for t in trades if t.result == BOResult.WIN)
-    losses = sum(1 for t in trades if t.result == BOResult.LOSS)
+    for source, trades in source_trades.items():
+        # Determine initial balance for this source
+        if source == "WS" and ws_initial_balance is not None:
+            src_initial = ws_initial_balance
+        else:
+            src_initial = initial_balance
 
-    if delta > 0:
-        session_result = "WIN"
-    elif delta < 0:
-        session_result = "LOSS"
-    else:
-        session_result = "BREAKEVEN"
+        # Get previous ledger balance for this bot+source
+        last_ledger = (
+            db.query(BotSettlementLedger)
+            .filter(
+                BotSettlementLedger.bot_name == bot_name,
+                BotSettlementLedger.fill_source == source,
+            )
+            .order_by(BotSettlementLedger.id.desc())
+            .first()
+        )
+        ledger_prev = last_ledger.new_balance if last_ledger else src_initial
 
-    db.add(BotSettlementLedger(
-        bot_name=bot_name,
-        prev_balance=ledger_prev,
-        total_profit=total_profit,
-        total_fee=total_fee,
-        delta=delta,
-        new_balance=new_bal,
-        session_result=session_result,
-        trade_count=len(trades),
-        win_count=wins,
-        loss_count=losses,
-        trade_ids=[t.id for t in trades],
-        settled_at=now,
-    ))
+        total_profit = round(sum(t.profit or 0 for t in trades), 8)
+        total_fee = round(sum(t.entry_fee or 0 for t in trades), 8)
+        delta = round(total_profit - total_fee, 8)
+        new_bal = round(ledger_prev + delta, 8)
 
-    logger.info(
-        "LEDGER '%s': %.8f %+.8f (profit=%+.8f fee=%.8f) -> %.8f [%s] %d trades",
-        bot_name, ledger_prev, delta,
-        total_profit, total_fee, new_bal, session_result, len(trades),
-    )
+        wins = sum(1 for t in trades if t.result == BOResult.WIN)
+        losses = sum(1 for t in trades if t.result == BOResult.LOSS)
+
+        if delta > 0:
+            session_result = "WIN"
+        elif delta < 0:
+            session_result = "LOSS"
+        else:
+            session_result = "BREAKEVEN"
+
+        db.add(BotSettlementLedger(
+            bot_name=bot_name,
+            prev_balance=ledger_prev,
+            total_profit=total_profit,
+            total_fee=total_fee,
+            delta=delta,
+            new_balance=new_bal,
+            session_result=session_result,
+            trade_count=len(trades),
+            win_count=wins,
+            loss_count=losses,
+            trade_ids=[t.id for t in trades],
+            settled_at=now,
+            fill_source=source,
+        ))
+
+        logger.info(
+            "LEDGER '%s' [%s]: %.8f %+.8f (profit=%+.8f fee=%.8f) -> %.8f [%s] %d trades",
+            bot_name, source, ledger_prev, delta,
+            total_profit, total_fee, new_bal, session_result, len(trades),
+        )
 
 
 # -- Balance reconciliation ----------------------------------------------------
@@ -484,8 +501,54 @@ def reconcile_bot_balances(
         )
         drift = round(new_balance - (prev_balance or 0), 8)
 
-        # Apply
+        # Apply legacy balance
         bot.balance = new_balance
+
+        # ── Dual-pool reconciliation (REST / WS) ─────────────────────────
+        # Each pool has its own starting balance:
+        #   REST → initial_balance (original)
+        #   WS   → ws_initial_balance (= balance at migration/creation time)
+        ws_initial = bot.ws_initial_balance if bot.ws_initial_balance is not None else initial
+
+        for source in ("REST", "WS"):
+            pool_initial = initial if source == "REST" else ws_initial
+            src_pnl = (
+                db.query(func.coalesce(func.sum(BinaryOption.profit), 0.0))
+                .filter(
+                    BinaryOption.bot_name == bot_name,
+                    BinaryOption.result.in_([BOResult.WIN, BOResult.LOSS]),
+                    BinaryOption.fill_source == source,
+                )
+                .scalar()
+            ) or 0.0
+            src_locked = (
+                db.query(func.coalesce(func.sum(BinaryOption.amount), 0.0))
+                .filter(
+                    BinaryOption.bot_name == bot_name,
+                    BinaryOption.result == BOResult.PENDING,
+                    BinaryOption.fill_source == source,
+                )
+                .scalar()
+            ) or 0.0
+            src_fees = (
+                db.query(func.coalesce(func.sum(BinaryOption.entry_fee), 0.0))
+                .filter(
+                    BinaryOption.bot_name == bot_name,
+                    BinaryOption.result != BOResult.CANCELLED,
+                    BinaryOption.entry_fee.isnot(None),
+                    BinaryOption.fill_source == source,
+                )
+                .scalar()
+            ) or 0.0
+            # Futures only affect REST pool (futures don't have dual mode)
+            fut_effect = futures_cash_effect if source == "REST" else 0.0
+            src_balance = round(pool_initial + src_pnl - src_locked - src_fees + fut_effect, 8)
+
+            if source == "REST":
+                bot.balance_rest = src_balance
+                bot.balance = src_balance  # keep legacy in sync with REST
+            else:
+                bot.balance_ws = src_balance
 
         # Record balance history as equity (cash + all locked margins)
         equity = round(
@@ -497,9 +560,13 @@ def reconcile_bot_balances(
             balance=equity,
         ))
 
-        # ── Settlement Ledger: one aggregated record per bot ──────────────────
+        # ── Settlement Ledger: per-source records per bot ──────────────────
         if trade_ids:
-            _write_settlement_ledger(db, bot_name, trade_ids, initial, settled_at=batch_settled_at)
+            _write_settlement_ledger(
+                db, bot_name, trade_ids, initial,
+                settled_at=batch_settled_at,
+                ws_initial_balance=ws_initial,
+            )
 
         # Auto-pause on bankruptcy
         if bot.balance <= 0:

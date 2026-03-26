@@ -29,7 +29,7 @@ from ws_feed_service.order_consumer import OrderConsumer
 from ws_feed_service.rest_poller import RestPoller, REST_POLL_INTERVAL
 
 from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S, REST_POLL_TIMEOUT_S, FEED_MODE
-from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions, check_orderbook_keys
+from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions, purge_archived_sessions, check_orderbook_keys
 from database import SessionLocal
 from models import BinaryOption, BOResult
 
@@ -230,9 +230,12 @@ async def _recover_pending_orders(sync_redis, session_manager: SessionManager, r
                 continue
 
             # Compute session_id from settlement_at
+            # settlement_at = candle_close = candle_open + period_s
+            # Align to candle boundary to handle any timestamp drift
             period_s = _TF_SECONDS.get(tf_val, 300)
             if bo.settlement_at:
-                candle_open = int(bo.settlement_at.timestamp()) - period_s
+                settle_ts = int(bo.settlement_at.timestamp())
+                candle_open = settle_ts - settle_ts % period_s - period_s
             else:
                 now_ts = int(now.timestamp())
                 candle_open = now_ts - (now_ts % period_s)
@@ -425,7 +428,7 @@ async def main():
         log.info("Seeded Redis with %d initial orderbook(s) from REST", len(initial_books))
 
     # 5. Start TokenRegistry refresh loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def on_new_tokens(ids: list[str]) -> None:
         # Re-register mapping so new tokens get price writes.
@@ -458,7 +461,7 @@ async def main():
         # Notify poller / volume feed of new tokens so they can subscribe
         if FEED_MODE == "websocket":
             poller.add_tokens(ids)
-        else:
+        elif trade_volume_feed is not None:
             trade_volume_feed.add_tokens(ids)
 
         log.info(
@@ -489,7 +492,6 @@ async def main():
                     winning_outcome="",
                     bo_ids=bo_ids,
                 ),
-                loop=loop,
             )
             log.info(
                 "Market resolved callback: asset_id=%s bo_ids=%s",
@@ -504,6 +506,7 @@ async def main():
         log.info("Recovery: re-pushed %d pending order(s) to queue", recovered)
 
     # 8. Start poller — REST or WebSocket depending on FEED_MODE
+    trade_volume_feed = None  # initialized only in REST mode
     if FEED_MODE == "websocket":
         from ws_feed_service.ws_poller import WsFeedPoller
         all_token_ids = registry.all_token_ids()
@@ -541,7 +544,7 @@ async def main():
     async def _session_lifecycle_tick():
         while not shutdown_event.is_set():
             try:
-                _loop = asyncio.get_event_loop()
+                _loop = asyncio.get_running_loop()
                 created, new_token_ids = await _loop.run_in_executor(
                     None,
                     ensure_future_sessions,
@@ -572,6 +575,7 @@ async def main():
                         )
 
                 cleanup_expired_sessions(session_manager, sync_redis)
+                purge_archived_sessions(session_manager, sync_redis)
 
                 # Health check: verify all active/prefetch sessions have orderbook keys
                 await _loop.run_in_executor(
@@ -612,6 +616,7 @@ async def main():
     poller_task.cancel()
     if rest_pm_client is not None:
         rest_pm_client.close()
+    if trade_volume_feed is not None:
         await trade_volume_feed.stop()
     consumer.stop()
     await registry.stop()

@@ -124,9 +124,12 @@ def reset(apply: bool = False) -> None:
         # ── Reset bots ──
         for bot in bots:
             bot.balance = BOT_BALANCE
+            bot.balance_rest = BOT_BALANCE
+            bot.balance_ws = BOT_BALANCE
+            bot.ws_initial_balance = BOT_BALANCE
             bot.initial_balance = BOT_BALANCE
             bot.status = "ACTIVE"
-        print(f"  Reset {len(bots)} bots → balance={BOT_BALANCE:.0f}")
+        print(f"  Reset {len(bots)} bots → balance={BOT_BALANCE:.0f} (rest={BOT_BALANCE:.0f}, ws={BOT_BALANCE:.0f})")
 
         # ── Reset users & tạo snapshot ban đầu ──
         for user in users:

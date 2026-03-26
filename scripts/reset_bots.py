@@ -170,9 +170,12 @@ def reset(
         # -- 6. Reset bot balances --
         for bot in bots:
             bot.balance = BOT_BALANCE
+            bot.balance_rest = BOT_BALANCE
+            bot.balance_ws = BOT_BALANCE
+            bot.ws_initial_balance = BOT_BALANCE
             bot.initial_balance = BOT_BALANCE
             bot.status = "ACTIVE"
-        print(f"  Reset {len(bots)} bots -> balance=${BOT_BALANCE:,.0f}")
+        print(f"  Reset {len(bots)} bots -> balance=${BOT_BALANCE:,.0f} (rest+ws)")
 
         # -- 7. Reset affected users --
         affected_user_ids = set(b.user_id for b in bots if b.user_id)

@@ -185,11 +185,36 @@ class RedisWriter:
 
         total_tokens = len(self._session_token_map)
         total_combos = sum(len(v) for v in self._session_token_map.values())
+
+        # Prune stale entries from unbounded caches to prevent memory leaks
+        pruned = self._prune_stale_caches()
+        extra = f", pruned {pruned} stale cache entries" if pruned else ""
+
         logger.info(
             "RedisWriter: session tokens registered — %d token(s) → %d combo(s) "
-            "(%d past + current + %d future)",
-            total_tokens, total_combos, max_past, max_future,
+            "(%d past + current + %d future)%s",
+            total_tokens, total_combos, max_past, max_future, extra,
         )
+
+    def _prune_stale_caches(self) -> int:
+        """Remove entries from unbounded caches that no longer map to any active token."""
+        # Build set of all valid combo keys from current maps
+        valid_combo_keys: set[str] = set()
+        for token_id, combos in self._token_map.items():
+            for sym, tf, direction in combos:
+                valid_combo_keys.add(f"{sym}:{tf}:{direction}")
+        for token_id, combos in self._session_token_map.items():
+            for sym, tf, direction, candle_ts in combos:
+                valid_combo_keys.add(f"{sym}:{tf}:{direction}")
+                valid_combo_keys.add(f"{sym}:{tf}:{direction}:{candle_ts}")
+
+        pruned = 0
+        for cache in (self._last_price_record_ts, self._last_ob_by_combo):
+            stale_keys = [k for k in cache if k not in valid_combo_keys]
+            for k in stale_keys:
+                del cache[k]
+                pruned += 1
+        return pruned
 
     async def publish_token_mapping(self) -> None:
         """

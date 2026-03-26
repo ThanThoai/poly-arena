@@ -47,7 +47,7 @@ TIMEFRAMES = ["M5", "M15"]
 FORECASTS = ["GREEN", "RED"]
 
 # ── Futures config ─────────────────────────────────────────────────────────
-FUTURES_ENABLED = os.environ.get("FUTURES_ENABLED", "1") == "1"
+FUTURES_ENABLED = os.environ.get("FUTURES_ENABLED", "0") == "1"
 FUTURES_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 FUTURES_SIDES = ["LONG", "SHORT"]
 FUTURES_NUM_BOTS = int(os.environ.get("FUTURES_NUM_BOTS", "4"))

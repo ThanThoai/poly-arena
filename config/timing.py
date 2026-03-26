@@ -30,6 +30,8 @@ WS_CLOSE_TIMEOUT_S = 5          # graceful close timeout
 
 PRICE_CACHE_TTL_S = 120         # Redis EXPIRE on price hashes (survives session gaps)
 PRICE_STALE_THRESHOLD_S = 45    # FastAPI treats older prices as stale
+WS_STALE_THRESHOLD_S = 15       # WS mode: REST fallback if no update within N seconds
+WS_RECONNECT_STALE_MS = 1000   # WS mode: force reconnect if ANY token stale > this (ms)
 API_PRICE_CACHE_TTL_S = 5       # in-memory cache for /prices REST endpoint
 API_ORDERBOOK_CACHE_TTL_S = 5   # in-memory cache for /orderbook REST endpoint
 SLUG_CACHE_TTL_S = 300          # slug → token_ids cache (matches shortest candle M5)

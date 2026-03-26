@@ -12,7 +12,7 @@ from models import BalanceHistory, BinaryOption, Bot, BOResult
 from routers import achievements as achievements_router, admin as admin_router, auth, binary_options, bots, dashboard, ws as ws_router, ws_polymarket, futures as futures_router
 from services.orderbook_broadcaster import broadcaster
 from services.redis_client import get_async_redis, close_async_redis
-from config.fees import maker_rebate_from_levels
+from config.fees import maker_rebate_from_levels, taker_fee_from_levels
 from services.order_trace import make_trace, append_trace
 from services.user_balance import record_user_balance
 from ws_feed_service.config import (
@@ -341,30 +341,39 @@ async def _handle_order_fill(r, stream, group, msg_id, data) -> None:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                # Fee handling: maker rebate for ALL LIMIT fills from ME.
-                # MARKET orders are filled at API level (taker fee deducted there).
-                # All ME fills for LIMIT orders are maker fills (order rests on
-                # book until matched), including aggressive LIMIT remainders
-                # that already have entry_fee > 0 from the REST taker portion.
-                # Skip rebate if cancel handler already processed this order
-                # (race: CANCEL processed before FILL replay → avoid double rebate).
+                # Fee handling:
+                # - LIMIT fills from ME → maker rebate
+                # - WS MARKET fills (fill_source='WS') → taker fee
+                # - REST MARKET fills → taker fee already deducted at API level
                 fee_applied = 0.0
                 is_maker_fill = bo.limit_price is not None
+                is_ws_market = bo.fill_source == "WS" and bo.limit_price is None
                 already_canceled = bo.me_order_status == "CANCELED"
-                if wp_str and is_maker_fill and not already_canceled:
+                if wp_str and not already_canceled:
                     try:
                         fill_levels = json.loads(wp_str)
-                        rebate = maker_rebate_from_levels(fill_levels)
-                        if rebate > 0:
-                            bot = db.query(Bot).filter(
-                                Bot.bot_name == bo.bot_name,
-                            ).first()
-                            if bot:
+                        bot = db.query(Bot).filter(
+                            Bot.bot_name == bo.bot_name,
+                        ).first()
+                        if is_maker_fill:
+                            rebate = maker_rebate_from_levels(fill_levels)
+                            if rebate > 0 and bot:
                                 bot.balance = round(bot.balance + rebate, 8)
-                            bo.entry_fee = round(
-                                (bo.entry_fee or 0) - rebate, 8,
-                            )
-                        fee_applied = rebate
+                                if bot.balance_rest is not None:
+                                    bot.balance_rest = round(bot.balance_rest + rebate, 8)
+                                bo.entry_fee = round(
+                                    (bo.entry_fee or 0) - rebate, 8,
+                                )
+                            fee_applied = rebate
+                        elif is_ws_market:
+                            taker_fee = taker_fee_from_levels(fill_levels)
+                            if taker_fee > 0 and bot:
+                                if bot.balance_ws is not None:
+                                    bot.balance_ws = round(bot.balance_ws - taker_fee, 8)
+                                bo.entry_fee = round(
+                                    (bo.entry_fee or 0) + taker_fee, 8,
+                                )
+                            fee_applied = -taker_fee  # negative = cost
                     except (json.JSONDecodeError, TypeError, KeyError):
                         pass
 

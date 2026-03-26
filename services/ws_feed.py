@@ -86,6 +86,16 @@ class PolymarketFeed:
                 pass
         logger.info("Polymarket feed stopped")
 
+    async def force_reconnect(self, reason: str = "stale data") -> None:
+        """Force-close the current WS connection to trigger immediate reconnect."""
+        if self._ws is not None:
+            logger.warning("Force reconnect requested: %s", reason)
+            try:
+                await self._ws.close(1000, reason)
+            except Exception:
+                pass
+            self._reconnect_delay = _RECONNECT_BASE  # reset backoff
+
     def add_tokens(self, token_ids: list[str]) -> None:
         """
         Add token IDs to track.
@@ -240,6 +250,101 @@ class PolymarketFeed:
                     event.get("event_type", "?"), e,
                     exc_info=True,
                 )
+
+
+# ── Redundant Feed Pool ──────────────────────────────────────────────────────
+
+_DEDUP_WINDOW_MS = 50  # skip duplicate events arriving within this window
+
+
+class PolymarketFeedPool:
+    """
+    Manages N concurrent PolymarketFeed connections for redundancy.
+
+    All connections subscribe to the same tokens. Events are deduplicated:
+    only the first copy that arrives is forwarded to the callback.
+    If one connection drops, the others continue providing data.
+    """
+
+    def __init__(
+        self,
+        token_ids: list[str],
+        on_event: Optional[Callable[[dict], None]] = None,
+        pool_size: int = 3,
+    ) -> None:
+        self.token_ids = list(token_ids)
+        self._on_event = on_event
+        self._pool_size = pool_size
+        self._feeds: list[PolymarketFeed] = []
+        # Dedup: (asset_id, event_type) → monotonic timestamp of last forwarded event
+        self._last_forwarded: dict[tuple[str, str], float] = {}
+        self._forwarded_count = 0
+        self._deduped_count = 0
+
+        for i in range(pool_size):
+            feed = PolymarketFeed(
+                token_ids=list(token_ids),
+                on_event=self._dedup_dispatch,
+            )
+            self._feeds.append(feed)
+
+    async def start(self) -> None:
+        """Start all feed connections concurrently."""
+        logger.info(
+            "FeedPool starting %d connection(s) — tracking %d token(s)",
+            self._pool_size, len(self.token_ids),
+        )
+        for feed in self._feeds:
+            await feed.start()
+
+    async def stop(self) -> None:
+        """Stop all feed connections."""
+        for feed in self._feeds:
+            await feed.stop()
+        logger.info(
+            "FeedPool stopped — forwarded %d, deduped %d events",
+            self._forwarded_count, self._deduped_count,
+        )
+
+    def add_tokens(self, token_ids: list[str]) -> None:
+        """Add tokens to all connections in the pool."""
+        new = set(token_ids) - set(self.token_ids)
+        if not new:
+            return
+        self.token_ids.extend(new)
+        for feed in self._feeds:
+            feed.add_tokens(list(new))
+
+    async def force_reconnect(self, reason: str = "stale data") -> None:
+        """Force-reconnect ALL connections in the pool."""
+        logger.warning("FeedPool: force reconnect all %d connections: %s", self._pool_size, reason)
+        for feed in self._feeds:
+            await feed.force_reconnect(reason=reason)
+
+    def _dedup_dispatch(self, event: dict) -> None:
+        """Forward event only if not a duplicate (within dedup window)."""
+        if self._on_event is None:
+            return
+
+        asset_id = event.get("asset_id", "")
+        event_type = event.get("event_type", "")
+
+        # For price_change events, asset_id is nested in price_changes list
+        if event_type == "price_change" and not asset_id:
+            changes = event.get("price_changes", [])
+            asset_id = changes[0].get("asset_id", "") if changes else ""
+
+        key = (asset_id, event_type)
+        now = time.monotonic()
+        last = self._last_forwarded.get(key, 0.0)
+
+        if (now - last) * 1000 < _DEDUP_WINDOW_MS:
+            self._deduped_count += 1
+            return
+
+        self._last_forwarded[key] = now
+        self._forwarded_count += 1
+        self._on_event(event)
 
 
 # ── Module-level singleton ───────────────────────────────────────────────────

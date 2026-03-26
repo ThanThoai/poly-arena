@@ -25,7 +25,7 @@ from ws_feed_service.config import (
     ORDERBOOK_KEY_PREFIX,
 )
 from schemas import (
-    BOBotStats, BOCreate, BOForecastStats, BOResponse,
+    BOBotStats, BOCreate, BOForecastStats, BOResponse, DualModeResponse,
     BOStats, BOTimeframeStats,
     SessionInfo as SessionInfoSchema, TimelineEvent, TradeInspectResponse,
 )
@@ -579,6 +579,168 @@ def _fill_market_from_snapshot(
     return round(avg_price, 8), round(num_shares, 8), walk_levels, snapshot_timestamp, rest_request_at
 
 
+# WS fill timing window: only accept snapshots arriving 20–50ms AFTER order timestamp.
+# This simulates realistic WS propagation latency.
+_WS_WINDOW_MIN_MS = 20   # snapshot must be at least this many ms after order
+_WS_WINDOW_MAX_MS = 50   # snapshot must arrive within this many ms after order
+_WS_POLL_INTERVAL_S = 0.002  # poll Redis every 2ms while waiting
+
+
+def _read_ws_snapshot(
+    symbol: str, timeframe: str, direction: str, candle_open: int,
+) -> tuple[list[list], float] | None:
+    """Read asks + updated_at from Redis. Returns None if unavailable."""
+    from services.redis_client import get_sync_redis
+    sr = get_sync_redis()
+    for key in (
+        f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}:{candle_open}",
+        f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}",
+    ):
+        data = sr.hgetall(key)
+        if data and "asks" in data and "updated_at" in data:
+            asks = json.loads(data["asks"])
+            if asks:
+                return asks, float(data["updated_at"])
+    return None
+
+
+def _try_walk_asks(
+    asks: list[list],
+    amount: float,
+    slippage_tolerance: Optional[float],
+    ceiling_price: Optional[float],
+    order_type: str,
+) -> tuple[float, float, list] | None:
+    """Try to fill a MARKET BUY by walking asks.
+
+    Returns (avg_price, num_shares, walk_levels) if successful, None if
+    the orderbook cannot satisfy the order (slippage exceeded, no liquidity, FOK rejected).
+    """
+    slippage = slippage_tolerance if slippage_tolerance is not None else _DEFAULT_SLIPPAGE_TOLERANCE
+    best_ask = Decimal(str(asks[0][0]))
+    max_price = best_ask * (Decimal("1") + Decimal(str(slippage)))
+
+    if ceiling_price is not None:
+        max_price = min(max_price, Decimal(str(ceiling_price)))
+
+    budget = Decimal(str(amount))
+    total_cost = Decimal("0")
+    total_qty = Decimal("0")
+    walk_levels: list[dict] = []
+
+    for level in asks:
+        price = Decimal(str(level[0]))
+        size = Decimal(str(level[1]))
+
+        if price > max_price:
+            break
+        remaining_budget = budget - total_cost
+        if remaining_budget <= 0:
+            break
+
+        max_qty_at_level = remaining_budget / price
+        fill_qty = min(size, max_qty_at_level)
+        level_cost = fill_qty * price
+
+        total_cost += level_cost
+        total_qty += fill_qty
+        walk_levels.append({
+            "price": float(price),
+            "qty": float(fill_qty),
+            "cost": float(level_cost),
+        })
+
+        if total_cost >= budget:
+            break
+
+    # FOK: require full budget
+    if order_type == "FOK" and ceiling_price is not None:
+        if total_cost < budget and total_qty > 0:
+            return None
+
+    if total_qty == 0:
+        return None
+
+    avg_price = float(total_cost / total_qty)
+    num_shares = float(total_qty)
+    return round(avg_price, 8), round(num_shares, 8), walk_levels
+
+
+def _fill_market_from_ws_snapshot(
+    symbol: str, timeframe: str, direction: str, amount: float,
+    order_received_at: datetime,
+    slippage_tolerance: Optional[float] = None,
+    candle_open: int = 0,
+    order_type: str = "FAK",
+    ceiling_price: Optional[float] = None,
+) -> Tuple[float, float, list, float]:
+    """Fill a MARKET BUY from a WS snapshot arriving 20–50ms after the order.
+
+    Polls Redis every 2ms waiting for the FIRST snapshot whose timestamp
+    falls in [order_ts + 20ms, order_ts + 50ms].  Once found, attempts to
+    walk asks exactly once:
+      - Fill succeeds → return
+      - Fill fails (slippage / no liquidity) → reject immediately (no retry)
+      - No snapshot in window → reject
+
+    Returns (avg_price, num_shares, walk_levels, snapshot_updated_at)
+    """
+    order_ts = order_received_at.timestamp()
+    deadline = order_ts + _WS_WINDOW_MAX_MS / 1000.0
+    target_min = order_ts + _WS_WINDOW_MIN_MS / 1000.0
+
+    # Phase 1: wait for first valid snapshot in window
+    snap_ts = 0.0
+    asks: list[list] = []
+
+    while True:
+        now = time.time()
+        if now > deadline:
+            break
+
+        result = _read_ws_snapshot(symbol, timeframe, direction, candle_open)
+        if result is not None:
+            asks, snap_ts = result
+            if snap_ts >= target_min and snap_ts <= deadline:
+                break  # got a valid snapshot
+            if snap_ts > deadline:
+                break  # too late
+
+        time.sleep(_WS_POLL_INTERVAL_S)
+    else:
+        pass  # loop ended normally (shouldn't happen with while True)
+
+    # Check if we got a valid snapshot
+    if snap_ts < target_min or snap_ts > deadline:
+        last_snap = f"{snap_ts:.3f}" if snap_ts > 0 else "N/A"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"WS snapshot not available in window "
+                f"[+{_WS_WINDOW_MIN_MS}ms, +{_WS_WINDOW_MAX_MS}ms]. "
+                f"order_ts={order_ts:.3f}, last_snapshot_ts={last_snap}"
+            ),
+        )
+
+    # Phase 2: try to fill once — no retry
+    fill = _try_walk_asks(asks, amount, slippage_tolerance, ceiling_price, order_type)
+    if fill is None:
+        latency_ms = (snap_ts - order_ts) * 1000
+        best_ask = asks[0][0] if asks else "N/A"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"WS fill rejected: price not suitable. "
+                f"best_ask={best_ask}, slippage={slippage_tolerance}, "
+                f"ceiling={ceiling_price}, order_type={order_type}. "
+                f"snapshot latency={latency_ms:.1f}ms"
+            ),
+        )
+
+    avg_price, num_shares, walk_levels = fill
+    return avg_price, num_shares, walk_levels, snap_ts
+
+
 def _fill_limit_from_snapshot(
     symbol: str, timeframe: str, direction: str, amount: float,
     limit_price: float,
@@ -727,7 +889,16 @@ def _queue_prefilled_to_me(
         )
 
 
-@router.post("", response_model=BOResponse, status_code=201)
+def _refund_dual_balance(bot: Bot, amount: float, is_dual: bool) -> None:
+    """Refund amount to both REST and WS pools (if dual) and sync legacy balance."""
+    if bot.balance_rest is not None:
+        bot.balance_rest = round(bot.balance_rest + amount, 8)
+    if is_dual and bot.balance_ws is not None:
+        bot.balance_ws = round(bot.balance_ws + amount, 8)
+    bot.balance = bot.balance_rest if bot.balance_rest is not None else round(bot.balance + amount, 8)
+
+
+@router.post("", response_model=DualModeResponse, status_code=201)
 def create_bo(
     payload: BOCreate,
     x_api_key: str = Header(..., alias="x-api-key", description="Bot API key"),
@@ -781,9 +952,29 @@ def create_bo(
     is_aggressive_limit = False
 
     max_fee = estimate_max_taker_fee(payload.amount) if not is_limit else 0
-    if bot.balance < payload.amount + max_fee:
+    cost_with_fee = payload.amount + max_fee
+
+    # Dual-balance pools (REST + WS) for MARKET orders
+    _br = bot.balance_rest if bot.balance_rest is not None else bot.balance
+    _bw = bot.balance_ws if bot.balance_ws is not None else bot.balance
+    can_rest = _br >= cost_with_fee
+    can_ws = _bw >= cost_with_fee
+    is_dual_market = not is_limit and (can_rest and can_ws)
+
+    if not can_rest and not can_ws:
         raise HTTPException(status_code=400, detail="Insufficient balance (including estimated fee)")
-    bot.balance = round(bot.balance - payload.amount, 8)
+    # For LIMIT orders, use legacy balance check
+    if is_limit and bot.balance < cost_with_fee:
+        raise HTTPException(status_code=400, detail="Insufficient balance (including estimated fee)")
+
+    # Deduct from REST pool
+    if can_rest:
+        bot.balance_rest = round(_br - payload.amount, 8)
+    # Deduct from WS pool (only for dual MARKET)
+    if is_dual_market:
+        bot.balance_ws = round(_bw - payload.amount, 8)
+    # Keep legacy balance synced to REST pool
+    bot.balance = bot.balance_rest if bot.balance_rest is not None else round(bot.balance - payload.amount, 8)
 
     direction  = _FORECAST_TO_STATUS[payload.forecast.value]  # "UP" or "DOWN"
 
@@ -797,7 +988,7 @@ def create_bo(
             session_offset=payload.session_offset or 0,
         )
     except ValueError as exc:
-        bot.balance = round(bot.balance + payload.amount, 8)
+        _refund_dual_balance(bot, payload.amount, is_dual_market)
         raise HTTPException(status_code=400, detail=str(exc))
 
     settlement_at = session.settlement_at
@@ -826,7 +1017,7 @@ def create_bo(
 
     if not session.is_current and snapshot_best_ask is None:
         # Future session with no orderbook data yet — ME hasn't created it
-        bot.balance = round(bot.balance + payload.amount, 8)
+        _refund_dual_balance(bot, payload.amount, is_dual_market)
         raise HTTPException(
             status_code=503,
             detail="Market for the target session is not available yet",
@@ -834,7 +1025,7 @@ def create_bo(
 
     # For current sessions, also check that ME is running (snapshot exists)
     if session.is_current and snapshot_best_ask is None:
-        bot.balance = round(bot.balance + payload.amount, 8)
+        _refund_dual_balance(bot, payload.amount, is_dual_market)
         raise HTTPException(
             status_code=503,
             detail="Price data unavailable — matching engine may not be running",
@@ -857,7 +1048,7 @@ def create_bo(
     # ceiling_price must be >= best_ask; otherwise no fill is possible.
     if payload.ceiling_price is not None and snapshot_best_ask is not None:
         if payload.ceiling_price < snapshot_best_ask:
-            bot.balance = round(bot.balance + payload.amount, 8)
+            _refund_dual_balance(bot, payload.amount, is_dual_market)
             reject_detail = (
                 f"ceiling_price ({payload.ceiling_price:.4f}) is below current "
                 f"Best Ask ({snapshot_best_ask:.4f}) — no fills possible"
@@ -890,7 +1081,7 @@ def create_bo(
     # Runs after session resolution so we have the correct candle_open.
     if snapshot_best_ask is not None and (payload.tp_price is not None or payload.sl_price is not None):
         if payload.sl_price is not None and payload.sl_price >= snapshot_best_ask:
-            bot.balance = round(bot.balance + payload.amount, 8)
+            _refund_dual_balance(bot, payload.amount, is_dual_market)
             pending_traces.append(make_trace(
                 "VALIDATION", "PRE_VALIDATION_FAILED",
                 f"Validation Failed: SL ${payload.sl_price:.4f} must be lower than "
@@ -905,7 +1096,7 @@ def create_bo(
                 ),
             )
         if payload.tp_price is not None and payload.tp_price <= snapshot_best_ask:
-            bot.balance = round(bot.balance + payload.amount, 8)
+            _refund_dual_balance(bot, payload.amount, is_dual_market)
             pending_traces.append(make_trace(
                 "VALIDATION", "PRE_VALIDATION_FAILED",
                 f"Validation Failed: TP ${payload.tp_price:.4f} must be higher than "
@@ -932,13 +1123,14 @@ def create_bo(
 
     # ── Aggressive limit detection (after session resolution) ─────────
     # Now we have session.candle_open so we read the correct orderbook.
+    ws_bo = None  # only set for dual-mode MARKET orders
     if is_limit:
         if snapshot_best_ask is not None and payload.limit_price >= snapshot_best_ask:
             is_aggressive_limit = True
             # Check balance covers estimated taker fee (actual fee deducted after fill)
             extra_fee = estimate_max_taker_fee(payload.amount)
             if bot.balance < extra_fee:
-                bot.balance = round(bot.balance + payload.amount, 8)
+                _refund_dual_balance(bot, payload.amount, is_dual_market)
                 raise HTTPException(
                     status_code=400,
                     detail="Insufficient balance (including estimated taker fee for aggressive limit)",
@@ -960,7 +1152,7 @@ def create_bo(
                 candle_open=candle_open,
             )
         except HTTPException:
-            bot.balance = round(bot.balance + payload.amount, 8)
+            _refund_dual_balance(bot, payload.amount, is_dual_market)
             raise
 
         original_amount = payload.amount
@@ -1038,6 +1230,7 @@ def create_bo(
             me_order_status   = me_order_status,
             walk_prices       = {"entry": walk_levels} if walk_levels else None,
             traces            = order_traces if order_traces else None,
+            fill_source       = "REST",
         )
         db.add(bo)
         db.commit()
@@ -1163,6 +1356,7 @@ def create_bo(
             ceiling_price       = payload.ceiling_price,
             me_order_status   = "PENDING",
             traces            = order_traces if order_traces else None,
+            fill_source       = "REST",
         )
         db.add(bo)
         db.commit()
@@ -1209,7 +1403,7 @@ def create_bo(
                 ceiling_price=payload.ceiling_price,
             )
         except HTTPException as exc:
-            bot.balance = round(bot.balance + payload.amount, 8)
+            _refund_dual_balance(bot, payload.amount, is_dual_market)
             logger.warning(
                 "BO MARKET FAK REJECTED %s %s %s: amount=%.4f "
                 "order_type=%s ceiling=%s slippage=%s "
@@ -1259,7 +1453,7 @@ def create_bo(
                 order_detail["order_to_snapshot_ms"] = round(order_to_snapshot_ms, 3)
 
                 if order_to_snapshot_ms > 100:
-                    bot.balance = round(bot.balance + payload.amount, 8)
+                    _refund_dual_balance(bot, payload.amount, is_dual_market)
                     reject_detail = (
                         f"Stale orderbook snapshot: order_to_snapshot={order_to_snapshot_ms:.1f}ms "
                         f"(threshold=100ms). "
@@ -1300,17 +1494,23 @@ def create_bo(
                     snapshot_ts_str,
                 )
 
-        # FAK partial fill: refund unspent budget to bot
+        # FAK partial fill: refund unspent budget to bot (REST pool only)
         actual_cost = sum(lv["cost"] for lv in walk_levels)
         is_partial = actual_cost < original_market_amount
+        rest_amount = payload.amount  # save before mutation
         if is_partial:
             refund = round(original_market_amount - actual_cost, 8)
+            if bot.balance_rest is not None:
+                bot.balance_rest = round(bot.balance_rest + refund, 8)
             bot.balance = round(bot.balance + refund, 8)
-            payload.amount = round(actual_cost, 8)
+            rest_amount = round(actual_cost, 8)
+            payload.amount = rest_amount
 
-        # Apply taker fee
+        # Apply taker fee (REST pool)
         entry_fee = taker_fee_from_levels(walk_levels)
         if entry_fee > 0:
+            if bot.balance_rest is not None:
+                bot.balance_rest = round(bot.balance_rest - entry_fee, 8)
             bot.balance = round(bot.balance - entry_fee, 8)
 
         me_order_status = "PREFILLED" if has_bracket else None
@@ -1386,8 +1586,8 @@ def create_bo(
             symbol            = payload.symbol,
             timeframe         = payload.timeframe,
             forecast          = payload.forecast,
-            amount            = payload.amount,
-            original_amount   = payload.amount,
+            amount            = rest_amount,
+            original_amount   = original_market_amount,
             result            = BOResult.PENDING,
             avg_price         = avg_price,
             num_shares        = num_shares,
@@ -1408,6 +1608,7 @@ def create_bo(
             me_order_status   = me_order_status,
             walk_prices       = {"entry": walk_levels},
             traces            = order_traces if order_traces else None,
+            fill_source       = "REST",
         )
         db.add(bo)
         db.commit()
@@ -1444,6 +1645,125 @@ def create_bo(
                 candle_open=candle_open,
             )
 
+        # ── WS dual order: fill from WS-fed Redis snapshot ─────────────
+        ws_bo = None
+        if is_dual_market:
+            ws_avg_price = None
+            ws_num_shares = None
+            ws_walk_levels = None
+            ws_entry_fee = 0.0
+            ws_amount = original_market_amount
+            ws_reject_reason = None
+            ws_snapshot_ts = None
+
+            try:
+                ws_avg_price, ws_num_shares, ws_walk_levels, ws_snapshot_ts = _fill_market_from_ws_snapshot(
+                    payload.symbol.value, payload.timeframe.value, direction,
+                    original_market_amount,
+                    order_received_at=order_received_at,
+                    slippage_tolerance=payload.slippage_tolerance,
+                    candle_open=candle_open,
+                    order_type=payload.order_type or "FAK",
+                    ceiling_price=payload.ceiling_price,
+                )
+
+                # FAK partial fill: refund to WS pool
+                ws_actual_cost = sum(lv["cost"] for lv in ws_walk_levels)
+                ws_is_partial = ws_actual_cost < original_market_amount
+                if ws_is_partial:
+                    ws_refund = round(original_market_amount - ws_actual_cost, 8)
+                    bot.balance_ws = round(bot.balance_ws + ws_refund, 8)
+                    ws_amount = round(ws_actual_cost, 8)
+
+                # Taker fee on WS fill
+                ws_entry_fee = taker_fee_from_levels(ws_walk_levels)
+                if ws_entry_fee > 0:
+                    bot.balance_ws = round(bot.balance_ws - ws_entry_fee, 8)
+
+            except HTTPException as ws_exc:
+                # WS fill failed (stale snapshot or no liquidity) — refund WS pool
+                ws_reject_reason = ws_exc.detail
+                bot.balance_ws = round(bot.balance_ws + original_market_amount, 8)
+                logger.warning(
+                    "WS MARKET fill rejected for REST BO #%d: %s",
+                    bo.id, ws_reject_reason,
+                )
+
+            # Create WS BinaryOption (filled or rejected)
+            if ws_reject_reason is None:
+                # Build WS timing reason
+                ws_order_ts_f = order_received_at.timestamp()
+                ws_order_ts_s = f"{ws_order_ts_f:.3f}"
+                ws_snap_ts_s = f"{ws_snapshot_ts:.3f}" if ws_snapshot_ts else "N/A"
+                # Positive = snapshot arrived after order (expected)
+                ws_latency_ms = (ws_snapshot_ts - ws_order_ts_f) * 1000 if ws_snapshot_ts else 0
+                ws_timing_info = (
+                    f"[WS Timing] order_ts={ws_order_ts_s}, "
+                    f"ws_snapshot_ts={ws_snap_ts_s}, "
+                    f"latency={ws_latency_ms:.1f}ms "
+                    f"(window={_WS_WINDOW_MIN_MS}-{_WS_WINDOW_MAX_MS}ms)"
+                )
+                ws_reason = payload.reason
+                if ws_reason:
+                    ws_reason = f"{ws_reason} | {ws_timing_info}"
+                else:
+                    ws_reason = ws_timing_info
+
+                ws_traces = [make_trace(
+                    "MATCHING", "WS_FILL",
+                    f"WS MARKET filled from snapshot arriving {ws_latency_ms:.1f}ms after order. "
+                    f"Avg: ${ws_avg_price:.4f}. Shares: {ws_num_shares:.4f}. "
+                    f"Fee: ${ws_entry_fee:.4f}.",
+                    {"avg_price": ws_avg_price, "num_shares": ws_num_shares,
+                     "walk_levels": ws_walk_levels, "entry_fee": ws_entry_fee,
+                     "snapshot_updated_at": ws_snapshot_ts,
+                     "latency_ms": ws_latency_ms,
+                     "window_min_ms": _WS_WINDOW_MIN_MS,
+                     "window_max_ms": _WS_WINDOW_MAX_MS},
+                )]
+                ws_bo = BinaryOption(
+                    bot_name          = bot.bot_name,
+                    symbol            = payload.symbol,
+                    timeframe         = payload.timeframe,
+                    forecast          = payload.forecast,
+                    amount            = ws_amount,
+                    original_amount   = original_market_amount,
+                    result            = BOResult.PENDING,
+                    avg_price         = ws_avg_price,
+                    num_shares        = ws_num_shares,
+                    reason            = ws_reason,
+                    order_received_at = order_received_at,
+                    ask_fetched_at    = ask_fetched_at,
+                    settlement_at     = settlement_at,
+                    limit_price       = None,
+                    tp_price          = payload.tp_price,
+                    sl_price          = payload.sl_price,
+                    ttl               = payload.ttl,
+                    session_offset    = session_offset,
+                    session_id        = session_id,
+                    candle_open       = candle_open,
+                    entry_fee         = ws_entry_fee,
+                    order_type        = payload.order_type,
+                    ceiling_price     = payload.ceiling_price,
+                    me_order_status   = None,
+                    walk_prices       = {"entry": ws_walk_levels},
+                    traces            = ws_traces,
+                    fill_source       = "WS",
+                    pair_id           = bo.id,
+                )
+                db.add(ws_bo)
+                db.commit()
+                db.refresh(ws_bo)
+
+                # Link REST → WS
+                bo.pair_id = bo.id
+                db.commit()
+
+                logger.info(
+                    "BO #%d WS MARKET filled (pair of REST BO #%d): avg=%.6f shares=%.4f fee=%.4f",
+                    ws_bo.id, bo.id, ws_avg_price, ws_num_shares, ws_entry_fee,
+                )
+
     # Persist any traces added after initial commit (e.g. from _queue_prefilled_to_me)
     db.commit()
     db.refresh(bo)
@@ -1464,37 +1784,39 @@ def create_bo(
     bo.snapshot_best_bid      = snapshot_prices["best_bid"]
     bo.snapshot_best_bid_size = snapshot_prices["best_bid_size"]
 
-    # Log fill status with snapshot context
-    fill_status = "FILLED" if bo.num_shares and bo.num_shares > 0 else "UNFILLED"
-    if bo.me_order_status == "PARTIAL":
-        fill_status = "PARTIAL_FILL"
-    elif bo.me_order_status == "PENDING":
-        fill_status = "QUEUED"
     logger.info(
-        "BO #%d CREATED: fill_status=%s me_status=%s shares=%s avg_price=%s "
-        "amount=%.4f snapshot=[ask=%s(%s) bid=%s(%s)]",
-        bo.id, fill_status, bo.me_order_status,
+        "BO #%d CREATED: fill_source=%s me_status=%s shares=%s avg_price=%s amount=%.4f",
+        bo.id, bo.fill_source, bo.me_order_status,
         f"{bo.num_shares:.4f}" if bo.num_shares else "0",
         f"{bo.avg_price:.6f}" if bo.avg_price else "N/A",
         bo.amount,
-        snapshot_prices["best_ask"], snapshot_prices["best_ask_size"],
-        snapshot_prices["best_bid"], snapshot_prices["best_bid_size"],
     )
 
-    return bo
+    # Build dual-mode response
+    rest_resp = BOResponse.model_validate(bo)
+    ws_resp = None
+    if ws_bo is not None:
+        ws_bo.snapshot_best_ask      = snapshot_prices["best_ask"]
+        ws_bo.snapshot_best_ask_size = snapshot_prices["best_ask_size"]
+        ws_bo.snapshot_best_bid      = snapshot_prices["best_bid"]
+        ws_bo.snapshot_best_bid_size = snapshot_prices["best_bid_size"]
+        ws_resp = BOResponse.model_validate(ws_bo)
+
+    return DualModeResponse(rest_order=rest_resp, ws_order=ws_resp)
 
 
 # ─── Danh sách lệnh ───────────────────────────────────────────────────────────
 
 @router.get("", response_model=List[BOResponse])
 def list_bo(
-    bot_name:  Optional[str]          = Query(None),
-    symbol:    Optional[BOSymbol]     = Query(None),
-    timeframe: Optional[BOTimeframe]  = Query(None),
-    forecast:  Optional[BOForecast]   = Query(None),
-    result:    Optional[BOResult]     = Query(None),
-    limit:     int                    = Query(5000, ge=1, le=10000),
-    offset:    int                    = Query(0,    ge=0),
+    bot_name:    Optional[str]          = Query(None),
+    symbol:      Optional[BOSymbol]     = Query(None),
+    timeframe:   Optional[BOTimeframe]  = Query(None),
+    forecast:    Optional[BOForecast]   = Query(None),
+    result:      Optional[BOResult]     = Query(None),
+    fill_source: Optional[str]          = Query(None, description="Filter by fill source: REST or WS"),
+    limit:       int                    = Query(5000, ge=1, le=10000),
+    offset:      int                    = Query(0,    ge=0),
     db: Session = Depends(get_db),
 ):
     q = db.query(BinaryOption)
@@ -1508,6 +1830,8 @@ def list_bo(
         q = q.filter(BinaryOption.forecast == forecast)
     if result:
         q = q.filter(BinaryOption.result == result)
+    if fill_source:
+        q = q.filter(BinaryOption.fill_source == fill_source.upper())
     total = q.count()
     rows = q.order_by(BinaryOption.created_at.desc()).offset(offset).limit(limit).all()
     data = [BOResponse.model_validate(r).model_dump(mode="json") for r in rows]

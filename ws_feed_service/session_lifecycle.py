@@ -23,6 +23,7 @@ from config.timing import (
     SESSION_PRE_CREATE_BUFFER_S,
     SESSION_CLEANUP_DELAY_S,
     ARCHIVED_RETENTION_S,
+    WS_STALE_THRESHOLD_S,
 )
 from services.session_engine import SessionState
 from ws_feed_service.config import SYMBOLS, TIMEFRAMES, ORDERBOOK_KEY_PREFIX
@@ -225,16 +226,88 @@ def _register_writer(writer: RedisWriter, registry: TokenRegistry) -> None:
     writer.register_session_tokens(registry.get_all_token_mapping(), fresh_sessions)
 
 
+def _ob_needs_repair(
+    sync_redis,
+    sym: str,
+    tf: str,
+    direction: str,
+    candle_open: int,
+    stale_threshold: float,
+) -> bool:
+    """
+    Return True if the orderbook key is missing OR stale (updated_at older than threshold).
+
+    Checks both session-keyed and legacy keys — returns False if either has fresh data.
+    """
+    now = time.time()
+    for key in (
+        f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}",
+        f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}",
+    ):
+        try:
+            updated_at = sync_redis.hget(key, "updated_at")
+            if updated_at is not None:
+                age = now - float(updated_at)
+                if age < stale_threshold:
+                    return False  # fresh enough
+        except Exception:
+            continue
+    return True
+
+
+def _repair_orderbook(
+    sync_redis,
+    pm,
+    sym: str,
+    tf: str,
+    direction: str,
+    candle_open: int,
+    token_id: str,
+) -> bool:
+    """Fetch orderbook from REST and write to Redis. Returns True on success."""
+    import json as _json
+    from config.timing import PRICE_CACHE_TTL_S
+
+    _, _, bids, asks = pm._fetch_book_depth(token_id)
+    if not bids and not asks:
+        return False
+
+    bids_json = _json.dumps([[float(p), float(s)] for p, s in bids])
+    asks_json = _json.dumps([[float(p), float(s)] for p, s in asks])
+    ob_mapping = {
+        "bids": bids_json,
+        "asks": asks_json,
+        "updated_at": str(time.time()),
+    }
+    ob_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}"
+    sync_redis.hset(ob_key, mapping=ob_mapping)
+    sync_redis.expire(ob_key, PRICE_CACHE_TTL_S)
+
+    # Also write legacy key for current session
+    period_s = TF_SECONDS[tf]
+    now_ts = int(time.time())
+    current_open = now_ts - (now_ts % period_s)
+    if candle_open == current_open:
+        legacy_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
+        sync_redis.hset(legacy_key, mapping=ob_mapping)
+        sync_redis.expire(legacy_key, PRICE_CACHE_TTL_S)
+
+    return True
+
+
 def check_orderbook_keys(
     sm: SessionManager,
     sync_redis,
     registry: TokenRegistry,
+    stale_threshold: float = WS_STALE_THRESHOLD_S,
 ) -> tuple[int, int]:
     """
     Periodic health check (every 5s): verify every non-ARCHIVED session has
-    its 2 expected orderbook Redis keys (UP + DOWN per session).
+    its 2 expected orderbook Redis keys (UP + DOWN per session) with fresh data.
 
-    Missing keys are re-seeded from Polymarket REST API.
+    A key is considered stale if its ``updated_at`` is older than
+    ``stale_threshold`` seconds (default: WS_STALE_THRESHOLD_S = 15s).
+    Missing or stale keys are re-seeded from Polymarket REST API.
 
     Returns (checked_sessions, repaired_keys).
     """
@@ -252,21 +325,20 @@ def check_orderbook_keys(
             candle_open = session.candle_open
             checked += 1
 
-            missing_dirs: list[str] = []
+            stale_dirs: list[str] = []
             for direction in ("UP", "DOWN"):
-                key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}"
                 try:
-                    if not sync_redis.exists(key):
-                        missing_dirs.append(direction)
+                    if _ob_needs_repair(sync_redis, sym, tf, direction, candle_open, stale_threshold):
+                        stale_dirs.append(direction)
                 except Exception as exc:
-                    logger.warning("OB health: Redis check failed %s: %s", key, exc)
+                    logger.warning("OB health: Redis check failed %s:%s:%s:%d: %s", sym, tf, direction, candle_open, exc)
 
-            if not missing_dirs:
+            if not stale_dirs:
                 continue
 
             logger.warning(
-                "OB health: session %s missing %d key(s): %s",
-                session.session_id, len(missing_dirs), missing_dirs,
+                "OB health: session %s — %d stale/missing key(s): %s",
+                session.session_id, len(stale_dirs), stale_dirs,
             )
 
             # Lazy-init REST client
@@ -279,7 +351,7 @@ def check_orderbook_keys(
                     logger.error("OB health: cannot create PolymarketClient: %s", exc)
                     break
 
-            for direction in missing_dirs:
+            for direction in stale_dirs:
                 token_id = session.tokens.get(direction)
                 if not token_id:
                     token_id = registry.get_token_id(sym, tf, direction)
@@ -288,36 +360,12 @@ def check_orderbook_keys(
                     continue
 
                 try:
-                    _, _, bids, asks = _pm._fetch_book_depth(token_id)
-                    if not bids and not asks:
-                        continue
-
-                    import json as _json
-                    bids_json = _json.dumps([[float(p), float(s)] for p, s in bids])
-                    asks_json = _json.dumps([[float(p), float(s)] for p, s in asks])
-                    ob_mapping = {
-                        "bids": bids_json,
-                        "asks": asks_json,
-                        "updated_at": str(time.time()),
-                    }
-                    ob_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_open}"
-                    sync_redis.hset(ob_key, mapping=ob_mapping)
-                    sync_redis.expire(ob_key, 120)
-
-                    # Also write legacy key for current session
-                    period_s = TF_SECONDS[tf]
-                    now_ts = int(time.time())
-                    current_open = now_ts - (now_ts % period_s)
-                    if candle_open == current_open:
-                        legacy_key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
-                        sync_redis.hset(legacy_key, mapping=ob_mapping)
-                        sync_redis.expire(legacy_key, 120)
-
-                    repaired += 1
-                    logger.info(
-                        "OB health: repaired %s:%s:%s:%d (%d bids, %d asks)",
-                        sym, tf, direction, candle_open, len(bids), len(asks),
-                    )
+                    if _repair_orderbook(sync_redis, _pm, sym, tf, direction, candle_open, token_id):
+                        repaired += 1
+                        logger.info(
+                            "OB health: refreshed %s:%s:%s:%d (stale>%ds)",
+                            sym, tf, direction, candle_open, stale_threshold,
+                        )
                 except Exception as exc:
                     logger.error("OB health: REST fetch failed %s:%s:%s:%d — %s", sym, tf, direction, candle_open, exc)
     finally:

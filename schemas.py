@@ -123,6 +123,9 @@ class BOResponse(BaseModel):
     requested_quantity: Optional[float] = None
     filled_quantity:    Optional[float] = None
     unfilled_quantity:  Optional[float] = None
+    # Dual-mode fill source
+    fill_source:   Optional[str] = None   # 'REST' or 'WS'
+    pair_id:       Optional[int] = None   # links REST↔WS pair
 
     model_config = {"from_attributes": True}
 
@@ -148,6 +151,12 @@ class BOResponse(BaseModel):
             self.unfilled_quantity = round(self.requested_quantity - self.filled_quantity, 8)
 
         return self
+
+
+class DualModeResponse(BaseModel):
+    """Response for MARKET orders: contains both REST and WS fill results."""
+    rest_order: Optional[BOResponse] = None
+    ws_order:   Optional[BOResponse] = None
 
 
 class BOStats(BaseModel):
@@ -254,6 +263,7 @@ class BotBalanceEntry(BaseModel):
     trade_count:    Optional[int] = None
     win_count:      Optional[int] = None
     loss_count:     Optional[int] = None
+    fill_source:    Optional[str] = None   # 'REST' or 'WS'
 
 
 class BalanceHistoryGrouped(BaseModel):
@@ -355,6 +365,8 @@ class BotResponse(BaseModel):
     status:          str = "ACTIVE"
     initial_balance: float
     balance:         float
+    balance_rest:    Optional[float] = None
+    balance_ws:      Optional[float] = None
     created_at:      Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -368,6 +380,8 @@ class BotPublic(BaseModel):
     status:          str = "ACTIVE"
     initial_balance: float
     balance:         float
+    balance_rest:    Optional[float] = None
+    balance_ws:      Optional[float] = None
     user_id:         Optional[int] = None
     owner_name:      Optional[str] = None
     user_initial_balance: Optional[float] = None  # user's total pool balance

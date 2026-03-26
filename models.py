@@ -50,7 +50,10 @@ class Bot(Base):
     api_key         = Column(String(64),  unique=True, nullable=False, index=True)
     is_active       = Column(Boolean, default=True)
     initial_balance = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)
-    balance         = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)   # current equity
+    balance         = Column(Numeric(18, 8, asdecimal=False), default=INITIAL_BALANCE)   # current equity (= balance_rest for backward compat)
+    balance_rest    = Column(Numeric(18, 8, asdecimal=False), nullable=True)             # REST API fill pool
+    balance_ws      = Column(Numeric(18, 8, asdecimal=False), nullable=True)             # WS Feed fill pool
+    ws_initial_balance = Column(Numeric(18, 8, asdecimal=False), nullable=True)          # WS pool starting balance (= balance at migration time)
     status          = Column(String(10), default="ACTIVE", nullable=False, server_default=text("'ACTIVE'"))
     user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at      = Column(DateTime(timezone=True), default=_now)
@@ -122,6 +125,7 @@ class BotSettlementLedger(Base):
 
     settled_at     = Column(DateTime(timezone=True), nullable=True)
     recorded_at    = Column(DateTime(timezone=True), default=_now)
+    fill_source    = Column(String(4), nullable=True)              # 'REST' or 'WS' (None = legacy combined)
 
 
 class UserBalanceHistory(Base):
@@ -224,6 +228,10 @@ class BinaryOption(Base):
     session_offset  = Column(Integer, default=0)          # 0 = current session, 1 = next session
     session_id      = Column(String(64), nullable=True, index=True)   # e.g. "BTC:M5:1709313000"
     candle_open     = Column(Integer, nullable=True)                  # Unix ts of candle open boundary
+
+    # ── Dual-mode fill source ──────────────────────────────────────────────
+    fill_source     = Column(String(4), nullable=True, index=True)   # 'REST' or 'WS'
+    pair_id         = Column(Integer, nullable=True)                  # links REST↔WS pair (REST order's ID)
 
 
 # ── Achievement System ─────────────────────────────────────────────────────
