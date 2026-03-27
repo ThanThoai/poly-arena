@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import time as _time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -61,7 +62,8 @@ class MarketSnapshot:
     spread: Optional[Decimal] = None
     book_hash: Optional[str] = None
 
-    last_updated: int = 0  # timestamp ms
+    last_updated: int = 0       # timestamp ms (from WS event, kept for Redis compat)
+    last_updated_ts: float = 0.0  # local Unix timestamp (s) — set only when bids/asks actually change
     is_resolved: bool = False
 
     # Stats
@@ -108,6 +110,25 @@ class MarketSnapshot:
             self.spread = self.best_ask - self.best_bid
         else:
             self.spread = None
+
+
+@dataclass
+class _SnapshotView:
+    """Immutable snapshot copy returned by get_snapshot() — safe to read outside the lock."""
+    token_id: str
+    last_updated_ts: float
+    asks: list  # [(price, size), ...] ascending
+    bids: list  # [(price, size), ...] descending
+    best_bid: Optional[Decimal]
+    best_ask: Optional[Decimal]
+    spread: Optional[Decimal]
+    is_resolved: bool
+
+    def get_asks(self, depth: int = 20) -> list:
+        return self.asks[:depth]
+
+    def get_bids(self, depth: int = 20) -> list:
+        return self.bids[:depth]
 
 
 def _dec(value) -> Decimal:
@@ -200,6 +221,7 @@ class SnapshotStore:
 
             snap.book_hash = event.get("hash")
             snap.last_updated = timestamp
+            snap.last_updated_ts = _time.time()
             snap.book_event_count += 1
             snap._update_bbo()
 
@@ -230,27 +252,37 @@ class SnapshotStore:
                     continue
 
                 # Apply change: size=0 means level removed
+                book_changed = False
                 if side.upper() in ("BUY", "BID"):
                     if size == 0:
-                        snap.bids.pop(-price, None)
+                        if snap.bids.pop(-price, None) is not None:
+                            book_changed = True
                     else:
                         snap.bids[-price] = size
+                        book_changed = True
                 elif side.upper() in ("SELL", "ASK"):
                     if size == 0:
-                        snap.asks.pop(price, None)
+                        if snap.asks.pop(price, None) is not None:
+                            book_changed = True
                     else:
                         snap.asks[price] = size
+                        book_changed = True
 
-                # Use best_bid/best_ask from event if available (more reliable)
-                if "best_bid" in change:
-                    snap.best_bid = _dec(change["best_bid"])
-                if "best_ask" in change:
-                    snap.best_ask = _dec(change["best_ask"])
-                if snap.best_bid is not None and snap.best_ask is not None:
-                    snap.spread = snap.best_ask - snap.best_bid
+                # Use best_bid/best_ask from event if available, else recalc from book
+                if "best_bid" in change or "best_ask" in change:
+                    if "best_bid" in change:
+                        snap.best_bid = _dec(change["best_bid"]) or None
+                    if "best_ask" in change:
+                        snap.best_ask = _dec(change["best_ask"]) or None
+                    if snap.best_bid is not None and snap.best_ask is not None:
+                        snap.spread = snap.best_ask - snap.best_bid
+                elif book_changed:
+                    snap._update_bbo()
 
                 snap.book_hash = change.get("hash", snap.book_hash)
                 snap.last_updated = timestamp
+                if book_changed:
+                    snap.last_updated_ts = _time.time()
                 snap.price_change_count += 1
 
             self._emit(token_id, "price_change")
@@ -299,9 +331,12 @@ class SnapshotStore:
             snap = self._store.get(token_id)
             if snap is None:
                 return
-            snap.best_bid = _dec(event.get("best_bid", 0))
-            snap.best_ask = _dec(event.get("best_ask", 0))
-            snap.spread = _dec(event.get("spread", 0))
+            snap.best_bid = _dec(event.get("best_bid", 0)) or None
+            snap.best_ask = _dec(event.get("best_ask", 0)) or None
+            if "spread" in event:
+                snap.spread = _dec(event["spread"])
+            elif snap.best_bid is not None and snap.best_ask is not None:
+                snap.spread = snap.best_ask - snap.best_bid
             snap.last_updated = int(event.get("timestamp", 0))
 
         self._emit(token_id, "best_bid_ask")
@@ -351,6 +386,7 @@ class SnapshotStore:
 
                 snap.spread = Decimal("0")
                 snap.last_updated = timestamp
+                snap.last_updated_ts = _time.time()
 
         for token_id in all_tokens:
             self._emit(token_id, "market_resolved")
@@ -359,7 +395,21 @@ class SnapshotStore:
 
     def get_snapshot(self, token_id: str) -> Optional[MarketSnapshot]:
         with self._lock:
-            return self._store.get(token_id)
+            snap = self._store.get(token_id)
+            if snap is None:
+                return None
+            # Return a lightweight view: copy scalar fields + asks list under lock
+            # so the fill path never reads partially-rebuilt book data.
+            return _SnapshotView(
+                token_id=snap.token_id,
+                last_updated_ts=snap.last_updated_ts,
+                asks=snap.get_asks(depth=50),
+                bids=snap.get_bids(depth=50),
+                best_bid=snap.best_bid,
+                best_ask=snap.best_ask,
+                spread=snap.spread,
+                is_resolved=snap.is_resolved,
+            )
 
     def get_orderbook(
         self, token_id: str, depth: int = 10,
@@ -412,3 +462,21 @@ class SnapshotStore:
         if market_id and not snap.market_id:
             snap.market_id = market_id
         return snap
+
+
+# ── Module-level singleton ────────────────────────────────────────────────────
+# Shared between WsFeedPoller (writer) and API routers (reader).
+# Set by WsFeedPoller.__init__(); read by _fill_market_from_ws_snapshot().
+
+_global_store: Optional[SnapshotStore] = None
+
+
+def get_store() -> Optional[SnapshotStore]:
+    """Return the global SnapshotStore instance, or None if not yet initialized."""
+    return _global_store
+
+
+def set_store(store: SnapshotStore) -> None:
+    """Register the global SnapshotStore instance (called by WsFeedPoller)."""
+    global _global_store
+    _global_store = store

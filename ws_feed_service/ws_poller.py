@@ -37,7 +37,7 @@ from typing import Optional
 from services.ws_feed import PolymarketFeed, PolymarketFeedPool
 from services.session_manager import SessionManager
 from services.session_engine import SessionState
-from services.snapshot_store import SnapshotStore
+from services.snapshot_store import SnapshotStore, set_store
 from services.volume_tracker import record_trade_volume
 from config.timing import WS_STALE_THRESHOLD_S, WS_RECONNECT_STALE_MS, REST_POLL_TIMEOUT_S
 
@@ -72,6 +72,7 @@ class WsFeedPoller:
             pool_size=pool_size,
         )
         self._store = SnapshotStore()  # in-memory full-depth orderbook per token
+        set_store(self._store)  # register as global singleton for API fill path
         self._event_count = 0
         self._trade_count = 0
         # Track last WS update time per token for staleness detection
@@ -87,7 +88,6 @@ class WsFeedPoller:
         )
         self._stale_check_task = asyncio.ensure_future(self._stale_check_loop())
         self._reconnect_monitor_task = asyncio.ensure_future(self._reconnect_monitor_loop())
-        self._ts_refresh_task = asyncio.ensure_future(self._ts_refresh_loop())
         await self._feed.start()
 
     async def stop(self) -> None:
@@ -96,8 +96,6 @@ class WsFeedPoller:
             self._stale_check_task.cancel()
         if hasattr(self, '_reconnect_monitor_task') and self._reconnect_monitor_task is not None:
             self._reconnect_monitor_task.cancel()
-        if hasattr(self, '_ts_refresh_task') and self._ts_refresh_task is not None:
-            self._ts_refresh_task.cancel()
         await self._feed.stop()
         logger.info(
             "WsFeedPoller stopped after %d event(s), %d REST fallback(s)",
@@ -107,6 +105,21 @@ class WsFeedPoller:
     def add_tokens(self, token_ids: list[str]) -> None:
         """Add new token IDs to the live WebSocket subscription."""
         self._feed.add_tokens(token_ids)
+
+    def remove_tokens(self, token_ids: list[str]) -> None:
+        """Remove expired token IDs: unsubscribe from WS, evict from SnapshotStore."""
+        if not token_ids:
+            return
+        # 1. Stop receiving WS events for these tokens
+        self._feed.remove_tokens(token_ids)
+        # 2. Evict from SnapshotStore (free memory)
+        with self._store._lock:
+            for t in token_ids:
+                self._store._store.pop(t, None)
+        # 3. Remove staleness tracking
+        for t in token_ids:
+            self._last_ws_update.pop(t, None)
+        logger.info("Removed %d expired token(s) from SnapshotStore + WS subscription", len(token_ids))
 
     # ── Event handling ────────────────────────────────────────────────────
 
@@ -156,12 +169,6 @@ class WsFeedPoller:
             if asset_id:
                 self._touch_token(asset_id)
                 self._trade_count += 1
-                # Trade doesn't change bids/asks but we still touch updated_at
-                # so the Redis snapshot timestamp stays fresh.
-                if self._writer is not None:
-                    asyncio.ensure_future(
-                        self._writer.touch_orderbook_ts(asset_id),
-                    )
                 self._handle_last_trade(event)
                 if self._trade_count % 500 == 0:
                     logger.info(
@@ -198,15 +205,15 @@ class WsFeedPoller:
             for p, s in snap.asks.items()
         ]
 
-        # Apply full snapshot to matching engine sessions
-        sessions = self._sm.get_sessions_for_token(token_id)
-        for session in sessions:
-            if session.state == SessionState.ARCHIVED:
-                continue
-            book = session.get_book_for_token(token_id)
-            if book is not None:
-                book.apply_snapshot(bids_raw, asks_raw)
-                session.try_match_pending(book)
+        # [DISABLED] ME matching temporarily disabled
+        # sessions = self._sm.get_sessions_for_token(token_id)
+        # for session in sessions:
+        #     if session.state == SessionState.ARCHIVED:
+        #         continue
+        #     book = session.get_book_for_token(token_id)
+        #     if book is not None:
+        #         book.apply_snapshot(bids_raw, asks_raw)
+        #         session.try_match_pending(book)
 
         # Write to Redis
         if self._writer is not None:
@@ -216,11 +223,6 @@ class WsFeedPoller:
 
             asyncio.ensure_future(
                 self._writer.update_orderbook(token_id, dec_bids, dec_asks),
-            )
-            # Always refresh updated_at even when data is unchanged (dedup
-            # in update_orderbook may skip the full write).
-            asyncio.ensure_future(
-                self._writer.touch_orderbook_ts(token_id),
             )
 
             # Update BBO price key
@@ -250,16 +252,16 @@ class WsFeedPoller:
             )
             self._record_volume(asset_id, float(price), float(size))
 
-        # Apply to matching engine sessions — record_trade + bracket monitoring
-        sessions = self._sm.get_sessions_for_token(asset_id)
-        for session in sessions:
-            if session.state == SessionState.ARCHIVED:
-                continue
-            book = session.get_book_for_token(asset_id)
-            if book is None:
-                continue
-            book.record_trade(price=price, size=size, side=side)
-            book.monitor_bracket_orders()
+        # [DISABLED] ME matching/bracket monitoring temporarily disabled
+        # sessions = self._sm.get_sessions_for_token(asset_id)
+        # for session in sessions:
+        #     if session.state == SessionState.ARCHIVED:
+        #         continue
+        #     book = session.get_book_for_token(asset_id)
+        #     if book is None:
+        #         continue
+        #     book.record_trade(price=price, size=size, side=side)
+        #     book.monitor_bracket_orders()
 
     def _record_volume(self, token_id: str, price: float, size: float) -> None:
         """Record trade volume for all sessions mapped to this token."""
@@ -294,45 +296,6 @@ class WsFeedPoller:
                     price=price, size=size,
                 )
             )
-
-    # ── Timestamp refresh loop ──────────────────────────────────────────────
-
-    _TS_REFRESH_INTERVAL_S = 0.010  # 10ms — keeps updated_at fresh for WS fill window
-
-    async def _ts_refresh_loop(self) -> None:
-        """Continuously touch updated_at on all active orderbook keys.
-
-        The WS fill window [+20ms, +50ms] requires ``updated_at`` to be
-        written AFTER the order arrives.  WS events alone may not arrive
-        frequently enough to land inside a 30ms window.  This loop
-        refreshes the timestamp every 10ms so the window always finds a
-        fresh value.
-        """
-        if self._writer is None:
-            return
-
-        # Give WS time to populate initial data
-        await asyncio.sleep(2.0)
-
-        cached_tokens: list[str] = []
-        refresh_counter = 0
-
-        try:
-            while True:
-                # Refresh token list every ~1s (100 iterations × 10ms)
-                if refresh_counter % 100 == 0:
-                    cached_tokens = list(self._get_all_active_tokens())
-                refresh_counter += 1
-
-                for token_id in cached_tokens:
-                    try:
-                        await self._writer.touch_orderbook_ts(token_id)
-                    except Exception:
-                        pass
-
-                await asyncio.sleep(self._TS_REFRESH_INTERVAL_S)
-        except asyncio.CancelledError:
-            pass
 
     # ── Staleness guard ────────────────────────────────────────────────────
 
@@ -443,25 +406,24 @@ class WsFeedPoller:
         for k in stale_keys:
             del self._last_ws_update[k]
 
-    # ── Fast reconnect monitor (1000ms staleness) ─────────────────────
+    # ── Stale guard + SnapshotStore restart (>1s no event) ───────────────
 
-    _RECONNECT_COOLDOWN_S = 30.0  # min seconds between forced reconnects
-    _RECONNECT_MIN_STALE_TOKENS = 3  # need at least N tokens stale to trigger
+    _RECONNECT_COOLDOWN_S = 5.0   # min seconds between forced reconnects
 
     async def _reconnect_monitor_loop(self) -> None:
         """
-        Fast check every 1s: if a significant portion of active tokens that
-        HAVE received data before go stale (>WS_RECONNECT_STALE_MS), force
-        reconnect.
+        Check every 1s: if ANY known token is stale >WS_RECONNECT_STALE_MS (1s),
+        clear its stale snapshots and force-reconnect ALL 3 WS connections.
 
-        Tokens that have NEVER received a WS event are excluded — they are
-        handled by the 15s REST fallback instead.  This prevents a single
-        dead token from triggering a reconnect storm that disrupts all
-        other tokens.
+        Reconnect causes Polymarket to re-send full ``book`` events for all
+        subscribed tokens → SnapshotStore rebuilds from scratch.
+
+        Tokens that have NEVER received a WS event are excluded (handled by
+        the 15s REST fallback instead).
         """
         threshold_s = WS_RECONNECT_STALE_MS / 1000.0
-        # Give WS time to connect and deliver first events
-        await asyncio.sleep(max(5.0, threshold_s * 3))
+        # Give WS time to connect and deliver first events before monitoring
+        await asyncio.sleep(max(5.0, threshold_s * 5))
 
         last_reconnect = 0.0
 
@@ -471,8 +433,7 @@ class WsFeedPoller:
                     now = time.monotonic()
                     active_tokens = self._get_all_active_tokens()
 
-                    # Only consider tokens that have received at least one event
-                    stale_count = 0
+                    stale_tokens: list[str] = []
                     known_count = 0
                     worst_age_ms = 0.0
                     worst_token = ""
@@ -480,28 +441,49 @@ class WsFeedPoller:
                     for token_id in active_tokens:
                         last = self._last_ws_update.get(token_id, 0.0)
                         if last == 0.0:
-                            continue  # never received — skip, REST fallback handles it
+                            continue  # never received — REST fallback handles it
                         known_count += 1
                         age_ms = (now - last) * 1000
                         if age_ms > WS_RECONNECT_STALE_MS:
-                            stale_count += 1
+                            stale_tokens.append(token_id)
                             if age_ms > worst_age_ms:
                                 worst_age_ms = age_ms
                                 worst_token = token_id
 
                     cooldown_ok = (now - last_reconnect) >= self._RECONNECT_COOLDOWN_S
-                    enough_stale = stale_count >= min(self._RECONNECT_MIN_STALE_TOKENS, max(1, known_count // 2))
 
-                    if stale_count > 0 and enough_stale and cooldown_ok:
+                    if stale_tokens and cooldown_ok:
                         logger.warning(
-                            "WsFeedPoller: %d/%d known token(s) stale (worst=%s %.0fms) — forcing WS reconnect",
-                            stale_count, known_count, worst_token[:16], worst_age_ms,
+                            "WsFeedPoller: %d/%d token(s) stale >%dms (worst=%s %.0fms) "
+                            "— clearing snapshots + restarting all %d WS streams",
+                            len(stale_tokens), known_count, WS_RECONNECT_STALE_MS,
+                            worst_token[:16], worst_age_ms, self._pool_size,
                         )
+
+                        # Clear stale snapshots so fills don't use outdated data
+                        # while reconnect is in progress
+                        with self._store._lock:
+                            for token_id in stale_tokens:
+                                snap = self._store._store.get(token_id)
+                                if snap is not None:
+                                    snap.bids.clear()
+                                    snap.asks.clear()
+                                    snap.best_bid = None
+                                    snap.best_ask = None
+                                    snap.spread = None
+                                    snap.last_updated_ts = 0.0
+
+                        # Force all 3 WS connections to reconnect
+                        # Polymarket will re-send book events → SnapshotStore rebuilds
                         await self._feed.force_reconnect(
-                            reason=f"{stale_count}/{known_count} tokens stale, worst {worst_token[:16]} {worst_age_ms:.0f}ms",
+                            reason=(
+                                f"{len(stale_tokens)}/{known_count} tokens stale, "
+                                f"worst {worst_token[:16]} {worst_age_ms:.0f}ms"
+                            ),
                         )
                         last_reconnect = now
-                        await asyncio.sleep(5.0)
+                        # Wait before resuming checks to let reconnect complete
+                        await asyncio.sleep(3.0)
                         continue
 
                 except Exception as exc:

@@ -26,9 +26,7 @@ from services.token_registry import TokenRegistry
 from services.polymarket import PolymarketClient
 from ws_feed_service.redis_writer import RedisWriter
 from ws_feed_service.order_consumer import OrderConsumer
-from ws_feed_service.rest_poller import RestPoller, REST_POLL_INTERVAL
-
-from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S, REST_POLL_TIMEOUT_S, FEED_MODE
+from config.timing import TF_SECONDS as _TF_SECONDS, SESSION_LIFECYCLE_TICK_S, REST_POLL_TIMEOUT_S
 from ws_feed_service.session_lifecycle import ensure_future_sessions, cleanup_expired_sessions, purge_archived_sessions, check_orderbook_keys
 from database import SessionLocal
 from models import BinaryOption, BOResult
@@ -378,7 +376,7 @@ async def _recover_pending_orders(sync_redis, session_manager: SessionManager, r
 
 
 async def main():
-    log.info("Feed Service starting (%s mode)...", "WebSocket" if FEED_MODE == "websocket" else "REST polling")
+    log.info("Feed Service starting (WebSocket mode)...")
 
     # 1. Connect Redis
     async_redis = get_async_redis()
@@ -458,11 +456,20 @@ async def main():
                         await writer.update_price(token_id, best_ask, best_bid)
             asyncio.ensure_future(_seed())
 
-        # Notify poller / volume feed of new tokens so they can subscribe
-        if FEED_MODE == "websocket":
+        # Notify poller of new tokens so it can subscribe
+        if ids:
             poller.add_tokens(ids)
-        elif trade_volume_feed is not None:
+        if False and trade_volume_feed is not None:
             trade_volume_feed.add_tokens(ids)
+
+        # Schedule removal of old tokens after 15s (candle expired)
+        if old_token_ids:
+            _expired = list(old_token_ids)
+            async def _delayed_remove(token_ids: list[str]) -> None:
+                await asyncio.sleep(15)
+                poller.remove_tokens(token_ids)
+                log.info("Delayed removal: evicted %d expired token(s) after 15s", len(token_ids))
+            asyncio.ensure_future(_delayed_remove(_expired))
 
         log.info(
             "TokenRegistry pushed %d new token(s)%s, seeded %d book(s)",
@@ -474,60 +481,27 @@ async def main():
     registry._on_new_tokens = on_new_tokens
     await registry.start()
 
-    # 6. Start OrderConsumer daemon thread
-    consumer = OrderConsumer(sync_redis, session_manager, writer, loop, registry=registry)
-    consumer.start()
+    # 6. [DISABLED] OrderConsumer — ME/LIMIT/bracket temporarily disabled
+    # consumer = OrderConsumer(sync_redis, session_manager, writer, loop, registry=registry)
+    # consumer.start()
+    consumer = None  # placeholder for shutdown compatibility
 
-    # 6b. Wire up market_resolved callback on SessionManager
-    def _on_market_resolved(asset_id: str, resolved_orders: list) -> None:
-        bo_ids = []
-        for order in resolved_orders:
-            bo_id = consumer._order_to_bo.get(order.order_id)
-            if bo_id is not None:
-                bo_ids.append(bo_id)
-        if bo_ids:
-            asyncio.ensure_future(
-                writer.publish_market_resolved(
-                    asset_id=asset_id,
-                    winning_outcome="",
-                    bo_ids=bo_ids,
-                ),
-            )
-            log.info(
-                "Market resolved callback: asset_id=%s bo_ids=%s",
-                asset_id[:16], bo_ids,
-            )
+    # 6b. [DISABLED] market_resolved callback — ME disabled
+    # session_manager._on_market_resolved = _on_market_resolved
 
-    session_manager._on_market_resolved = _on_market_resolved
+    # 7. [DISABLED] Recovery — no ME orders to recover
+    # recovered = await _recover_pending_orders(sync_redis, session_manager, registry)
+    # if recovered:
+    #     log.info("Recovery: re-pushed %d pending order(s) to queue", recovered)
 
-    # 7. Recovery: re-push PENDING BOs to per-session queues
-    recovered = await _recover_pending_orders(sync_redis, session_manager, registry)
-    if recovered:
-        log.info("Recovery: re-pushed %d pending order(s) to queue", recovered)
-
-    # 8. Start poller — REST or WebSocket depending on FEED_MODE
-    trade_volume_feed = None  # initialized only in REST mode
-    if FEED_MODE == "websocket":
-        from ws_feed_service.ws_poller import WsFeedPoller
-        all_token_ids = registry.all_token_ids()
-        poller = WsFeedPoller(session_manager, writer, all_token_ids)
-        poller_task = asyncio.ensure_future(poller.start())
-        rest_pm_client = None
-        log.info("Using WebSocket feed mode (%d token(s))", len(all_token_ids))
-    else:
-        rest_pm_client = PolymarketClient(timeout=REST_POLL_TIMEOUT_S)
-        poller = RestPoller(
-            session_manager, writer=writer,
-            pm_client=rest_pm_client, interval=REST_POLL_INTERVAL,
-        )
-        poller_task = asyncio.ensure_future(poller.start())
-
-        # Start TradeVolumeFeed — lightweight WS connection for trade volume tracking
-        from ws_feed_service.trade_volume_feed import TradeVolumeFeed
-        all_token_ids = registry.all_token_ids()
-        trade_volume_feed = TradeVolumeFeed(writer, token_ids=all_token_ids)
-        asyncio.ensure_future(trade_volume_feed.start())
-        log.info("Using REST polling feed mode + TradeVolumeFeed (%d token(s))", len(all_token_ids))
+    # 8. Start WebSocket poller
+    from ws_feed_service.ws_poller import WsFeedPoller
+    all_token_ids = registry.all_token_ids()
+    poller = WsFeedPoller(session_manager, writer, all_token_ids)
+    poller_task = asyncio.ensure_future(poller.start())
+    rest_pm_client = None
+    trade_volume_feed = None
+    log.info("WsFeedPoller started (%d token(s))", len(all_token_ids))
 
     # 9. Periodic TTL expiry tick
     async def _expiry_tick():
@@ -603,10 +577,7 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
-    log.info(
-        "Feed Service running (%s mode) — press Ctrl+C to stop",
-        "WebSocket" if FEED_MODE == "websocket" else "REST polling",
-    )
+    log.info("Feed Service running (WebSocket mode) — press Ctrl+C to stop")
     await shutdown_event.wait()
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
@@ -618,7 +589,8 @@ async def main():
         rest_pm_client.close()
     if trade_volume_feed is not None:
         await trade_volume_feed.stop()
-    consumer.stop()
+    if consumer is not None:
+        consumer.stop()
     await registry.stop()
     session_manager.shutdown()
     await close_async_redis()

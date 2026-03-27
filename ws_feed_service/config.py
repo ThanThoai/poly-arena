@@ -36,8 +36,8 @@ STREAM_MAXLEN = 10_000              # XADD MAXLEN ~ for bracket exits
 
 # ── UI Future Sessions ──────────────────────────────────────────────────
 
-UI_FUTURE_SESSIONS = 0              # TEMP: disabled future sessions
-UI_PAST_SESSIONS = 0                # TEMP: disabled past sessions
+UI_FUTURE_SESSIONS = 1              # show 1 future session in orderbook UI
+UI_PAST_SESSIONS = 0                # no past sessions
 
 # ── Market constants ─────────────────────────────────────────────────────────
 

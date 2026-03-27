@@ -25,7 +25,7 @@ logging.basicConfig(
 log = logging.getLogger("test-bot")
 
 BASE = os.environ.get("API_URL", "http://localhost:8099/poly-arena")
-NUM_USERS = int(os.environ.get("NUM_USERS", "5"))
+NUM_USERS = int(os.environ.get("NUM_USERS", "1"))
 BOTS_PER_USER = int(os.environ.get("BOTS_PER_USER", "5"))
 TRADES_PER_TICK = int(os.environ.get("TRADES_PER_TICK", "15"))
 CASES_PER_TICK = int(os.environ.get("CASES_PER_TICK", "4"))
@@ -42,7 +42,7 @@ else:
 while len(BOT_PREFIX_LIST) < NUM_USERS:
     BOT_PREFIX_LIST.append(f"trader-{len(BOT_PREFIX_LIST)+1}")
 
-SYMBOLS = ["BTC", "ETH"]
+SYMBOLS = ["BTC"]
 TIMEFRAMES = ["M5", "M15"]
 FORECASTS = ["GREEN", "RED"]
 
@@ -349,7 +349,7 @@ BOT_PROFILES = [
         "limit_pct": 0.15,
         "ttl_pct": 0.10,
         "preferred_symbols": ["BTC"],
-        "preferred_tf": ["M5"],
+        "preferred_tf": ["M5", "M15"],
     },
     {
         "suffix": "conservative",
@@ -357,7 +357,7 @@ BOT_PROFILES = [
         "limit_pct": 0.50,
         "ttl_pct": 0.40,
         "preferred_symbols": ["BTC"],
-        "preferred_tf": ["M5"],
+        "preferred_tf": ["M5", "M15"],
     },
     {
         "suffix": "scalper",
@@ -365,7 +365,7 @@ BOT_PROFILES = [
         "limit_pct": 0.30,
         "ttl_pct": 0.60,
         "preferred_symbols": ["BTC"],
-        "preferred_tf": ["M5"],
+        "preferred_tf": ["M5", "M15"],
     },
     {
         "suffix": "whale",
@@ -373,7 +373,7 @@ BOT_PROFILES = [
         "limit_pct": 0.40,
         "ttl_pct": 0.20,
         "preferred_symbols": ["BTC"],
-        "preferred_tf": ["M5"],
+        "preferred_tf": ["M5", "M15"],
     },
     {
         "suffix": "random-m5",
@@ -381,7 +381,7 @@ BOT_PROFILES = [
         "limit_pct": 0.30,
         "ttl_pct": 0.30,
         "preferred_symbols": ["BTC"],
-        "preferred_tf": ["M5"],
+        "preferred_tf": ["M5", "M15"],
     },
 ]
 
@@ -402,7 +402,7 @@ A1_LIMIT_PRICES = [0.49, 0.50, 0.51]
 # ---------------------------------------------------------------------------
 
 RANDOM_TRADER_USER = os.environ.get("RANDOM_TRADER_USER", "random-trader")
-RANDOM_TRADER_NUM_BOTS = int(os.environ.get("RANDOM_TRADER_BOTS", "4"))
+RANDOM_TRADER_NUM_BOTS = int(os.environ.get("RANDOM_TRADER_BOTS", "0"))
 RANDOM_TRADER_INTERVAL = int(os.environ.get("RANDOM_TRADER_INTERVAL", "15"))  # seconds between orders
 
 RANDOM_BTC_PROFILES = [

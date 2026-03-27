@@ -115,14 +115,37 @@ class PolymarketFeed:
         if self._ws is not None and self._running:
             asyncio.create_task(self._resubscribe(self.token_ids))
 
+    def remove_tokens(self, token_ids: list[str]) -> None:
+        """
+        Remove token IDs from tracking and re-subscribe with the remaining list.
+
+        Polymarket WS treats each subscription as a full replacement, so we
+        send the updated list (without the removed tokens) to stop receiving
+        events for them.
+        """
+        to_remove = set(token_ids) & set(self.token_ids)
+        if not to_remove:
+            return
+        self.token_ids = [t for t in self.token_ids if t not in to_remove]
+        logger.info(
+            "Removed %d token(s) from feed (total: %d)",
+            len(to_remove), len(self.token_ids),
+        )
+        if self._ws is not None and self._running:
+            asyncio.create_task(self._resubscribe(self.token_ids))
+
     async def _resubscribe(self, token_ids: list[str]) -> None:
         """
         Send a full subscription message on the live WS connection.
 
         Polymarket WS treats each subscription as a REPLACEMENT, so we must
         always send the complete list of token IDs, not just new ones.
+        Sending an empty list causes "INVALID OPERATION" — skip in that case.
         """
         if self._ws is None:
+            return
+        if not token_ids:
+            logger.warning("_resubscribe called with empty token list — skipping to avoid INVALID OPERATION")
             return
         try:
             payload = {
@@ -181,16 +204,17 @@ class PolymarketFeed:
             self._last_pong = time.monotonic()
             logger.info("Connected to Polymarket Market Channel")
 
-            # Subscribe
-            payload = {
-                "assets_ids": self.token_ids,
-                "type": "market",
-                "custom_feature_enabled": True,
-            }
-            await ws.send(json.dumps(payload))
-            logger.info(
-                "Subscribed to %d asset(s)", len(self.token_ids)
-            )
+            # Subscribe (skip if no tokens — empty list causes INVALID OPERATION)
+            if not self.token_ids:
+                logger.warning("No token_ids to subscribe — waiting for add_tokens()")
+            else:
+                payload = {
+                    "assets_ids": self.token_ids,
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                }
+                await ws.send(json.dumps(payload))
+                logger.info("Subscribed to %d asset(s)", len(self.token_ids))
 
             # Start heartbeat
             self._ping_task = asyncio.create_task(self._heartbeat(ws))
@@ -314,6 +338,15 @@ class PolymarketFeedPool:
         self.token_ids.extend(new)
         for feed in self._feeds:
             feed.add_tokens(list(new))
+
+    def remove_tokens(self, token_ids: list[str]) -> None:
+        """Remove tokens from all connections in the pool and re-subscribe."""
+        to_remove = set(token_ids) & set(self.token_ids)
+        if not to_remove:
+            return
+        self.token_ids = [t for t in self.token_ids if t not in to_remove]
+        for feed in self._feeds:
+            feed.remove_tokens(list(to_remove))
 
     async def force_reconnect(self, reason: str = "stale data") -> None:
         """Force-reconnect ALL connections in the pool."""

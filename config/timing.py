@@ -71,7 +71,7 @@ BRPOP_TIMEOUT_S = 1             # OrderConsumer BRPOP blocking timeout
 
 # ── Session Lifecycle ──────────────────────────────────────────────────────
 
-REQUIRED_FUTURE_SESSIONS = 0       # TEMP: current session only (disabled +1, +2)
+REQUIRED_FUTURE_SESSIONS = 1       # prefetch 1 future candle only
 SESSION_PRE_CREATE_BUFFER_S = 20   # create next session 20s before candle boundary
 SESSION_CLEANUP_DELAY_S = 10       # cleanup 10s after session period ends
 ARCHIVED_RETENTION_S = 60          # keep ARCHIVED sessions for 60s after settling

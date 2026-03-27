@@ -781,26 +781,28 @@ async def _consume_market_resolved() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start bracket exit consumer (reads from Redis Stream)
-    consumer_task = asyncio.create_task(
-        _consume_bracket_exits(),
-        name="bracket-exit-consumer",
-    )
-    # Start order cancel consumer (reads from Redis Stream)
-    cancel_task = asyncio.create_task(
-        _consume_order_cancels(),
-        name="order-cancel-consumer",
-    )
-    # Start order fill consumer (syncs partial fills to DB)
-    fill_task = asyncio.create_task(
-        _consume_order_fills(),
-        name="order-fill-consumer",
-    )
-    # Start market resolved consumer (v2 spec Section 5)
-    resolved_task = asyncio.create_task(
-        _consume_market_resolved(),
-        name="market-resolved-consumer",
-    )
+    # [DISABLED] ME-related stream consumers temporarily disabled
+    # Only MARKET orders without brackets — no ME events to consume.
+    # consumer_task = asyncio.create_task(
+    #     _consume_bracket_exits(),
+    #     name="bracket-exit-consumer",
+    # )
+    # cancel_task = asyncio.create_task(
+    #     _consume_order_cancels(),
+    #     name="order-cancel-consumer",
+    # )
+    # fill_task = asyncio.create_task(
+    #     _consume_order_fills(),
+    #     name="order-fill-consumer",
+    # )
+    # resolved_task = asyncio.create_task(
+    #     _consume_market_resolved(),
+    #     name="market-resolved-consumer",
+    # )
+
+    # Start in-process WS snapshot feed for WS MARKET fills
+    from services.snapshot_feed import start_snapshot_feed, stop_snapshot_feed
+    await start_snapshot_feed()
 
     # Start orderbook broadcaster (single Redis pub/sub for all WS clients)
     await broadcaster.start()
@@ -819,16 +821,18 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown ────────────────────────────────────────────────────────────
+    await stop_snapshot_feed()
     await broadcaster.stop()
-    consumer_task.cancel()
-    cancel_task.cancel()
-    fill_task.cancel()
-    resolved_task.cancel()
-    for t in (consumer_task, cancel_task, fill_task, resolved_task):
-        try:
-            await t
-        except asyncio.CancelledError:
-            pass
+    # [DISABLED] ME stream consumers not running
+    # consumer_task.cancel()
+    # cancel_task.cancel()
+    # fill_task.cancel()
+    # resolved_task.cancel()
+    # for t in (consumer_task, cancel_task, fill_task, resolved_task):
+    #     try:
+    #         await t
+    #     except asyncio.CancelledError:
+    #         pass
     await close_async_redis()
 
 

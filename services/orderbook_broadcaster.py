@@ -22,9 +22,9 @@ from ws_feed_service.config import ORDERBOOK_KEY_PREFIX
 
 logger = logging.getLogger(__name__)
 
-_OB_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
+_OB_SYMBOLS = ["BTC"]
 _OB_DIRECTIONS = ["UP", "DOWN"]
-_OB_TIMEFRAMES = ["M5"]
+_OB_TIMEFRAMES = ["M5", "M15"]
 
 
 # ── Parsed message dataclass ────────────────────────────────────────────────

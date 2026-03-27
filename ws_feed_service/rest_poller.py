@@ -69,32 +69,33 @@ class RestPoller:
         logger.info("RestPoller stopped after %d poll cycles", self._poll_count)
 
     async def _poll_cycle(self) -> None:
-        """One poll cycle: fetch orderbooks, run matching, write to Redis."""
+        """One poll cycle: fetch orderbooks, write to Redis.
+        [DISABLED] ME matching/bracket monitoring temporarily disabled.
+        """
         all_tokens = self._get_all_active_tokens()
         if not all_tokens:
             return
 
         self._poll_count += 1
-        matching_tokens = self._get_matching_tokens()
+        # [DISABLED] matching_tokens = self._get_matching_tokens()
 
         # Fetch orderbooks individually via GET /book
         book_map = await self._fetch_books_individual(all_tokens)
 
-        # Process results
-        applied = 0
+        # Process results — write to Redis only (no ME matching)
         for token_id, (bids, asks) in book_map.items():
             # Always write to Redis for UI display
             await self._write_to_redis(token_id, bids, asks)
 
-            # Apply to matching engine only for tokens with active orders
-            if token_id in matching_tokens:
-                if self._apply_to_sessions(token_id, bids, asks):
-                    applied += 1
+            # [DISABLED] ME matching temporarily disabled
+            # if token_id in matching_tokens:
+            #     if self._apply_to_sessions(token_id, bids, asks):
+            #         applied += 1
 
         if self._poll_count % 50 == 0:
             logger.info(
-                "RestPoller: cycle #%d — polled %d token(s), matched %d",
-                self._poll_count, len(all_tokens), applied,
+                "RestPoller: cycle #%d — polled %d token(s) (ME disabled)",
+                self._poll_count, len(all_tokens),
             )
 
     async def _fetch_books_individual(self, token_ids: list[str]) -> dict[str, tuple[list[dict], list[dict]]]:

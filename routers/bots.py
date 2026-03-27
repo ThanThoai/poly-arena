@@ -503,17 +503,85 @@ def _bot_locked_margin(db: Session, bot_name: str) -> float:
     return bo_locked + fut_pos_margin + fut_ord_margin
 
 
-def _bot_pnl(db: Session, bot: Bot, trades: list) -> BotPnlResponse:
-    """Build a BotPnlResponse from Bot + settlement ledger + pending trades."""
-    initial = bot.initial_balance or 0
-    locked = _bot_locked_margin(db, bot.bot_name)
+def _batch_locked_margins(db: Session, bot_names: list[str]) -> dict[str, float]:
+    """Batch-fetch locked margins for all bots in 3 queries (instead of 3×N)."""
+    if not bot_names:
+        return {}
 
-    # Aggregate from settlement ledger
-    ledger_rows = (
-        db.query(BotSettlementLedger)
-        .filter(BotSettlementLedger.bot_name == bot.bot_name)
+    result: dict[str, float] = {n: 0.0 for n in bot_names}
+
+    # 1) BO pending amounts
+    bo_rows = (
+        db.query(BinaryOption.bot_name, sa_func.coalesce(sa_func.sum(BinaryOption.amount), 0.0))
+        .filter(BinaryOption.bot_name.in_(bot_names), BinaryOption.result == BOResult.PENDING)
+        .group_by(BinaryOption.bot_name)
         .all()
     )
+    for name, val in bo_rows:
+        result[name] += float(val or 0)
+
+    # 2) Futures open position margins
+    fp_rows = (
+        db.query(FuturesPosition.bot_name, sa_func.coalesce(sa_func.sum(FuturesPosition.margin), 0.0))
+        .filter(FuturesPosition.bot_name.in_(bot_names), FuturesPosition.status == FuturesPositionStatus.OPEN)
+        .group_by(FuturesPosition.bot_name)
+        .all()
+    )
+    for name, val in fp_rows:
+        result[name] += float(val or 0)
+
+    # 3) Futures pending order margins
+    fo_rows = (
+        db.query(
+            FuturesOrder.bot_name,
+            sa_func.coalesce(sa_func.sum(FuturesOrder.size * FuturesOrder.limit_price / FuturesOrder.leverage), 0.0),
+        )
+        .filter(FuturesOrder.bot_name.in_(bot_names), FuturesOrder.status == FuturesOrderStatus.PENDING)
+        .group_by(FuturesOrder.bot_name)
+        .all()
+    )
+    for name, val in fo_rows:
+        result[name] += float(val or 0)
+
+    return result
+
+
+def _batch_settlement_ledger(db: Session, bot_names: list[str]) -> dict[str, list]:
+    """Batch-fetch settlement ledger rows for all bots in 1 query."""
+    if not bot_names:
+        return {}
+    rows = (
+        db.query(BotSettlementLedger)
+        .filter(BotSettlementLedger.bot_name.in_(bot_names))
+        .all()
+    )
+    by_bot: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_bot[r.bot_name].append(r)
+    return by_bot
+
+
+def _bot_pnl(
+    db: Session,
+    bot: Bot,
+    trades: list,
+    locked: float | None = None,
+    ledger_rows: list | None = None,
+) -> BotPnlResponse:
+    """Build a BotPnlResponse from Bot + settlement ledger + pending trades.
+
+    Pass pre-fetched `locked` and `ledger_rows` to avoid per-bot queries.
+    """
+    initial = bot.initial_balance or 0
+    if locked is None:
+        locked = _bot_locked_margin(db, bot.bot_name)
+
+    if ledger_rows is None:
+        ledger_rows = (
+            db.query(BotSettlementLedger)
+            .filter(BotSettlementLedger.bot_name == bot.bot_name)
+            .all()
+        )
 
     if ledger_rows:
         wins = sum(r.win_count or 0 for r in ledger_rows)
@@ -568,19 +636,38 @@ def bots_pnl(
     if not bot_names:
         return []
 
+    # Batch all heavy queries upfront (3 + 1 + 1 = 5 queries total, not 4×N+1)
     trades = db.query(BinaryOption).filter(BinaryOption.bot_name.in_(bot_names)).all()
     trades_by_bot: dict[str, list] = {name: [] for name in bot_names}
     for t in trades:
         trades_by_bot.setdefault(t.bot_name, []).append(t)
 
+    locked_map = _batch_locked_margins(db, bot_names)
+    ledger_map = _batch_settlement_ledger(db, bot_names)
+
     return sorted(
-        [_bot_pnl(db, b, trades_by_bot.get(b.bot_name, [])) for b in bots],
+        [
+            _bot_pnl(
+                db, b,
+                trades_by_bot.get(b.bot_name, []),
+                locked=locked_map.get(b.bot_name, 0.0),
+                ledger_rows=ledger_map.get(b.bot_name, []),
+            )
+            for b in bots
+        ],
         key=lambda x: x.realized_pnl,
         reverse=True,
     )
 
 
-def _user_pnl(db: Session, user: User, bots: list[Bot], trades_by_bot: dict[str, list]) -> UserPnlResponse:
+def _user_pnl(
+    db: Session,
+    user: User,
+    bots: list[Bot],
+    trades_by_bot: dict[str, list],
+    locked_map: dict[str, float] | None = None,
+    ledger_map: dict[str, list] | None = None,
+) -> UserPnlResponse:
     """Build UserPnlResponse for a single user.
 
     Only ACTIVE bots contribute to realized_pnl — deleted bots' P&L has already
@@ -588,7 +675,14 @@ def _user_pnl(db: Session, user: User, bots: list[Bot], trades_by_bot: dict[str,
     trades here would double-count.
     """
     active_bots = [b for b in bots if getattr(b, 'is_active', True)]
-    active_pnls = [_bot_pnl(db, b, trades_by_bot.get(b.bot_name, [])) for b in active_bots]
+    active_pnls = [
+        _bot_pnl(
+            db, b, trades_by_bot.get(b.bot_name, []),
+            locked=locked_map.get(b.bot_name, 0.0) if locked_map is not None else None,
+            ledger_rows=ledger_map.get(b.bot_name, []) if ledger_map is not None else None,
+        )
+        for b in active_bots
+    ]
 
     wins = sum(bp.wins for bp in active_pnls)
     losses = sum(bp.losses for bp in active_pnls)
@@ -646,6 +740,10 @@ def user_pnl(
     for t in all_trades:
         trades_by_bot.setdefault(t.bot_name, []).append(t)
 
+    # Batch queries for all bots at once
+    locked_map = _batch_locked_margins(db, bot_names)
+    ledger_map = _batch_settlement_ledger(db, bot_names)
+
     bots_by_user: dict[int, list[Bot]] = {}
     for b in all_bots:
         if b.user_id:
@@ -656,7 +754,7 @@ def user_pnl(
         user_bots = bots_by_user.get(u.id, [])
         if not user_bots:
             continue
-        result.append(_user_pnl(db, u, user_bots, trades_by_bot))
+        result.append(_user_pnl(db, u, user_bots, trades_by_bot, locked_map, ledger_map))
 
     return sorted(result, key=lambda x: x.realized_pnl, reverse=True)
 
@@ -676,6 +774,9 @@ def user_pnl_all(db: Session = Depends(get_db)):
     for t in all_trades:
         trades_by_bot.setdefault(t.bot_name, []).append(t)
 
+    locked_map = _batch_locked_margins(db, bot_names)
+    ledger_map = _batch_settlement_ledger(db, bot_names)
+
     # Group bots by user
     bots_by_user: dict[int, list[Bot]] = {}
     for b in all_bots:
@@ -687,6 +788,6 @@ def user_pnl_all(db: Session = Depends(get_db)):
         user_bots = bots_by_user.get(u.id, [])
         if not user_bots:
             continue
-        result.append(_user_pnl(db, u, user_bots, trades_by_bot))
+        result.append(_user_pnl(db, u, user_bots, trades_by_bot, locked_map, ledger_map))
 
     return sorted(result, key=lambda x: x.realized_pnl, reverse=True)
