@@ -588,8 +588,14 @@ _WS_POLL_INTERVAL_S = 0.002  # poll Redis every 2ms while waiting
 
 def _read_ws_snapshot(
     symbol: str, timeframe: str, direction: str, candle_open: int,
-) -> tuple[list[list], float] | None:
-    """Read asks + updated_at from Redis. Returns None if unavailable."""
+) -> tuple[list[list], float, str] | None:
+    """Read asks + updated_at from Redis.
+
+    Returns ``(asks, updated_at_ts, key_used)`` or ``None`` if the key is
+    missing entirely.  When the key exists but ``asks`` is empty (no
+    liquidity on this side), returns an empty list so the caller can
+    distinguish "no data" from "no liquidity".
+    """
     from services.redis_client import get_sync_redis
     sr = get_sync_redis()
     for key in (
@@ -597,10 +603,9 @@ def _read_ws_snapshot(
         f"{ORDERBOOK_KEY_PREFIX}:{symbol}:{timeframe}:{direction}",
     ):
         data = sr.hgetall(key)
-        if data and "asks" in data and "updated_at" in data:
-            asks = json.loads(data["asks"])
-            if asks:
-                return asks, float(data["updated_at"])
+        if data and "updated_at" in data:
+            asks = json.loads(data["asks"]) if "asks" in data else []
+            return asks, float(data["updated_at"]), key
     return None
 
 

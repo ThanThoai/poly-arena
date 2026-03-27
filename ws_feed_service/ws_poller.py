@@ -5,6 +5,16 @@ Drop-in alternative to RestPoller: receives real-time orderbook events via
 WebSocket instead of polling REST every 200ms.  Same integration points:
 RedisWriter for price/depth publishing, SessionManager for matching.
 
+Maintains an in-memory SnapshotStore (same mechanism as demo_ws_snapshot.py)
+that incrementally builds full-depth orderbooks from all WS event types:
+  - ``book``: full snapshot reset
+  - ``price_change``: incremental delta updates
+  - ``best_bid_ask``: BBO update
+  - ``last_trade_price``: trade execution
+
+After each event the full book is synced to Redis (with fresh ``updated_at``)
+and applied to the matching engine.
+
 Includes a staleness guard: if a token hasn't received a WS event within
 WS_STALE_THRESHOLD_S (default 15s), a REST fallback fetch is triggered so
 every session stays fresh.
@@ -27,6 +37,7 @@ from typing import Optional
 from services.ws_feed import PolymarketFeed, PolymarketFeedPool
 from services.session_manager import SessionManager
 from services.session_engine import SessionState
+from services.snapshot_store import SnapshotStore
 from services.volume_tracker import record_trade_volume
 from config.timing import WS_STALE_THRESHOLD_S, WS_RECONNECT_STALE_MS, REST_POLL_TIMEOUT_S
 
@@ -35,12 +46,12 @@ logger = logging.getLogger(__name__)
 
 class WsFeedPoller:
     """
-    Wraps PolymarketFeed with the same integration as RestPoller:
-    applies orderbook snapshots to sessions and writes prices to Redis.
+    Wraps PolymarketFeed with SnapshotStore-based orderbook maintenance.
 
-    Runs a background staleness check every WS_STALE_THRESHOLD_S seconds.
-    Tokens that haven't received a WS update within the threshold are
-    refreshed via a single REST call (fallback).
+    All WS events are routed through a SnapshotStore instance that maintains
+    full-depth orderbooks per token.  After each update the current book state
+    is synced to Redis (always with a fresh ``updated_at``) and applied to the
+    matching engine for order matching / bracket monitoring.
     """
 
     POOL_SIZE = 3  # number of concurrent WS connections
@@ -60,6 +71,7 @@ class WsFeedPoller:
             on_event=self._on_event,
             pool_size=pool_size,
         )
+        self._store = SnapshotStore()  # in-memory full-depth orderbook per token
         self._event_count = 0
         self._trade_count = 0
         # Track last WS update time per token for staleness detection
@@ -75,6 +87,7 @@ class WsFeedPoller:
         )
         self._stale_check_task = asyncio.ensure_future(self._stale_check_loop())
         self._reconnect_monitor_task = asyncio.ensure_future(self._reconnect_monitor_loop())
+        self._ts_refresh_task = asyncio.ensure_future(self._ts_refresh_loop())
         await self._feed.start()
 
     async def stop(self) -> None:
@@ -83,6 +96,8 @@ class WsFeedPoller:
             self._stale_check_task.cancel()
         if hasattr(self, '_reconnect_monitor_task') and self._reconnect_monitor_task is not None:
             self._reconnect_monitor_task.cancel()
+        if hasattr(self, '_ts_refresh_task') and self._ts_refresh_task is not None:
+            self._ts_refresh_task.cancel()
         await self._feed.stop()
         logger.info(
             "WsFeedPoller stopped after %d event(s), %d REST fallback(s)",
@@ -99,122 +114,131 @@ class WsFeedPoller:
         """
         Dispatch a Polymarket WebSocket event.
 
-        Event types:
-        - ``book``: full orderbook snapshot → write to Redis + apply to sessions
-        - ``price_change``: incremental price update → write to Redis only
-        - ``last_trade_price``: trade execution → record in sessions + write to Redis
+        Every event is first processed by the SnapshotStore (which maintains
+        the full-depth orderbook in memory, exactly like demo_ws_snapshot.py).
+        Then the affected token's book is synced to Redis + matching engine.
         """
         event_type = event.get("event_type")
+
+        # 1. Update SnapshotStore — handles all 7 event types
+        self._store.handle_event(event)
+
+        # 2. Sync affected tokens to Redis + ME
         if event_type == "book":
-            self._handle_book(event)
+            asset_id = event.get("asset_id")
+            if asset_id:
+                self._touch_token(asset_id)
+                self._event_count += 1
+                self._sync_snapshot(asset_id)
+                if self._event_count % 200 == 0:
+                    logger.info(
+                        "WsFeedPoller: %d book events processed so far",
+                        self._event_count,
+                    )
+
         elif event_type == "price_change":
-            self._handle_price_change(event)
+            seen: set[str] = set()
+            for change in event.get("price_changes", []):
+                asset_id = change.get("asset_id")
+                if asset_id and asset_id not in seen:
+                    seen.add(asset_id)
+                    self._touch_token(asset_id)
+                    self._sync_snapshot(asset_id)
+
+        elif event_type == "best_bid_ask":
+            asset_id = event.get("asset_id")
+            if asset_id:
+                self._touch_token(asset_id)
+                self._sync_snapshot(asset_id)
+
         elif event_type == "last_trade_price":
-            self._handle_last_trade(event)
+            asset_id = event.get("asset_id")
+            if asset_id:
+                self._touch_token(asset_id)
+                self._trade_count += 1
+                # Trade doesn't change bids/asks but we still touch updated_at
+                # so the Redis snapshot timestamp stays fresh.
+                if self._writer is not None:
+                    asyncio.ensure_future(
+                        self._writer.touch_orderbook_ts(asset_id),
+                    )
+                self._handle_last_trade(event)
+                if self._trade_count % 500 == 0:
+                    logger.info(
+                        "WsFeedPoller: %d trade events processed so far",
+                        self._trade_count,
+                    )
 
     def _touch_token(self, token_id: str) -> None:
         """Record that a WS event was received for this token."""
         self._last_ws_update[token_id] = time.monotonic()
 
-    def _handle_book(self, event: dict) -> None:
-        """Handle a full orderbook snapshot from WebSocket."""
-        asset_id = event.get("asset_id")
-        if not asset_id:
+    # ── Snapshot sync ──────────────────────────────────────────────────────
+
+    def _sync_snapshot(self, token_id: str) -> None:
+        """Read full book from SnapshotStore → write to Redis + apply to ME.
+
+        This is the core of the SnapshotStore approach: the in-memory store
+        is always up-to-date (maintained incrementally from all WS events).
+        We read the current state and push it to both Redis and the matching
+        engine on every book-changing event.
+        """
+        snap = self._store.get_snapshot(token_id)
+        if snap is None:
             return
 
-        self._touch_token(asset_id)
-        self._event_count += 1
-
-        # Parse bids/asks from WS event
-        raw_bids = event.get("bids", [])
-        raw_asks = event.get("asks", [])
-
-        # Convert to Decimal tuples for RedisWriter
-        dec_bids = [
-            (Decimal(str(b["price"])), Decimal(str(b["size"])))
-            for b in sorted(raw_bids, key=lambda x: float(x["price"]), reverse=True)
+        # Convert SnapshotStore format → list[dict] for ME's apply_snapshot
+        # SnapshotStore bids use neg-key trick: key = -price
+        bids_raw = [
+            {"price": str(-neg_p), "size": str(s)}
+            for neg_p, s in snap.bids.items()
         ]
-        dec_asks = [
-            (Decimal(str(a["price"])), Decimal(str(a["size"])))
-            for a in sorted(raw_asks, key=lambda x: float(x["price"]))
+        asks_raw = [
+            {"price": str(p), "size": str(s)}
+            for p, s in snap.asks.items()
         ]
 
-        # Schedule async Redis writes on the event loop
+        # Apply full snapshot to matching engine sessions
+        sessions = self._sm.get_sessions_for_token(token_id)
+        for session in sessions:
+            if session.state == SessionState.ARCHIVED:
+                continue
+            book = session.get_book_for_token(token_id)
+            if book is not None:
+                book.apply_snapshot(bids_raw, asks_raw)
+                session.try_match_pending(book)
+
+        # Write to Redis
         if self._writer is not None:
+            # Convert to Decimal tuples for RedisWriter
+            dec_bids = [(-neg_p, s) for neg_p, s in snap.bids.items()]
+            dec_asks = list(snap.asks.items())
+
             asyncio.ensure_future(
-                self._writer.update_orderbook(asset_id, dec_bids, dec_asks),
+                self._writer.update_orderbook(token_id, dec_bids, dec_asks),
             )
-            best_ask = float(dec_asks[0][0]) if dec_asks else None
-            best_bid = float(dec_bids[0][0]) if dec_bids else None
+            # Always refresh updated_at even when data is unchanged (dedup
+            # in update_orderbook may skip the full write).
+            asyncio.ensure_future(
+                self._writer.touch_orderbook_ts(token_id),
+            )
+
+            # Update BBO price key
+            best_ask = float(snap.best_ask) if snap.best_ask else None
+            best_bid = float(snap.best_bid) if snap.best_bid else None
             if best_ask is not None:
                 asyncio.ensure_future(
-                    self._writer.update_price(asset_id, best_ask, best_bid),
+                    self._writer.update_price(token_id, best_ask, best_bid),
                 )
 
-        # Apply snapshot to matching engine sessions
-        self._apply_to_sessions(asset_id, raw_bids, raw_asks)
-
-        if self._event_count % 200 == 0:
-            logger.info(
-                "WsFeedPoller: %d book events processed so far", self._event_count,
-            )
-
-    def _handle_price_change(self, event: dict) -> None:
-        """Handle incremental price changes — update Redis prices + apply to sessions."""
-        if self._writer is None:
-            return
-
-        # Polymarket uses "price_changes" key: list of dicts
-        # Each: {asset_id, price, size, side, hash, best_bid, best_ask}
-        price_changes = event.get("price_changes", [])
-        if not price_changes:
-            return
-
-        # Group changes by asset_id and extract best bid/ask
-        for change in price_changes:
-            asset_id = change.get("asset_id")
-            if not asset_id:
-                continue
-
-            self._touch_token(asset_id)
-            best_bid = float(change["best_bid"]) if "best_bid" in change else None
-            best_ask = float(change["best_ask"]) if "best_ask" in change else None
-
-            if best_ask is not None or best_bid is not None:
-                asyncio.ensure_future(
-                    self._writer.update_price(asset_id, best_ask, best_bid),
-                )
-
-            # Apply incremental update to matching engine sessions
-            price = change.get("price")
-            size = change.get("size")
-            side = change.get("side", "")
-            if price is not None and size is not None:
-                # Map Polymarket sides to ShadowOrderbook sides
-                book_side = "bid" if side.upper() == "BUY" else "ask"
-                delta = [{"side": book_side, "price": price, "size": size}]
-                sessions = self._sm.get_sessions_for_token(asset_id)
-                for session in sessions:
-                    if session.state == SessionState.ARCHIVED:
-                        continue
-                    book = session.get_book_for_token(asset_id)
-                    if book is not None:
-                        book.apply_changes(delta)
+    # ── Trade handling ─────────────────────────────────────────────────────
 
     def _handle_last_trade(self, event: dict) -> None:
-        """
-        Handle a last_trade_price event — record trade in sessions and write to Redis.
-
-        Event fields: asset_id, price, size, side
-        Records the trade on the ShadowOrderbook (updates last_trade) and triggers
-        bracket monitoring (TP/SL may fire on trade price).
-        """
+        """Record trade in sessions, write to Redis, trigger bracket monitoring."""
         asset_id = event.get("asset_id")
         if not asset_id:
             return
 
-        self._touch_token(asset_id)
-        self._trade_count += 1
         price = event.get("price", "0")
         size = event.get("size", "0")
         side = event.get("side", "")
@@ -224,8 +248,6 @@ class WsFeedPoller:
             asyncio.ensure_future(
                 self._writer.update_last_trade(asset_id, price, size, side),
             )
-
-            # Record volume per session for this token
             self._record_volume(asset_id, float(price), float(size))
 
         # Apply to matching engine sessions — record_trade + bracket monitoring
@@ -238,11 +260,6 @@ class WsFeedPoller:
                 continue
             book.record_trade(price=price, size=size, side=side)
             book.monitor_bracket_orders()
-
-        if self._trade_count % 500 == 0:
-            logger.info(
-                "WsFeedPoller: %d trade events processed so far", self._trade_count,
-            )
 
     def _record_volume(self, token_id: str, price: float, size: float) -> None:
         """Record trade volume for all sessions mapped to this token."""
@@ -278,27 +295,57 @@ class WsFeedPoller:
                 )
             )
 
-    def _apply_to_sessions(
-        self, token_id: str, bids: list[dict], asks: list[dict],
-    ) -> None:
-        """Apply orderbook snapshot to matching engine sessions (same as RestPoller)."""
-        sessions = self._sm.get_sessions_for_token(token_id)
-        for session in sessions:
-            if session.state == SessionState.ARCHIVED:
-                continue
-            book = session.get_book_for_token(token_id)
-            if book is None:
-                continue
-            book.apply_snapshot(bids, asks)
-            session.try_match_pending(book)
+    # ── Timestamp refresh loop ──────────────────────────────────────────────
+
+    _TS_REFRESH_INTERVAL_S = 0.010  # 10ms — keeps updated_at fresh for WS fill window
+
+    async def _ts_refresh_loop(self) -> None:
+        """Continuously touch updated_at on all active orderbook keys.
+
+        The WS fill window [+20ms, +50ms] requires ``updated_at`` to be
+        written AFTER the order arrives.  WS events alone may not arrive
+        frequently enough to land inside a 30ms window.  This loop
+        refreshes the timestamp every 10ms so the window always finds a
+        fresh value.
+        """
+        if self._writer is None:
+            return
+
+        # Give WS time to populate initial data
+        await asyncio.sleep(2.0)
+
+        cached_tokens: list[str] = []
+        refresh_counter = 0
+
+        try:
+            while True:
+                # Refresh token list every ~1s (100 iterations × 10ms)
+                if refresh_counter % 100 == 0:
+                    cached_tokens = list(self._get_all_active_tokens())
+                refresh_counter += 1
+
+                for token_id in cached_tokens:
+                    try:
+                        await self._writer.touch_orderbook_ts(token_id)
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(self._TS_REFRESH_INTERVAL_S)
+        except asyncio.CancelledError:
+            pass
 
     # ── Staleness guard ────────────────────────────────────────────────────
 
     def _get_all_active_tokens(self) -> set[str]:
-        """Return all token_ids from non-archived sessions."""
+        """Return token_ids from ACTIVE sessions only (current candle).
+
+        PREFETCH sessions (future candles) are excluded because Polymarket
+        does not stream WS data for markets that haven't opened yet.
+        Including them would cause perpetual staleness and reconnect storms.
+        """
         tokens: set[str] = set()
         for engine in self._sm.list_sessions():
-            if engine.state in (SessionState.ACTIVE, SessionState.PREFETCH):
+            if engine.state == SessionState.ACTIVE:
                 for direction in engine.books:
                     token_id = engine.get_token_id(direction)
                     if token_id:
@@ -365,24 +412,17 @@ class WsFeedPoller:
                     None, self._rest_pm.fetch_book_raw, token_id,
                 )
 
-                # Write to Redis
-                if self._writer is not None:
-                    dec_bids = [
-                        (Decimal(str(b["price"])), Decimal(str(b["size"])))
-                        for b in sorted(bids, key=lambda x: float(x["price"]), reverse=True)
-                    ]
-                    dec_asks = [
-                        (Decimal(str(a["price"])), Decimal(str(a["size"])))
-                        for a in sorted(asks, key=lambda x: float(x["price"]))
-                    ]
-                    await self._writer.update_orderbook(token_id, dec_bids, dec_asks)
-                    best_ask = float(dec_asks[0][0]) if dec_asks else None
-                    best_bid = float(dec_bids[0][0]) if dec_bids else None
-                    if best_ask is not None:
-                        await self._writer.update_price(token_id, best_ask, best_bid)
+                # Feed into SnapshotStore as a synthetic book event
+                self._store.handle_event({
+                    "event_type": "book",
+                    "asset_id": token_id,
+                    "bids": bids,
+                    "asks": asks,
+                    "timestamp": int(time.time() * 1000),
+                })
 
-                # Apply to matching engine
-                self._apply_to_sessions(token_id, bids, asks)
+                # Sync to Redis + ME
+                self._sync_snapshot(token_id)
 
                 # Mark as refreshed so we don't re-fetch on next tick
                 self._touch_token(token_id)
@@ -405,45 +445,65 @@ class WsFeedPoller:
 
     # ── Fast reconnect monitor (1000ms staleness) ─────────────────────
 
+    _RECONNECT_COOLDOWN_S = 30.0  # min seconds between forced reconnects
+    _RECONNECT_MIN_STALE_TOKENS = 3  # need at least N tokens stale to trigger
+
     async def _reconnect_monitor_loop(self) -> None:
         """
-        Fast check every 1s: if ANY active token hasn't received a WS event
-        in WS_RECONNECT_STALE_MS (1000ms), force-reconnect the WebSocket.
+        Fast check every 1s: if a significant portion of active tokens that
+        HAVE received data before go stale (>WS_RECONNECT_STALE_MS), force
+        reconnect.
 
-        This catches scenarios where the WS connection is alive (PONG ok)
-        but data has stopped flowing for a specific market.
+        Tokens that have NEVER received a WS event are excluded — they are
+        handled by the 15s REST fallback instead.  This prevents a single
+        dead token from triggering a reconnect storm that disrupts all
+        other tokens.
         """
         threshold_s = WS_RECONNECT_STALE_MS / 1000.0
         # Give WS time to connect and deliver first events
-        await asyncio.sleep(max(3.0, threshold_s * 2))
+        await asyncio.sleep(max(5.0, threshold_s * 3))
+
+        last_reconnect = 0.0
 
         try:
             while True:
                 try:
                     now = time.monotonic()
                     active_tokens = self._get_all_active_tokens()
-                    if active_tokens:
-                        worst_age_ms = 0.0
-                        worst_token = ""
-                        for token_id in active_tokens:
-                            last = self._last_ws_update.get(token_id, 0.0)
-                            age = now - last if last > 0 else now  # never updated = very stale
-                            age_ms = age * 1000
+
+                    # Only consider tokens that have received at least one event
+                    stale_count = 0
+                    known_count = 0
+                    worst_age_ms = 0.0
+                    worst_token = ""
+
+                    for token_id in active_tokens:
+                        last = self._last_ws_update.get(token_id, 0.0)
+                        if last == 0.0:
+                            continue  # never received — skip, REST fallback handles it
+                        known_count += 1
+                        age_ms = (now - last) * 1000
+                        if age_ms > WS_RECONNECT_STALE_MS:
+                            stale_count += 1
                             if age_ms > worst_age_ms:
                                 worst_age_ms = age_ms
                                 worst_token = token_id
 
-                        if worst_age_ms > WS_RECONNECT_STALE_MS:
-                            logger.warning(
-                                "WsFeedPoller: token %s stale %.0fms (>%dms) — forcing WS reconnect",
-                                worst_token[:16], worst_age_ms, WS_RECONNECT_STALE_MS,
-                            )
-                            await self._feed.force_reconnect(
-                                reason=f"token {worst_token[:16]} stale {worst_age_ms:.0f}ms",
-                            )
-                            # After reconnect, wait a bit before checking again
-                            await asyncio.sleep(3.0)
-                            continue
+                    cooldown_ok = (now - last_reconnect) >= self._RECONNECT_COOLDOWN_S
+                    enough_stale = stale_count >= min(self._RECONNECT_MIN_STALE_TOKENS, max(1, known_count // 2))
+
+                    if stale_count > 0 and enough_stale and cooldown_ok:
+                        logger.warning(
+                            "WsFeedPoller: %d/%d known token(s) stale (worst=%s %.0fms) — forcing WS reconnect",
+                            stale_count, known_count, worst_token[:16], worst_age_ms,
+                        )
+                        await self._feed.force_reconnect(
+                            reason=f"{stale_count}/{known_count} tokens stale, worst {worst_token[:16]} {worst_age_ms:.0f}ms",
+                        )
+                        last_reconnect = now
+                        await asyncio.sleep(5.0)
+                        continue
+
                 except Exception as exc:
                     logger.error("WsFeedPoller reconnect monitor error: %s", exc)
 

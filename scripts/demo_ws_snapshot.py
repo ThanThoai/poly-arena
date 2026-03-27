@@ -130,8 +130,8 @@ def _render(
                 continue
 
             # Header line with BBO
-            age_s = (now * 1000 - snap.last_updated) / 1000 if snap.last_updated else 0
-            age_str = f"{age_s:.1f}s ago" if age_s < 999 else "n/a"
+            age_ms = (now * 1000 - snap.last_updated) if snap.last_updated else 0
+            age_str = f"{age_ms:.0f}ms ago" if age_ms < 999000 else "n/a"
 
             mid = snap.midpoint
             mid_str = f"{mid:.4f}" if mid else "---"

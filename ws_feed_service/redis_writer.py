@@ -476,6 +476,33 @@ class RedisWriter:
             [f"{s}:{t}:{d}" for s, t, d in combos],
         )
 
+    async def touch_orderbook_ts(self, token_id: str) -> None:
+        """Refresh ``updated_at`` on all orderbook keys for this token.
+
+        Called after every WS event so that the snapshot timestamp is always
+        fresh — even when the orderbook data itself is unchanged and the full
+        ``update_orderbook`` write was skipped by the dedup guard.
+        """
+        legacy_combos = self._token_map.get(token_id)
+        session_combos = self._session_token_map.get(token_id)
+        if not legacy_combos and not session_combos:
+            return
+
+        now_ts = str(time.time())
+        pipe = self._r.pipeline(transaction=False)
+
+        if session_combos:
+            for sym, tf, direction, candle_ts in session_combos:
+                key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}:{candle_ts}"
+                pipe.hset(key, "updated_at", now_ts)
+
+        if legacy_combos:
+            for sym, tf, direction in legacy_combos:
+                key = f"{ORDERBOOK_KEY_PREFIX}:{sym}:{tf}:{direction}"
+                pipe.hset(key, "updated_at", now_ts)
+
+        await _retry_pipe(pipe, "RedisWriter.touch_orderbook_ts")
+
     async def update_orderbook(
         self,
         token_id: str,
@@ -510,6 +537,9 @@ class RedisWriter:
 
         cached = self._last_ob_json.get(token_id)
         if cached is not None and cached == (bids_json, asks_json) and not ttl_refresh_needed:
+            # Data unchanged — skip full write but still refresh updated_at
+            # so WS snapshot timestamp checks see a fresh value.
+            await self.touch_orderbook_ts(token_id)
             return
         self._last_ob_json[token_id] = (bids_json, asks_json)
         self._last_ob_write_ts[token_id] = now_mono
